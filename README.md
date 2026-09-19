@@ -45,13 +45,28 @@ rustypods images
 rustypods create dev --image arch-base      # instant Btrfs-snapshot
 rustypods start dev --memory-high 10G --memory-max 12G --cpu 400
 rustypods ps
-rustypods shell dev                         # machinectl shell nick@dev
+rustypods shell dev                         # eigen Exec-RPC: nsenter + host-pty
+rustypods shell dev -- cargo build          # of direct een commando (exit-code komt terug)
+echo hi | rustypods shell dev cat           # pipes werken ook
 rustypods stop dev
 rustypods destroy dev
 ```
 
 Handige vlaggen: `start --ephemeral` (wegwerp-run, `-x`) en `start --private-users`
 (sterkere isolatie, maar breekt de naadloze `/home/nick`-uid-mapping).
+
+## Exec-RPC (fase 2b)
+
+`rustypods shell` gebruikt géén `machinectl` meer: de daemon draait
+`nsenter -t <leader> -m -u -i -n -p` met een host-pty (`setsid`+`TIOCSCTTY`
+→ echte job control), schakelt naar de container-user via `setpriv` met
+passwd-data uit de image, en verplaatst de payload naar
+`machine-<pod>.scope/rustypods-exec` zodat exec'd processen onder dezelfde
+resource-limits vallen. SIGWINCH en exit-codes worden over de stream
+doorgestuurd; machined wordt alleen nog gebruikt voor de leader-pid-lookup.
+
+Bekende beperking: `tty(1)` faalt op path-resolutie (de pty-fd leeft in de
+host-devpts); de fd zelf werkt volledig.
 
 ## Telemetrie & shared memory (fase 2a)
 
@@ -76,6 +91,6 @@ Geschreven door uid 1000 zodat host- en pod-processen als `nick` kunnen mappen.
   = host-uid 1000 en `/home/nick` writes direct kloppen — distrobox-pariteit.
 - **Sanitize bij import**: distrobox-restjes (`/etc/hostname`, `machine-id`,
   entrypoint-bins, profile.d-hooks) worden gewist zodat `--boot` schoon start.
-- **Fase 2 restant**: `zbus` machined-API i.p.v. subprocessen, Exec-RPC
-  (nsenter+pty) zodat `shell` niet via machined hoeft, computer-oom
+- **Fase 2 restant**: `zbus` machined-API i.p.v. subprocessen (leader-lookup
+  en `set-property` gaan nu nog via `machinectl`/`systemctl`), computer-oom
   worker-subgroups/freeze, ringbuffer-protocol bovenop de SHM-segmenten.

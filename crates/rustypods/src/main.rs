@@ -1,7 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::process::Command;
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
@@ -81,7 +80,7 @@ enum Cmd {
         #[command(subcommand)]
         sub: ShmCmd,
     },
-    /// Shell in een draaiende pod (machinectl-passthrough).
+    /// Shell in een draaiende pod (eigen Exec-RPC: nsenter + host-pty).
     Shell {
         name: String,
         /// Inloggen als deze container-user (default: $USER).
@@ -128,6 +127,150 @@ fn limits_proto(high: Option<&str>, max: Option<&str>, cpu: Option<u32>) -> Resu
     Ok((l.memory_high_bytes > 0 || l.memory_max_bytes > 0 || l.cpu_quota_percent > 0).then_some(l))
 }
 
+/// `rustypods shell` via de Exec-RPC: de daemon nsentert op de machined
+/// leader-pid, een host-pty geeft job control, de remote exit-code komt
+/// exact terug. Raw mode + SIGWINCH-forwarding aan deze kant.
+async fn shell_exec(
+    sock: PathBuf,
+    name: String,
+    user: Option<String>,
+    cmd: Vec<String>,
+) -> Result<()> {
+    use rustypods_proto::rpc::exec_chunk::Kind;
+    use std::io::{IsTerminal, Write};
+    use tokio::io::AsyncReadExt;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let tty = std::io::stdin().is_terminal();
+    let user = user.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "root".into());
+    let (rows, cols) = if tty { term_size() } else { (0, 0) };
+    let mut env = Vec::new();
+    for k in ["TERM", "COLORTERM", "LANG"] {
+        if let Ok(v) = std::env::var(k) {
+            env.push(format!("{k}={v}"));
+        }
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<ExecChunk>(32);
+    tx.send(ExecChunk {
+        kind: Some(Kind::Start(ExecStart {
+            pod: name,
+            user,
+            argv: cmd,
+            tty,
+            rows,
+            cols,
+            env,
+        })),
+    })
+    .await?;
+    let mut c = connect(sock).await?;
+    let mut inbound = c.exec(ReceiverStream::new(rx)).await?.into_inner();
+
+    // Raw mode zodat de remote pty alle toetsaanslagen onbewerkt krijgt.
+    let raw = if tty { RawGuard::enter() } else { None };
+
+    // SIGWINCH → daemon → TIOCSWINSZ op de pty (kernel signaleert fg-groep)
+    if tty {
+        let tx_w = tx.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sig) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            {
+                while sig.recv().await.is_some() {
+                    let (rows, cols) = term_size();
+                    let _ = tx_w
+                        .send(ExecChunk {
+                            kind: Some(Kind::Winsize(WinSize { rows, cols })),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+    // stdin → daemon. tx MOVET hierheen: bij stdin-EOF valt de laatste
+    // sender weg (non-tty) → outbound stream eindigt → daemon sluit
+    // child-stdin → remote proces ziet EOF en exit.
+    let stdin_task = tokio::spawn(async move {
+        let mut si = tokio::io::stdin();
+        let mut buf = [0u8; 8192];
+        loop {
+            match si.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx
+                        .send(ExecChunk {
+                            kind: Some(Kind::Stdin(buf[..n].to_vec())),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut code = 1;
+    let mut out = std::io::stdout();
+    while let Some(m) = inbound.message().await? {
+        match m.kind {
+            Some(Kind::Stdout(b)) => {
+                out.write_all(&b)?;
+                out.flush()?;
+            }
+            Some(Kind::Stderr(b)) => {
+                std::io::stderr().write_all(&b)?;
+            }
+            Some(Kind::Exit(e)) => {
+                code = e.code;
+                break;
+            }
+            _ => {}
+        }
+    }
+    stdin_task.abort();
+    drop(raw); // termios herstellen vóór exit
+    std::process::exit(code);
+}
+
+fn term_size() -> (u32, u32) {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 {
+            (ws.ws_row as u32, ws.ws_col as u32)
+        } else {
+            (24, 80)
+        }
+    }
+}
+
+/// Zet stdin in raw mode; Drop herstelt termios.
+struct RawGuard {
+    orig: libc::termios,
+}
+impl RawGuard {
+    fn enter() -> Option<Self> {
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) != 0 {
+                return None;
+            }
+            let orig = t;
+            libc::cfmakeraw(&mut t);
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+            Some(Self { orig })
+        }
+    }
+}
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
 fn pod_state(p: &Pod) -> &'static str {
     match PodState::try_from(p.state).unwrap_or(PodState::Unknown) {
         PodState::Running => "running",
@@ -167,17 +310,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Shell { name, user, cmd } => {
-            let mut c = connect(cli.socket.clone()).await?;
-            let pods = c.list_pods(ListPodsRequest {}).await?.into_inner().pods;
-            let running = pods.iter().any(|p| p.name == name && p.state == PodState::Running as i32);
-            if !running {
-                bail!("pod {name} draait niet — `rustypods start {name}`");
-            }
-            let user = user.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "root".into());
-            let mut a = vec!["shell".to_string(), format!("{user}@{name}")];
-            a.extend(cmd);
-            let st = Command::new("machinectl").args(&a).status()?;
-            std::process::exit(st.code().unwrap_or(1));
+            shell_exec(cli.socket, name, user, cmd).await?;
         }
         Cmd::Ping => {
             let i = connect(cli.socket).await?.ping(PingRequest {}).await?.into_inner();

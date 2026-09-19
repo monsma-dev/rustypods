@@ -35,6 +35,21 @@ relogin). The bind is `--bind-ro=` now; socket connects work fine on ro
 mounts. Same class of caution applies to any host dir another init system
 considers "theirs" (`/run`, `/var/lib`, `/etc`).
 
+## Hard-won: nsenter exec + cgroup-lidmaatschap
+
+- `nsenter -p` **fork't altijd**: de gespawnde pid is een wachter; de echte
+  payload is zijn kind (`/proc/<pid>/task/<pid>/children`). Cgroup-moves en
+  metrics moeten op het KIND, niet op de nsenter-pid.
+- `machine-<pod>.scope` én `payload/` hebben `subtree_control` aan →
+  `cgroup.procs`-writes geven EBUSY (no-internal-process). Maak een eigen
+  leaf `machine-<pod>.scope/rustypods-exec` en schrijf daarheen — dan vallen
+  exec'd processen wél onder de pod's MemoryHigh/CPUQuota.
+- `nsenter --wd=<pad>` resolved vóór setns tegen de host-mountns → `getcwd`
+  faalt in de container. Niet gebruiken; `cd $HOME` in de login-shell-wrap.
+- PTY: `openpty` via libc (`posix_openpt`+`grantpt`+`unlockpt`+`ptsname`),
+  slave als stdio + `setsid`/`TIOCSCTTY` in `pre_exec`. `tty(1)` faalt op
+  path-lookup (host-devpts), fd-semantiek werkt volledig.
+
 ## Rootless podman caveat
 
 `podman` needs the user session bus (`/run/user/1000/bus`). If `podman

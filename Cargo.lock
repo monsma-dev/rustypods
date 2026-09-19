@@ -817,8 +817,10 @@ dependencies = [
  "clap",
  "http",
  "hyper-util",
+ "libc",
  "rustypods-proto",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower",
  "tracing",
@@ -859,6 +861,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "rustypods-proto",
  "serde",
  "serde_json",

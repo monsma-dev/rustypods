@@ -393,9 +393,33 @@ impl PodControl for Svc {
     type ExecStream = ReceiverStream<Result<ExecChunk, Status>>;
     async fn exec(
         &self,
-        _req: Request<tonic::Streaming<ExecChunk>>,
+        req: Request<tonic::Streaming<ExecChunk>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        Err(Status::unimplemented("Exec komt in fase 2 (nsenter + pty)"))
+        use rustypods_proto::rpc::exec_chunk::Kind;
+        let mut stream = req.into_inner();
+        let start = match stream.next().await {
+            Some(Ok(c)) => match c.kind {
+                Some(Kind::Start(s)) => s,
+                _ => return Err(Status::invalid_argument("eerste chunk moet ExecStart zijn")),
+            },
+            Some(Err(e)) => return Err(e),
+            None => return Err(Status::invalid_argument("lege exec-stream")),
+        };
+        let name = proto::validate_name(&start.pod).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+            }
+        }
+        let Some(leader) = nspawn::leader_pid(&name).await else {
+            return Err(Status::failed_precondition(format!("pod {name} draait niet")));
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        crate::exec::run(start, &self.pod_rootfs(&name), leader, stream, tx)
+            .await
+            .map_err(int)?;
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     type PodMetricsStream = ReceiverStream<Result<Metric, Status>>;

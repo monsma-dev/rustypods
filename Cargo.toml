@@ -18,7 +18,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "io-std", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -31,5 +31,6 @@ protoc-bin-vendored = "3"
 tower = "0.5"
 http = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
 
 rustypods-proto = { path = "crates/rustypods-proto" }

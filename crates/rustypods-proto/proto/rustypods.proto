@@ -145,10 +145,38 @@ message StartPodRequest {
   bool private_users = 4;
 }
 
-// Phase 2: fd 0 = stdin, 1 = stdout, 2 = stderr, 3 = winsize change.
+// Bidi exec: first client chunk is `start`; then stdin/winsize flow in,
+// stdout/stderr/exit flow out.
 message ExecChunk {
-  int32 fd = 1;
-  bytes data = 2;
+  oneof kind {
+    ExecStart start = 1;
+    bytes stdin = 2;
+    bytes stdout = 3;
+    bytes stderr = 4;
+    WinSize winsize = 5;
+    ExecExit exit = 6;
+  }
+}
+
+message ExecStart {
+  string pod = 1;
+  // Container user; empty = root.
+  string user = 2;
+  // Empty argv → login shell ($SHELL -l from the image's /etc/passwd).
+  repeated string argv = 3;
+  bool tty = 4;
+  uint32 rows = 5;
+  uint32 cols = 6;
+  repeated string env = 7; // "K=V", TERM etc.
+}
+
+message WinSize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message ExecExit {
+  int32 code = 1;
 }
 
 message Metric {

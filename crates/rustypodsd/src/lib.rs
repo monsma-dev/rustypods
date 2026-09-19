@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod btrfs;
+pub mod exec;
 pub mod nspawn;
 pub mod server;
 pub mod state;
