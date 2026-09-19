@@ -21,6 +21,41 @@ service PodControl {
   rpc Exec(stream ExecChunk) returns (stream ExecChunk);
   rpc PodMetrics(PodRef) returns (stream Metric);
   rpc StreamLogs(PodRef) returns (stream LogLine);
+
+  rpc CreateShm(ShmRequest) returns (ShmSegment);
+  rpc ListShm(PodRef) returns (ShmList);
+  rpc RemoveShm(ShmRef) returns (Empty);
+}
+
+// In-pod agent → daemon, on the per-pod socket /run/rustypods/run/agent.sock.
+service Agent {
+  rpc Ping(Empty) returns (AgentInfo);
+  rpc StreamMetrics(stream Metric) returns (Empty);
+}
+
+message AgentInfo {
+  string version = 1;
+}
+
+// mmap-able shared segment: host path under /dev/shm/rustypods/<pod>,
+// pod path under /run/rustypods/shm. Same pages both sides (tmpfs).
+message ShmRequest {
+  string pod = 1;
+  string name = 2;
+  uint64 size_bytes = 3;
+}
+message ShmSegment {
+  string name = 1;
+  string host_path = 2;
+  string pod_path = 3;
+  uint64 size_bytes = 4;
+}
+message ShmList {
+  repeated ShmSegment segs = 1;
+}
+message ShmRef {
+  string pod = 1;
+  string name = 2;
 }
 
 message Empty {}
@@ -122,6 +157,8 @@ message Metric {
   uint64 mem_high_bytes = 3;
   double cpu_pct = 4;
   uint64 pids = 5;
+  double mem_psi_avg10 = 6;
+  double io_psi_avg10 = 7;
 }
 
 message LogLine {

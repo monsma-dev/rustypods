@@ -3,7 +3,7 @@
 nspawn pods op Btrfs, aangestuurd door een Rust-daemon over UDS+gRPC.
 Podman/distrobox-light zonder overlayfs, zonder containerd, zonder proxy-overhead.
 
-## Architectuur (M1 — walking skeleton)
+## Architectuur
 
 ```
 rustypods (CLI) ──UDS+gRPC──> rustypodsd (root)
@@ -11,13 +11,17 @@ rustypods (CLI) ──UDS+gRPC──> rustypodsd (root)
                                   ├─ btrfs subvolume snapshot   (images → pods, instant CoW)
                                   ├─ systemd-nspawn --boot      (payload op de host-kernel)
                                   ├─ machined                   (machine-<pod>.scope, gratis tooling)
-                                  └─ systemctl set-property     (MemoryHigh/MemoryMax/CPUQuota guardrails)
+                                  ├─ systemctl set-property     (MemoryHigh/MemoryMax/CPUQuota guardrails)
+                                  └─ <──UDS── rustypods-agent   (in-pod telemetrie: cgroup v2 + PSI)
+
+dataplane: /dev/shm/rustypods/<pod>/  ──bind──>  /run/rustypods/shm/  (mmap = echte gedeelde pages)
+kanaal:    /var/lib/rustypods/run/<pod>/agent.sock ──bind──> /run/rustypods/run/
 ```
 
 - `crates/rustypods-proto` — gRPC contract + gedeelde helpers
 - `crates/rustypodsd` — root daemon (`/run/rustypods/daemon.sock`, data in `/var/lib/rustypods`)
 - `crates/rustypods` — CLI
-- `crates/rustypods-agent` — in-pod telemetry (stub; fase 2)
+- `crates/rustypods-agent` — in-pod telemetrie (gestart door `rustypods-agent.service`, gedropt in de image bij import)
 
 ## Bouwen
 
@@ -49,6 +53,19 @@ rustypods destroy dev
 Handige vlaggen: `start --ephemeral` (wegwerp-run, `-x`) en `start --private-users`
 (sterkere isolatie, maar breekt de naadloze `/home/nick`-uid-mapping).
 
+## Telemetrie & shared memory (fase 2a)
+
+```bash
+rustypods metrics dev                     # live stream: mem/cpu/pids/PSI uit de pod
+rustypods shm create dev ring --size 64M  # mmap-baar segment
+rustypods shm ls dev
+rustypods shm rm dev ring
+```
+
+Host-side: `/dev/shm/rustypods/<pod>/<naam>`; pod-side: `/run/rustypods/shm/<naam>`.
+Zelfde tmpfs-pages — een `mmap` aan beide kanten is letterlijk zero-copy.
+Geschreven door uid 1000 zodat host- en pod-processen als `nick` kunnen mappen.
+
 ## Design-notities
 
 - **Guardrails via machined-scope**: nspawn registreert zelf bij machined; de
@@ -59,6 +76,6 @@ Handige vlaggen: `start --ephemeral` (wegwerp-run, `-x`) en `start --private-use
   = host-uid 1000 en `/home/nick` writes direct kloppen — distrobox-pariteit.
 - **Sanitize bij import**: distrobox-restjes (`/etc/hostname`, `machine-id`,
   entrypoint-bins, profile.d-hooks) worden gewist zodat `--boot` schoon start.
-- **Fase 2**: `zbus` machined-API i.p.v. subprocessen, `rustypods-agent`
-  telemetrie via `/run/rustypods` bind, SHM-dataplane (`/dev/shm`), Exec-RPC
-  (nsenter+pty), computer-oom worker-subgroups/freeze.
+- **Fase 2 restant**: `zbus` machined-API i.p.v. subprocessen, Exec-RPC
+  (nsenter+pty) zodat `shell` niet via machined hoeft, computer-oom
+  worker-subgroups/freeze, ringbuffer-protocol bovenop de SHM-segmenten.

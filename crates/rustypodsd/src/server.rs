@@ -17,19 +17,22 @@ use rustypods_proto::rpc::pod_control_server::{PodControl, PodControlServer};
 use rustypods_proto::rpc::*;
 use rustypods_proto::{self as proto};
 
+use crate::agent::{self, ListenerMap, MetricsMap};
 use crate::state::{self, ImageMeta, LimitsSpec, PodMeta, State};
 use crate::{btrfs, nspawn, Config};
 
 pub struct Svc {
     cfg: Config,
     st: Arc<Mutex<State>>,
+    metrics: MetricsMap,
+    listeners: ListenerMap,
 }
 
-fn bad(e: anyhow::Error) -> Status {
-    Status::invalid_argument(format!("{e:#}"))
+fn bad(e: impl Into<anyhow::Error>) -> Status {
+    Status::invalid_argument(format!("{:#}", e.into()))
 }
-fn int(e: anyhow::Error) -> Status {
-    Status::internal(format!("{e:#}"))
+fn int(e: impl Into<anyhow::Error>) -> Status {
+    Status::internal(format!("{:#}", e.into()))
 }
 
 fn to_image(m: &ImageMeta, path: &Path) -> Image {
@@ -231,21 +234,45 @@ impl PodControl for Svc {
             return Err(Status::failed_precondition(format!("pod {name} draait al")));
         }
         let rootfs = self.pod_rootfs(&name);
+        let run_dir = proto::run_dir(&self.cfg.data_dir, &name);
+        let shm_host = proto::shm_host_dir(&name);
+        std::fs::create_dir_all(&run_dir).map_err(int)?;
+        std::fs::create_dir_all(&shm_host).map_err(int)?;
+        let _ = std::os::unix::fs::chown(
+            &shm_host,
+            Some(self.cfg.allowed_uid),
+            Some(self.cfg.allowed_uid),
+        );
+        agent::spawn_listener(
+            &run_dir,
+            &name,
+            self.metrics.clone(),
+            self.listeners.clone(),
+        )
+        .await
+        .map_err(int)?;
         let argv = nspawn::start_argv(
             &rootfs,
             &name,
             meta.ephemeral,
             meta.private_users,
             &self.cfg.bin_dir(),
+            &run_dir,
+            &shm_host,
         );
         let log = self.cfg.logs_dir().join(format!("{name}.log"));
-        nspawn::spawn(&argv, &log).await.map_err(int)?;
+        if let Err(e) = nspawn::spawn(&argv, &log).await {
+            agent::stop_listener(&self.listeners, &name).await;
+            return Err(int(e));
+        }
         if let Err(e) = nspawn::wait_registered(&name, Duration::from_secs(15)).await {
+            agent::stop_listener(&self.listeners, &name).await;
             let _ = nspawn::stop(&name).await;
             return Err(int(e.context(format!("boot mislukt — zie {}", log.display()))));
         }
         // Guardrails are the point: a pod that can't be capped gets stopped.
         if let Err(e) = nspawn::apply_limits(&name, &meta.limits).await {
+            agent::stop_listener(&self.listeners, &name).await;
             let _ = nspawn::stop(&name).await;
             return Err(int(e.context("limits zetten mislukt")));
         }
@@ -264,6 +291,7 @@ impl PodControl for Svc {
             .map_err(bad)?
             .to_string();
         nspawn::stop(&name).await.map_err(int)?;
+        agent::stop_listener(&self.listeners, &name).await;
         let st = self.st.lock().await;
         let Some(m) = st.pods.get(&name) else {
             return Err(Status::not_found(format!("pod {name} niet gevonden")));
@@ -286,10 +314,79 @@ impl PodControl for Svc {
             .map_err(bad)?
             .to_string();
         nspawn::stop(&name).await.map_err(int)?;
+        agent::stop_listener(&self.listeners, &name).await;
         btrfs::delete(&self.pod_rootfs(&name)).map_err(int)?;
+        agent::cleanup_pod_dirs(
+            &proto::run_dir(&self.cfg.data_dir, &name),
+            &proto::shm_host_dir(&name),
+        );
         let mut st = self.st.lock().await;
         st.pods.remove(&name);
         self.save(&st).map_err(int)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn create_shm(
+        &self,
+        req: Request<ShmRequest>,
+    ) -> Result<Response<ShmSegment>, Status> {
+        let req = req.into_inner();
+        let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&pod) {
+                return Err(Status::not_found(format!("pod {pod} niet gevonden")));
+            }
+        }
+        let dir = proto::shm_host_dir(&pod);
+        std::fs::create_dir_all(&dir).map_err(int)?;
+        let path = dir.join(&name);
+        let f = std::fs::File::create(&path).map_err(int)?;
+        f.set_len(req.size_bytes).map_err(int)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).map_err(int)?;
+        let _ = std::os::unix::fs::chown(
+            &path,
+            Some(self.cfg.allowed_uid),
+            Some(self.cfg.allowed_uid),
+        );
+        Ok(Response::new(ShmSegment {
+            name: name.clone(),
+            host_path: path.display().to_string(),
+            pod_path: format!("{}/{name}", proto::POD_SHM_DIR),
+            size_bytes: req.size_bytes,
+        }))
+    }
+
+    async fn list_shm(&self, req: Request<PodRef>) -> Result<Response<ShmList>, Status> {
+        let pod = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        let dir = proto::shm_host_dir(&pod);
+        let mut segs = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if let Ok(md) = e.metadata() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    segs.push(ShmSegment {
+                        pod_path: format!("{}/{name}", proto::POD_SHM_DIR),
+                        host_path: e.path().display().to_string(),
+                        size_bytes: md.len(),
+                        name,
+                    });
+                }
+            }
+        }
+        Ok(Response::new(ShmList { segs }))
+    }
+
+    async fn remove_shm(&self, req: Request<ShmRef>) -> Result<Response<Empty>, Status> {
+        let req = req.into_inner();
+        let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        let path = proto::shm_host_dir(&pod).join(&name);
+        std::fs::remove_file(&path).map_err(int)?;
         Ok(Response::new(Empty {}))
     }
 
@@ -304,9 +401,35 @@ impl PodControl for Svc {
     type PodMetricsStream = ReceiverStream<Result<Metric, Status>>;
     async fn pod_metrics(
         &self,
-        _req: Request<PodRef>,
+        req: Request<PodRef>,
     ) -> Result<Response<Self::PodMetricsStream>, Status> {
-        Err(Status::unimplemented("metrics komen in fase 2 via rustypods-agent"))
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+            }
+        }
+        let mut rx = agent::latest_rx(&self.metrics, &name).await;
+        let (tx, out) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            let first = rx.borrow().clone();
+            if tx.send(Ok(first)).await.is_err() {
+                return;
+            }
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let m = rx.borrow_and_update().clone();
+                if tx.send(Ok(m)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(out)))
     }
 
     type StreamLogsStream = ReceiverStream<Result<LogLine, Status>>;
@@ -396,6 +519,19 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
     )?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
+
+    // In-pod telemetry agent: enabled unit, binary comes via the ro-bind of
+    // /var/lib/rustypods/bin → /run/rustypods/bin at pod start.
+    let unit_dir = root.join("etc/systemd/system");
+    let wants_dir = unit_dir.join("multi-user.target.wants");
+    std::fs::create_dir_all(&wants_dir)?;
+    std::fs::write(
+        unit_dir.join("rustypods-agent.service"),
+        "[Unit]\nDescription=RustyPods in-pod telemetry agent\nAfter=local-fs.target\n\n[Service]\nExecStart=/run/rustypods/bin/rustypods-agent\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+    )?;
+    let link = wants_dir.join("rustypods-agent.service");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink("../rustypods-agent.service", &link)?;
     Ok(())
 }
 
@@ -426,10 +562,30 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .output();
 
     let st = Arc::new(Mutex::new(state::load(&cfg.state_file())));
+    let metrics: MetricsMap = Default::default();
+    let listeners: ListenerMap = Default::default();
     let svc = Svc {
         cfg: cfg.clone(),
-        st,
+        st: st.clone(),
+        metrics: metrics.clone(),
+        listeners: listeners.clone(),
     };
+
+    // Daemon restarted while pods kept running → rebind their agent channels.
+    let running: Vec<String> = {
+        let guard = st.lock().await;
+        guard.pods.keys().cloned().collect()
+    };
+    for name in running {
+        let run_dir = proto::run_dir(&cfg.data_dir, &name);
+        if nspawn::leader_pid(&name).await.is_some() {
+            if let Err(e) =
+                agent::spawn_listener(&run_dir, &name, metrics.clone(), listeners.clone()).await
+            {
+                tracing::warn!("agent-listener {name}: {e:#}");
+            }
+        }
+    }
 
     let allowed = cfg.allowed_uid;
     let (tx, rx) = tokio::sync::mpsc::channel::<tokio::net::UnixStream>(32);

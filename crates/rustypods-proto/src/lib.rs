@@ -25,9 +25,22 @@ pub fn bin_dir(data_dir: &std::path::Path) -> PathBuf {
 pub fn shm_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("shm")
 }
+/// Per-pod channel dir, bound rw into the pod at /run/rustypods/run.
+pub fn run_dir(data_dir: &std::path::Path, pod: &str) -> PathBuf {
+    data_dir.join("run").join(pod)
+}
+/// Host side of the SHM dataplane — tmpfs, bound rw to /run/rustypods/shm.
+pub fn shm_host_dir(pod: &str) -> PathBuf {
+    PathBuf::from("/dev/shm/rustypods").join(pod)
+}
 pub fn state_file(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("state.json")
 }
+
+/// In-pod paths (container side of the binds).
+pub const POD_RUN_DIR: &str = "/run/rustypods/run";
+pub const POD_AGENT_SOCK: &str = "/run/rustypods/run/agent.sock";
+pub const POD_SHM_DIR: &str = "/run/rustypods/shm";
 
 /// Pod/image names double as nspawn machine names and directory names.
 /// Keep them to a strict hostname-ish slug.

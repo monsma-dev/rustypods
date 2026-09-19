@@ -12,7 +12,15 @@ use tokio::time::{sleep, timeout};
 use crate::state::LimitsSpec;
 
 /// Pure argv builder — unit-testable.
-pub fn start_argv(rootfs: &Path, name: &str, ephemeral: bool, private_users: bool, agent_bin: &Path) -> Vec<OsString> {
+pub fn start_argv(
+    rootfs: &Path,
+    name: &str,
+    ephemeral: bool,
+    private_users: bool,
+    agent_bin: &Path,
+    run_dir: &Path,
+    shm_dir: &Path,
+) -> Vec<OsString> {
     let mut a: Vec<OsString> = vec![
         "systemd-nspawn".into(),
         "--boot".into(),
@@ -30,7 +38,13 @@ pub fn start_argv(rootfs: &Path, name: &str, ephemeral: bool, private_users: boo
         a.push("--bind-ro=/dev/dri".into());
     }
     if agent_bin.is_dir() {
-        a.push(format!("--bind-ro={}:/run/rustypods", agent_bin.display()).into());
+        a.push(format!("--bind-ro={}:/run/rustypods/bin", agent_bin.display()).into());
+    }
+    if run_dir.is_dir() {
+        a.push(format!("--bind={}:/run/rustypods/run", run_dir.display()).into());
+    }
+    if shm_dir.is_dir() {
+        a.push(format!("--bind={}:/run/rustypods/shm", shm_dir.display()).into());
     }
     if ephemeral {
         a.push("-x".into()); // nspawn btrfs-snapshots the dir and discards on exit
@@ -169,7 +183,9 @@ mod tests {
             "dev",
             ephemeral,
             pu,
-            &PathBuf::from("/bin"), // exists → agent bind
+            &PathBuf::from("/bin"),      // exists → agent-bin bind
+            &PathBuf::from("/bin"),      // exists → run bind
+            &PathBuf::from("/definitely-missing"), // skipped
         )
         .iter()
         .map(|s| s.to_string_lossy().into_owned())

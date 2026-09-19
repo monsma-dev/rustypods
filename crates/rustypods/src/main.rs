@@ -74,6 +74,13 @@ enum Cmd {
     Ps,
     /// Stop en verwijder een pod (Btrfs-snapshot weg).
     Destroy { name: String },
+    /// Live telemetrie uit de pod (rustypods-agent → daemon).
+    Metrics { name: String },
+    /// Shared-memory segmenten: mmap-bare files, host /dev/shm ↔ pod /run/rustypods/shm.
+    Shm {
+        #[command(subcommand)]
+        sub: ShmCmd,
+    },
     /// Shell in een draaiende pod (machinectl-passthrough).
     Shell {
         name: String,
@@ -84,6 +91,21 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ShmCmd {
+    /// Maak een segment (default 64M).
+    Create {
+        pod: String,
+        name: String,
+        #[arg(long, default_value = "64M")]
+        size: String,
+    },
+    /// Toon segmenten van een pod.
+    Ls { pod: String },
+    /// Verwijder een segment.
+    Rm { pod: String, name: String },
 }
 
 async fn connect(path: PathBuf) -> Result<PodControlClient<Channel>> {
@@ -244,6 +266,57 @@ async fn main() -> Result<()> {
         Cmd::Destroy { name } => {
             connect(cli.socket).await?.destroy_pod(PodRef { name: name.clone() }).await?;
             println!("pod {name} vernietigd");
+        }
+        Cmd::Metrics { name } => {
+            let mut c = connect(cli.socket).await?;
+            let mut s = c.pod_metrics(PodRef { name }).await?.into_inner();
+            while let Some(m) = s.message().await? {
+                let high = if m.mem_high_bytes > 0 {
+                    fmt_bytes(m.mem_high_bytes)
+                } else {
+                    "max".into()
+                };
+                println!(
+                    "mem {:>8}/{:<8} cpu {:>6.1}%  pids {:<5} psi mem={:.1} io={:.1}",
+                    fmt_bytes(m.mem_bytes),
+                    high,
+                    m.cpu_pct,
+                    m.pids,
+                    m.mem_psi_avg10,
+                    m.io_psi_avg10
+                );
+            }
+        }
+        Cmd::Shm { sub } => {
+            let mut c = connect(cli.socket).await?;
+            match sub {
+                ShmCmd::Create { pod, name, size } => {
+                    let seg = c
+                        .create_shm(ShmRequest {
+                            pod,
+                            name,
+                            size_bytes: parse_bytes(&size)?,
+                        })
+                        .await?
+                        .into_inner();
+                    println!("shm {} ({})", seg.name, fmt_bytes(seg.size_bytes));
+                    println!("  host: {}", seg.host_path);
+                    println!("  pod:  {}", seg.pod_path);
+                }
+                ShmCmd::Ls { pod } => {
+                    let l = c.list_shm(PodRef { name: pod }).await?.into_inner();
+                    for s in &l.segs {
+                        println!("{:<20} {:>10}  {}", s.name, fmt_bytes(s.size_bytes), s.host_path);
+                    }
+                    if l.segs.is_empty() {
+                        println!("geen segmenten");
+                    }
+                }
+                ShmCmd::Rm { pod, name } => {
+                    c.remove_shm(ShmRef { pod, name: name.clone() }).await?;
+                    println!("segment {name} verwijderd");
+                }
+            }
         }
     }
     Ok(())

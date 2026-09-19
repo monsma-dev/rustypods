@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod btrfs;
 pub mod nspawn;
 pub mod server;

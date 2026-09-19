@@ -10,5 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+http.workspace = true
+hyper-util.workspace = true
+rustypods-proto.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

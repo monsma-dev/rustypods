@@ -830,6 +830,13 @@ name = "rustypods-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "http",
+ "hyper-util",
+ "rustypods-proto",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
