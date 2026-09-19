@@ -196,13 +196,20 @@ Files are owned by uid 1000 so host and pod processes can map them as `nick`.
 
 ## Desktop GUI (`gui/`)
 
-Tauri v2 + React + TypeScript + Tailwind (dark, Adwaita-flavoured). The
-Rust side is a thin bridge: Tauri commands call the same gRPC socket via
-the shared `rustypods-client` crate — zero duplicated daemon logic.
+Tauri v2 + React + TypeScript + Tailwind v4 (dark, Adwaita-flavoured,
+frameless window with a custom headerbar). The Rust side is a thin
+bridge: Tauri commands call the same gRPC socket via the shared
+`rustypods-client` crate — zero duplicated daemon logic. The toolchain
+is Rust all the way down: SWC compiles TS/JSX, LightningCSS handles CSS,
+and `ts-proto` generates the frontend types straight from
+`crates/rustypods-proto/proto/rustypods.proto` — the daemon and the UI
+share one contract. Commands return proto messages verbatim (camelCase
+JSON), decoded with the generated `fromJSON`.
 
 ```bash
 cd gui
 npm install
+npm run gen:proto     # regenerate src/proto/rustypods.ts after .proto changes
 npm run tauri dev     # vite + native window, needs the daemon running
 npm run build         # frontend only → gui/dist
 ```

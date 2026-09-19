@@ -3,6 +3,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // Serialize messages as proto-JSON (camelCase) so Tauri can return
+        // them verbatim; the GUI parses with ts-proto's fromJSON.
+        .type_attribute(
+            ".",
+            "#[derive(serde::Serialize)] #[serde(rename_all = \"camelCase\")]",
+        )
         .compile_protos(&["proto/rustypods.proto"], &["proto"])?;
     Ok(())
 }

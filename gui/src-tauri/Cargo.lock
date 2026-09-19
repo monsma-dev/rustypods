@@ -2907,6 +2907,7 @@ dependencies = [
  "anyhow",
  "prost",
  "protoc-bin-vendored",
+ "serde",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

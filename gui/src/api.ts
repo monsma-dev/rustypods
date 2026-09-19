@@ -1,137 +1,148 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { DaemonStatus, ImageInfo, MetricSample, PodInfo } from "./types";
+import {
+  DaemonInfo,
+  Image,
+  Limits,
+  Metric,
+  Pod,
+  PodState,
+} from "./proto/rustypods";
+
+// The wire contract is crates/rustypods-proto/proto/rustypods.proto — Tauri
+// commands return proto messages as camelCase JSON, decoded here via the
+// generated fromJSON. No hand-maintained mirrors.
+export type { DaemonInfo, Image, Limits, Metric, Pod };
+export { PodState };
 
 // Outside the Tauri webview (plain `npm run dev` in a browser) there is no IPC
 // bridge — serve mock data so the UI stays demoable/testable.
 export const inTauri = "__TAURI_INTERNALS__" in window;
 
-const MOCK_PODS: PodInfo[] = [
-  {
+const MOCK_PODS: Pod[] = [
+  Pod.fromPartial({
     name: "dev",
     image: "arch-base",
-    state: "running",
-    leader_pid: 95458,
-    created_unix: 1789800000,
-    memory_high: "10.0G",
-    memory_max: "12.0G",
-    memory_high_bytes: 10 * 2 ** 30,
-    memory_max_bytes: 12 * 2 ** 30,
-    cpu_quota_percent: 400,
-    storage_max: "20.0G",
-    storage_max_bytes: 20 * 2 ** 30,
+    state: PodState.POD_STATE_RUNNING,
+    leaderPid: 95458,
+    createdUnix: 1789800000,
+    limits: {
+      memoryHighBytes: 10 * 2 ** 30,
+      memoryMaxBytes: 12 * 2 ** 30,
+      cpuQuotaPercent: 400,
+    },
+    storageMaxBytes: 20 * 2 ** 30,
     ports: ["2222:22/tcp"],
-    stack: "",
-    ephemeral: false,
-  },
-  {
+  }),
+  Pod.fromPartial({
     name: "dev-clone",
     image: "arch-base",
-    state: "stopped",
-    leader_pid: 0,
-    created_unix: 1789810000,
-    memory_high: "10.0G",
-    memory_max: "12.0G",
-    memory_high_bytes: 10 * 2 ** 30,
-    memory_max_bytes: 12 * 2 ** 30,
-    cpu_quota_percent: 400,
-    storage_max: "20.0G",
-    storage_max_bytes: 20 * 2 ** 30,
-    ports: [],
-    stack: "",
-    ephemeral: false,
-  },
-  {
+    state: PodState.POD_STATE_STOPPED,
+    createdUnix: 1789810000,
+    limits: {
+      memoryHighBytes: 10 * 2 ** 30,
+      memoryMaxBytes: 12 * 2 ** 30,
+      cpuQuotaPercent: 400,
+    },
+    storageMaxBytes: 20 * 2 ** 30,
+  }),
+  Pod.fromPartial({
     name: "demo-web",
     image: "arch-base",
-    state: "running",
-    leader_pid: 81201,
-    created_unix: 1789820000,
-    memory_high: "0B",
-    memory_max: "0B",
-    memory_high_bytes: 0,
-    memory_max_bytes: 0,
-    cpu_quota_percent: 0,
-    storage_max: "0B",
-    storage_max_bytes: 0,
+    state: PodState.POD_STATE_RUNNING,
+    leaderPid: 81201,
+    createdUnix: 1789820000,
     ports: ["8081:8080/tcp"],
     stack: "demo",
-    ephemeral: false,
-  },
-  {
+  }),
+  Pod.fromPartial({
     name: "demo-api",
     image: "arch-base",
-    state: "running",
-    leader_pid: 81244,
-    created_unix: 1789820000,
-    memory_high: "0B",
-    memory_max: "0B",
-    memory_high_bytes: 0,
-    memory_max_bytes: 0,
-    cpu_quota_percent: 0,
-    storage_max: "0B",
-    storage_max_bytes: 0,
-    ports: [],
+    state: PodState.POD_STATE_RUNNING,
+    leaderPid: 81244,
+    createdUnix: 1789820000,
     stack: "demo",
-    ephemeral: false,
-  },
+  }),
 ];
 
-const MOCK_IMAGES: ImageInfo[] = [
-  {
+const MOCK_IMAGES: Image[] = [
+  Image.fromPartial({
     name: "arch-base",
     path: "/var/lib/rustypods/images/arch-base",
     source: "distrobox-import",
-    created_unix: 1789700000,
-  },
+    createdUnix: 1789700000,
+  }),
 ];
 
-const MOCK_INFO: DaemonStatus = {
+const MOCK_INFO: DaemonInfo = DaemonInfo.fromPartial({
   version: "0.1.0",
-  socket_path: "/run/rustypods/daemon.sock",
-  data_dir: "/var/lib/rustypods",
+  socketPath: "/run/rustypods/daemon.sock",
+  dataDir: "/var/lib/rustypods",
   machined: true,
-  storage_driver: "btrfs",
-  runtime_engine: "systemd-nspawn",
-};
+  btrfs: true,
+  storageDriver: "btrfs",
+  runtimeEngine: "systemd-nspawn",
+});
 
 const delay = (ms = 80) => new Promise((r) => setTimeout(r, ms));
 
-export const getPods = async (): Promise<PodInfo[]> =>
-  inTauri ? invoke<PodInfo[]>("get_pods") : (await delay(), MOCK_PODS);
+export const getPods = async (): Promise<Pod[]> =>
+  inTauri
+    ? invoke<unknown[]>("get_pods").then((l) => l.map(Pod.fromJSON))
+    : (await delay(), MOCK_PODS);
 
-export const getImages = async (): Promise<ImageInfo[]> =>
-  inTauri ? invoke<ImageInfo[]>("get_images") : (await delay(), MOCK_IMAGES);
+export const getImages = async (): Promise<Image[]> =>
+  inTauri
+    ? invoke<unknown[]>("get_images").then((l) => l.map(Image.fromJSON))
+    : (await delay(), MOCK_IMAGES);
 
-export const getDaemonInfo = async (): Promise<DaemonStatus> =>
-  inTauri ? invoke<DaemonStatus>("get_daemon_info") : (await delay(), MOCK_INFO);
+export const getDaemonInfo = async (): Promise<DaemonInfo> =>
+  inTauri
+    ? invoke<unknown>("get_daemon_info").then(DaemonInfo.fromJSON)
+    : (await delay(), MOCK_INFO);
 
-export const startPod = async (name: string): Promise<PodInfo> => {
-  if (inTauri) return invoke<PodInfo>("start_pod", { name });
+export const startPod = async (name: string): Promise<Pod> => {
+  if (inTauri) return invoke<unknown>("start_pod", { name }).then(Pod.fromJSON);
   await delay();
   const p = MOCK_PODS.find((p) => p.name === name)!;
-  p.state = "running";
-  p.leader_pid = 90000;
+  p.state = PodState.POD_STATE_RUNNING;
+  p.leaderPid = 90000;
   return p;
 };
 
-export const stopPod = async (name: string): Promise<PodInfo> => {
-  if (inTauri) return invoke<PodInfo>("stop_pod", { name });
+export const stopPod = async (name: string): Promise<Pod> => {
+  if (inTauri) return invoke<unknown>("stop_pod", { name }).then(Pod.fromJSON);
   await delay();
   const p = MOCK_PODS.find((p) => p.name === name)!;
-  p.state = "stopped";
-  p.leader_pid = 0;
+  p.state = PodState.POD_STATE_STOPPED;
+  p.leaderPid = 0;
   return p;
 };
 
 export interface PodConfigUpdate {
   name: string;
-  memory_high_bytes: number;
-  memory_max_bytes: number;
-  cpu_quota_percent: number;
-  storage_max_bytes: number;
+  limits: Limits;
+  storageMaxBytes: number;
   ports?: string[];
 }
+
+export const updatePodConfig = async (u: PodConfigUpdate): Promise<Pod> => {
+  if (inTauri)
+    return invoke<unknown>("update_pod_config", {
+      name: u.name,
+      memoryHighBytes: u.limits.memoryHighBytes,
+      memoryMaxBytes: u.limits.memoryMaxBytes,
+      cpuQuotaPercent: u.limits.cpuQuotaPercent,
+      storageMaxBytes: u.storageMaxBytes,
+      ports: u.ports,
+    }).then(Pod.fromJSON);
+  await delay();
+  const p = MOCK_PODS.find((p) => p.name === u.name)!;
+  p.limits = { ...u.limits };
+  p.storageMaxBytes = u.storageMaxBytes;
+  if (u.ports) p.ports = u.ports;
+  return p;
+};
 
 // ---- live metrics (daemon stream → "pod-metrics" Tauri event) ----
 
@@ -151,14 +162,15 @@ export const unwatchMetrics = async (name: string): Promise<void> => {
   mockUnwatch(name);
 };
 
-/** Subscribe to MetricSamples for one pod. Returns an unsubscribe fn. */
+/** Subscribe to Metrics for one pod. Returns an unsubscribe fn. */
 export const onMetrics = async (
   pod: string,
-  cb: (m: MetricSample) => void
+  cb: (m: Metric) => void
 ): Promise<() => void> => {
   if (inTauri) {
-    const un = await listen<MetricSample>("pod-metrics", (e) => {
-      if (e.payload.pod === pod) cb(e.payload);
+    // Payload is the Metric message flattened plus a `pod` routing key.
+    const un = await listen<Record<string, unknown>>("pod-metrics", (e) => {
+      if (e.payload.pod === pod) cb(Metric.fromJSON(e.payload));
     });
     return un;
   }
@@ -167,25 +179,24 @@ export const onMetrics = async (
 
 // --- mock metrics for browser dev ---
 
-const mockSubs = new Map<string, Set<(m: MetricSample) => void>>();
+const mockSubs = new Map<string, Set<(m: Metric) => void>>();
 let mockTimer: ReturnType<typeof setInterval> | null = null;
 let mockT = 0;
 
-function mockSample(pod: string, t: number, now: number): MetricSample | null {
+function mockSample(pod: string, t: number, now: number): Metric | null {
   const p = MOCK_PODS.find((p) => p.name === pod);
-  if (!p || p.state !== "running") return null;
+  if (!p || p.state !== PodState.POD_STATE_RUNNING) return null;
   const w = Math.sin(t / 6);
-  return {
-    pod,
-    ts_unix_ms: now,
-    mem_bytes: (4 + w * 1.5 + Math.random()) * 2 ** 30,
-    mem_high_bytes: p.memory_high_bytes,
-    cpu_pct: Math.max(0, 120 + w * 90 + Math.random() * 40),
+  return Metric.fromPartial({
+    tsUnixMs: now,
+    memBytes: (4 + w * 1.5 + Math.random()) * 2 ** 30,
+    memHighBytes: p.limits?.memoryHighBytes ?? 0,
+    cpuPct: Math.max(0, 120 + w * 90 + Math.random() * 40),
     pids: 42,
-    mem_psi_avg10: Math.max(0, 3 + w * 2 + Math.random()),
-    io_psi_avg10: Math.max(0, 1 + w + Math.random() * 0.5),
-    cpu_psi_avg10: Math.max(0, 5 + w * 3 + Math.random() * 1.5),
-  };
+    memPsiAvg10: Math.max(0, 3 + w * 2 + Math.random()),
+    ioPsiAvg10: Math.max(0, 1 + w + Math.random() * 0.5),
+    cpuPsiAvg10: Math.max(0, 5 + w * 3 + Math.random() * 1.5),
+  });
 }
 
 function mockEmit() {
@@ -196,7 +207,7 @@ function mockEmit() {
   }
 }
 
-function mockSubscribe(pod: string, cb: (m: MetricSample) => void) {
+function mockSubscribe(pod: string, cb: (m: Metric) => void) {
   let set = mockSubs.get(pod);
   if (!set) mockSubs.set(pod, (set = new Set()));
   set.add(cb);
@@ -220,23 +231,3 @@ function mockUnwatch(pod: string) {
     mockTimer = null;
   }
 }
-
-export const updatePodConfig = async (u: PodConfigUpdate): Promise<PodInfo> => {
-  if (inTauri)
-    return invoke<PodInfo>("update_pod_config", {
-      name: u.name,
-      memoryHighBytes: u.memory_high_bytes,
-      memoryMaxBytes: u.memory_max_bytes,
-      cpuQuotaPercent: u.cpu_quota_percent,
-      storageMaxBytes: u.storage_max_bytes,
-      ports: u.ports,
-    });
-  await delay();
-  const p = MOCK_PODS.find((p) => p.name === u.name)!;
-  p.memory_high_bytes = u.memory_high_bytes;
-  p.memory_max_bytes = u.memory_max_bytes;
-  p.cpu_quota_percent = u.cpu_quota_percent;
-  p.storage_max_bytes = u.storage_max_bytes;
-  if (u.ports) p.ports = u.ports;
-  return p;
-};

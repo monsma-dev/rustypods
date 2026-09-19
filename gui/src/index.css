@@ -1,11 +1,27 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Deep Adwaita-dark palette — near-black chrome, tinted panels. */
+@theme {
+  --color-bg: #111114;
+  --color-bg2: #17171c;
+  --color-card: #1c1c23;
+  --color-card-hover: #23232b;
+  --color-border: #2a2a32;
+  --color-fg: #eeeeee;
+  --color-muted: #9a9aa5;
+  --color-accent: #3584e4; /* GNOME blue */
+  --color-accent-hover: #4a9cf5;
+  --color-ok: #33d17a;
+  --color-warn: #f6d32d;
+  --color-err: #e01b24;
+}
 
 body {
-  @apply bg-bg text-fg antialiased;
+  background: var(--color-bg);
+  color: var(--color-fg);
   font-family: "Cantarell", "Inter", system-ui, sans-serif;
   font-size: 13px; /* desktop density, not web */
+  -webkit-font-smoothing: antialiased;
 }
 
 /* Lean (RPi) mode: kill every animation/transition. */

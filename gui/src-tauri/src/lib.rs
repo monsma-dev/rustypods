@@ -1,5 +1,9 @@
 //! RustyPods Desktop backend — thin IPC bridge: React `invoke()` → gRPC over
 //! /run/rustypods/daemon.sock via the shared rustypods-client crate.
+//!
+//! Commands return the protobuf messages verbatim (serde → camelCase JSON);
+//! the frontend decodes them with the ts-proto types generated from the same
+//! .proto, so daemon and UI share one contract.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -13,7 +17,7 @@ use tonic::transport::Channel;
 use rustypods_client::connect;
 use rustypods_proto::rpc::pod_control_client::PodControlClient;
 use rustypods_proto::rpc::*;
-use rustypods_proto::{fmt_bytes, SOCKET_PATH};
+use rustypods_proto::SOCKET_PATH;
 
 /// One tokio runtime for the app — Tauri commands spawn gRPC work on it.
 struct Rt(tokio::runtime::Runtime);
@@ -38,71 +42,29 @@ where
     .map_err(|e| e.to_string())?
 }
 
-fn state_name(p: &Pod) -> &'static str {
-    match PodState::try_from(p.state) {
-        Ok(PodState::Running) => "running",
-        Ok(PodState::Stopped) => "stopped",
-        Ok(PodState::Failed) => "failed",
-        _ => "created",
+/// Guarantees `limits` is present so the UI never sees a null submessage.
+fn with_limits(mut p: Pod) -> Pod {
+    if p.limits.is_none() {
+        p.limits = Some(Limits::default());
     }
-}
-
-#[derive(Serialize)]
-struct PodInfo {
-    name: String,
-    image: String,
-    state: &'static str,
-    leader_pid: u32,
-    created_unix: u64,
-    memory_high: String,
-    memory_max: String,
-    memory_high_bytes: u64,
-    memory_max_bytes: u64,
-    cpu_quota_percent: u32,
-    storage_max: String,
-    storage_max_bytes: u64,
-    ports: Vec<String>,
-    stack: String,
-    ephemeral: bool,
-}
-
-fn to_info(p: Pod) -> PodInfo {
-    let state = state_name(&p);
-    let lim = p.limits.unwrap_or_default();
-    PodInfo {
-        name: p.name,
-        image: p.image,
-        state,
-        leader_pid: p.leader_pid,
-        created_unix: p.created_unix,
-        memory_high: fmt_bytes(lim.memory_high_bytes),
-        memory_max: fmt_bytes(lim.memory_max_bytes),
-        memory_high_bytes: lim.memory_high_bytes,
-        memory_max_bytes: lim.memory_max_bytes,
-        cpu_quota_percent: lim.cpu_quota_percent,
-        storage_max: fmt_bytes(p.storage_max_bytes),
-        storage_max_bytes: p.storage_max_bytes,
-        ports: p.ports,
-        stack: p.stack,
-        ephemeral: p.ephemeral,
-    }
+    p
 }
 
 #[tauri::command]
-async fn get_pods(rt: State<'_, Rt>) -> Result<Vec<PodInfo>, String> {
+async fn get_pods(rt: State<'_, Rt>) -> Result<Vec<Pod>, String> {
     call(&rt.0, |mut c| async move {
         let l = c
             .list_pods(ListPodsRequest {})
             .await
             .map_err(|e| e.to_string())?
             .into_inner();
-        Ok(l.pods.into_iter().map(to_info).collect())
+        Ok(l.pods.into_iter().map(with_limits).collect())
     })
     .await
 }
 
 #[tauri::command]
-async fn start_pod(rt: State<'_, Rt>, name: String) -> Result<PodInfo, String> {
+async fn start_pod(rt: State<'_, Rt>, name: String) -> Result<Pod, String> {
     call(&rt.0, |mut c| async move {
         let p = c
             .start_pod(StartPodRequest {
@@ -114,20 +76,20 @@ async fn start_pod(rt: State<'_, Rt>, name: String) -> Result<PodInfo, String> {
             .await
             .map_err(|e| e.message().to_string())?
             .into_inner();
-        Ok(to_info(p))
+        Ok(with_limits(p))
     })
     .await
 }
 
 #[tauri::command]
-async fn stop_pod(rt: State<'_, Rt>, name: String) -> Result<PodInfo, String> {
+async fn stop_pod(rt: State<'_, Rt>, name: String) -> Result<Pod, String> {
     call(&rt.0, |mut c| async move {
         let p = c
             .stop_pod(PodRef { name })
             .await
             .map_err(|e| e.message().to_string())?
             .into_inner();
-        Ok(to_info(p))
+        Ok(with_limits(p))
     })
     .await
 }
@@ -142,7 +104,7 @@ async fn update_pod_config(
     cpu_quota_percent: u32,
     storage_max_bytes: u64,
     ports: Option<Vec<String>>,
-) -> Result<PodInfo, String> {
+) -> Result<Pod, String> {
     call(&rt.0, move |mut c| async move {
         let p = c
             .update_pod_config(UpdatePodConfigRequest {
@@ -158,51 +120,31 @@ async fn update_pod_config(
             .await
             .map_err(|e| e.message().to_string())?
             .into_inner();
-        Ok(to_info(p))
+        Ok(with_limits(p))
     })
     .await
 }
 
-#[derive(Serialize)]
-struct ImageInfo {
-    name: String,
-    path: String,
-    source: String,
-    created_unix: u64,
-}
-
 #[tauri::command]
-async fn get_images(rt: State<'_, Rt>) -> Result<Vec<ImageInfo>, String> {
+async fn get_images(rt: State<'_, Rt>) -> Result<Vec<Image>, String> {
     call(&rt.0, |mut c| async move {
         let l = c
             .list_images(ListImagesRequest {})
             .await
             .map_err(|e| e.to_string())?
             .into_inner();
-        Ok(l.images
-            .into_iter()
-            .map(|i| ImageInfo {
-                name: i.name,
-                path: i.path,
-                source: i.source,
-                created_unix: i.created_unix,
-            })
-            .collect())
+        Ok(l.images)
     })
     .await
 }
 
+/// `pod-metrics` event payload: the agent's Metric sample, flattened, plus
+/// the pod name it belongs to so one listener can fan out to every row.
 #[derive(Serialize, Clone)]
-struct MetricSample {
+struct MetricEvent {
     pod: String,
-    ts_unix_ms: u64,
-    mem_bytes: u64,
-    mem_high_bytes: u64,
-    cpu_pct: f64,
-    pids: u64,
-    mem_psi_avg10: f64,
-    io_psi_avg10: f64,
-    cpu_psi_avg10: f64,
+    #[serde(flatten)]
+    metric: Metric,
 }
 
 /// Subscribe to a pod's live metric stream; each sample is emitted to the
@@ -229,18 +171,11 @@ async fn watch_metrics<R: tauri::Runtime>(
             return;
         };
         while let Ok(Some(m)) = s.message().await {
-            let sample = MetricSample {
+            let ev = MetricEvent {
                 pod: pod.clone(),
-                ts_unix_ms: m.ts_unix_ms,
-                mem_bytes: m.mem_bytes,
-                mem_high_bytes: m.mem_high_bytes,
-                cpu_pct: m.cpu_pct,
-                pids: m.pids,
-                mem_psi_avg10: m.mem_psi_avg10,
-                io_psi_avg10: m.io_psi_avg10,
-                cpu_psi_avg10: m.cpu_psi_avg10,
+                metric: m,
             };
-            if app.emit("pod-metrics", sample).is_err() {
+            if app.emit("pod-metrics", ev).is_err() {
                 break;
             }
         }
@@ -260,32 +195,13 @@ async fn unwatch_metrics(watches: State<'_, WatchMap>, name: String) -> Result<(
     Ok(())
 }
 
-#[derive(Serialize)]
-struct DaemonStatus {
-    version: String,
-    socket_path: String,
-    data_dir: String,
-    machined: bool,
-    storage_driver: String,
-    runtime_engine: String,
-}
-
 #[tauri::command]
-async fn get_daemon_info(rt: State<'_, Rt>) -> Result<DaemonStatus, String> {
+async fn get_daemon_info(rt: State<'_, Rt>) -> Result<DaemonInfo, String> {
     call(&rt.0, |mut c| async move {
-        let i = c
-            .ping(PingRequest {})
+        c.ping(PingRequest {})
             .await
-            .map_err(|e| e.to_string())?
-            .into_inner();
-        Ok(DaemonStatus {
-            version: i.version,
-            socket_path: i.socket_path,
-            data_dir: i.data_dir,
-            machined: i.machined,
-            storage_driver: i.storage_driver,
-            runtime_engine: i.runtime_engine,
-        })
+            .map(|r| r.into_inner())
+            .map_err(|e| e.to_string())
     })
     .await
 }

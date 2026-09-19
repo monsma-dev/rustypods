@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
-import type { DaemonStatus, ImageInfo, MetricSample, PodInfo } from "./types";
+import type { DaemonInfo, Image, Limits, Metric, Pod } from "./api";
+import { PodState, podStateToJSON } from "./proto/rustypods";
 
 type View = "pods" | "stacks" | "images" | "settings";
 
@@ -16,9 +17,17 @@ const GIB = 2 ** 30;
 const fmtGib = (bytes: number) =>
   bytes === 0 ? "unlimited" : `${(bytes / GIB).toFixed(1)} GiB`;
 
+const ZERO_LIMITS: Limits = {
+  memoryHighBytes: 0,
+  memoryMaxBytes: 0,
+  cpuQuotaPercent: 0,
+};
+const limitsOf = (p: Pod): Limits => p.limits ?? ZERO_LIMITS;
+const isRunning = (p: Pod) => p.state === PodState.POD_STATE_RUNNING;
+
 /** Live metric ring buffer (30 samples) for one pod — only when running. */
-function useMetrics(pod: string, active: boolean): MetricSample[] {
-  const [samples, setSamples] = useState<MetricSample[]>([]);
+function useMetrics(pod: string, active: boolean): Metric[] {
+  const [samples, setSamples] = useState<Metric[]>([]);
   useEffect(() => {
     if (!active) {
       setSamples([]);
@@ -94,16 +103,16 @@ function HeaderBar({ title }: { title: string }) {
 
 /* ---------- atoms ---------- */
 
-function StateBadge({ state }: { state: PodInfo["state"] }) {
+function StateBadge({ state }: { state: PodState }) {
   const cls =
-    state === "running"
+    state === PodState.POD_STATE_RUNNING
       ? "bg-ok/15 text-ok"
-      : state === "failed"
+      : state === PodState.POD_STATE_FAILED
         ? "bg-err/15 text-err"
         : "bg-white/5 text-muted";
   return (
     <span className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${cls}`}>
-      {state}
+      {podStateToJSON(state).replace("POD_STATE_", "").toLowerCase()}
     </span>
   );
 }
@@ -276,8 +285,8 @@ const fmtBytesShort = (b: number) => {
   return `${(b / 2 ** 10).toFixed(0)}K`;
 };
 
-function MetricsSection({ pod, lean }: { pod: PodInfo; lean: boolean }) {
-  const [samples, setSamples] = useState<MetricSample[]>([]);
+function MetricsSection({ pod, lean }: { pod: Pod; lean: boolean }) {
+  const [samples, setSamples] = useState<Metric[]>([]);
 
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -295,9 +304,10 @@ function MetricsSection({ pod, lean }: { pod: PodInfo; lean: boolean }) {
     };
   }, [pod.name]);
 
+  const lim = limitsOf(pod);
   const last = samples[samples.length - 1];
-  const noData = !last || (last.mem_bytes === 0 && last.ts_unix_ms === 0);
-  const peak = (f: (m: MetricSample) => number) =>
+  const noData = !last || (last.memBytes === 0 && last.tsUnixMs === 0);
+  const peak = (f: (m: Metric) => number) =>
     Math.max(1, ...samples.map(f));
 
   return (
@@ -310,11 +320,11 @@ function MetricsSection({ pod, lean }: { pod: PodInfo; lean: boolean }) {
       ) : lean ? (
         // Lean/RPi: text-only, no SVG work.
         <>
-          <Row label="Memory" value={`${fmtBytesShort(last.mem_bytes)} used`} />
-          <Row label="CPU" value={`${last.cpu_pct.toFixed(0)}%`} />
+          <Row label="Memory" value={`${fmtBytesShort(last.memBytes)} used`} />
+          <Row label="CPU" value={`${last.cpuPct.toFixed(0)}%`} />
           <Row
             label="PSI (mem / io / cpu)"
-            value={`${last.mem_psi_avg10.toFixed(1)} / ${last.io_psi_avg10.toFixed(1)} / ${last.cpu_psi_avg10.toFixed(1)}`}
+            value={`${last.memPsiAvg10.toFixed(1)} / ${last.ioPsiAvg10.toFixed(1)} / ${last.cpuPsiAvg10.toFixed(1)}`}
           />
           <Row label="PIDs" value={String(last.pids)} />
         </>
@@ -324,21 +334,21 @@ function MetricsSection({ pod, lean }: { pod: PodInfo; lean: boolean }) {
             <div className="mb-1 flex justify-between text-[11px]">
               <span className="font-medium">Memory</span>
               <span className="font-mono text-muted">
-                {fmtBytesShort(last.mem_bytes)}
-                {pod.memory_max_bytes > 0 && ` / ${pod.memory_max}`}
+                {fmtBytesShort(last.memBytes)}
+                {lim.memoryMaxBytes > 0 && ` / ${fmtBytesShort(lim.memoryMaxBytes)}`}
               </span>
             </div>
             <Spark
-              series={[samples.map((m) => m.mem_bytes)]}
+              series={[samples.map((m) => m.memBytes)]}
               colors={["#3584e4"]}
               max={Math.max(
-                pod.memory_max_bytes,
-                pod.memory_high_bytes,
-                peak((m) => m.mem_bytes) * 1.15
+                lim.memoryMaxBytes,
+                lim.memoryHighBytes,
+                peak((m) => m.memBytes) * 1.15
               )}
               marks={[
-                pod.memory_high_bytes > 0 && { v: pod.memory_high_bytes, color: "#f6d32d" },
-                pod.memory_max_bytes > 0 && { v: pod.memory_max_bytes, color: "#e01b24" },
+                lim.memoryHighBytes > 0 && { v: lim.memoryHighBytes, color: "#f6d32d" },
+                lim.memoryMaxBytes > 0 && { v: lim.memoryMaxBytes, color: "#e01b24" },
               ].filter(Boolean) as { v: number; color: string }[]}
             />
           </div>
@@ -346,20 +356,20 @@ function MetricsSection({ pod, lean }: { pod: PodInfo; lean: boolean }) {
             <div className="mb-1 flex justify-between text-[11px]">
               <span className="font-medium">CPU</span>
               <span className="font-mono text-muted">
-                {last.cpu_pct.toFixed(0)}%
-                {pod.cpu_quota_percent > 0 && ` / ${pod.cpu_quota_percent}%`}
+                {last.cpuPct.toFixed(0)}%
+                {lim.cpuQuotaPercent > 0 && ` / ${lim.cpuQuotaPercent}%`}
               </span>
             </div>
             <Spark
-              series={[samples.map((m) => m.cpu_pct)]}
+              series={[samples.map((m) => m.cpuPct)]}
               colors={["#33d17a"]}
               max={Math.max(
-                pod.cpu_quota_percent || 100,
-                peak((m) => m.cpu_pct) * 1.15
+                lim.cpuQuotaPercent || 100,
+                peak((m) => m.cpuPct) * 1.15
               )}
               marks={
-                pod.cpu_quota_percent > 0
-                  ? [{ v: pod.cpu_quota_percent, color: "#f6d32d" }]
+                lim.cpuQuotaPercent > 0
+                  ? [{ v: lim.cpuQuotaPercent, color: "#f6d32d" }]
                   : []
               }
             />
@@ -368,23 +378,23 @@ function MetricsSection({ pod, lean }: { pod: PodInfo; lean: boolean }) {
             <div className="mb-1 flex justify-between text-[11px]">
               <span className="font-medium">Pressure stall (avg10)</span>
               <span className="flex gap-2 font-mono text-muted">
-                <span className="text-accent">mem {last.mem_psi_avg10.toFixed(1)}</span>
-                <span className="text-warn">io {last.io_psi_avg10.toFixed(1)}</span>
-                <span className="text-err">cpu {last.cpu_psi_avg10.toFixed(1)}</span>
+                <span className="text-accent">mem {last.memPsiAvg10.toFixed(1)}</span>
+                <span className="text-warn">io {last.ioPsiAvg10.toFixed(1)}</span>
+                <span className="text-err">cpu {last.cpuPsiAvg10.toFixed(1)}</span>
               </span>
             </div>
             <Spark
               series={[
-                samples.map((m) => m.mem_psi_avg10),
-                samples.map((m) => m.io_psi_avg10),
-                samples.map((m) => m.cpu_psi_avg10),
+                samples.map((m) => m.memPsiAvg10),
+                samples.map((m) => m.ioPsiAvg10),
+                samples.map((m) => m.cpuPsiAvg10),
               ]}
               colors={["#3584e4", "#f6d32d", "#e01b24"]}
               max={Math.max(
                 10,
-                peak((m) => m.mem_psi_avg10),
-                peak((m) => m.io_psi_avg10),
-                peak((m) => m.cpu_psi_avg10)
+                peak((m) => m.memPsiAvg10),
+                peak((m) => m.ioPsiAvg10),
+                peak((m) => m.cpuPsiAvg10)
               )}
             />
           </div>
@@ -417,35 +427,38 @@ function PodDetail({
   onClose,
   act,
 }: {
-  pod: PodInfo;
+  pod: Pod;
   lean: boolean;
   onClose: () => void;
   act: (f: () => Promise<unknown>) => void;
 }) {
-  const [memHigh, setMemHigh] = useState(pod.memory_high_bytes);
-  const [memMax, setMemMax] = useState(pod.memory_max_bytes);
-  const [cpu, setCpu] = useState(pod.cpu_quota_percent);
-  const [disk, setDisk] = useState(pod.storage_max_bytes);
+  const lim = limitsOf(pod);
+  const [memHigh, setMemHigh] = useState(lim.memoryHighBytes);
+  const [memMax, setMemMax] = useState(lim.memoryMaxBytes);
+  const [cpu, setCpu] = useState(lim.cpuQuotaPercent);
+  const [disk, setDisk] = useState(pod.storageMaxBytes);
   const [ports, setPorts] = useState<PortRow[]>(pod.ports.map(parsePort));
   const [newPort, setNewPort] = useState<PortRow>({ host: "", pod: "", proto: "tcp" });
 
   const dirty =
-    memHigh !== pod.memory_high_bytes ||
-    memMax !== pod.memory_max_bytes ||
-    cpu !== pod.cpu_quota_percent ||
-    disk !== pod.storage_max_bytes ||
+    memHigh !== lim.memoryHighBytes ||
+    memMax !== lim.memoryMaxBytes ||
+    cpu !== lim.cpuQuotaPercent ||
+    disk !== pod.storageMaxBytes ||
     ports.map(serializePort).join(",") !== pod.ports.join(",");
 
-  const running = pod.state === "running";
+  const running = isRunning(pod);
 
   const apply = () =>
     act(() =>
       api.updatePodConfig({
         name: pod.name,
-        memory_high_bytes: memHigh,
-        memory_max_bytes: memMax,
-        cpu_quota_percent: cpu,
-        storage_max_bytes: disk,
+        limits: {
+          memoryHighBytes: memHigh,
+          memoryMaxBytes: memMax,
+          cpuQuotaPercent: cpu,
+        },
+        storageMaxBytes: disk,
         ports: ports.map(serializePort),
       })
     );
@@ -474,7 +487,7 @@ function PodDetail({
             </div>
             <p className="mt-0.5 truncate text-[11px] text-muted">
               {pod.image}
-              {running && ` · pid ${pod.leader_pid}`}
+              {running && ` · pid ${pod.leaderPid}`}
               {pod.stack && ` · stack ${pod.stack}`}
             </p>
           </div>
@@ -489,7 +502,7 @@ function PodDetail({
             ) : (
               <button
                 onClick={() => act(() => api.startPod(pod.name))}
-                className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accentHover"
+                className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
               >
                 Start
               </button>
@@ -623,10 +636,10 @@ function PodDetail({
           <div className="flex gap-2">
             <button
               onClick={() => {
-                setMemHigh(pod.memory_high_bytes);
-                setMemMax(pod.memory_max_bytes);
-                setCpu(pod.cpu_quota_percent);
-                setDisk(pod.storage_max_bytes);
+                setMemHigh(lim.memoryHighBytes);
+                setMemMax(lim.memoryMaxBytes);
+                setCpu(lim.cpuQuotaPercent);
+                setDisk(pod.storageMaxBytes);
                 setPorts(pod.ports.map(parsePort));
               }}
               disabled={!dirty}
@@ -637,7 +650,7 @@ function PodDetail({
             <button
               onClick={apply}
               disabled={!dirty}
-              className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accentHover disabled:opacity-40"
+              className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
             >
               Apply
             </button>
@@ -673,23 +686,24 @@ function PodRow({
   act,
   onOpen,
 }: {
-  pod: PodInfo;
+  pod: Pod;
   act: (f: () => Promise<unknown>) => void;
-  onOpen: (p: PodInfo) => void;
+  onOpen: (p: Pod) => void;
 }) {
-  const running = pod.state === "running";
+  const running = isRunning(pod);
+  const lim = limitsOf(pod);
   const samples = useMetrics(pod.name, running);
   const last = samples[samples.length - 1];
   const memMax = Math.max(
-    pod.memory_max_bytes,
-    pod.memory_high_bytes,
-    ...samples.map((m) => m.mem_bytes),
+    lim.memoryMaxBytes,
+    lim.memoryHighBytes,
+    ...samples.map((m) => m.memBytes),
     1
   );
   const limits = [
-    pod.memory_max_bytes > 0 && `≤${pod.memory_max}`,
-    pod.cpu_quota_percent > 0 && `${pod.cpu_quota_percent}%`,
-    pod.storage_max_bytes > 0 && `${pod.storage_max}`,
+    lim.memoryMaxBytes > 0 && `≤${fmtBytesShort(lim.memoryMaxBytes)}`,
+    lim.cpuQuotaPercent > 0 && `${lim.cpuQuotaPercent}%`,
+    pod.storageMaxBytes > 0 && `${fmtBytesShort(pod.storageMaxBytes)}`,
   ]
     .filter(Boolean)
     .join(" ");
@@ -709,16 +723,16 @@ function PodRow({
         <StateBadge state={pod.state} />
         {running && (
           <span className="ml-2 font-mono text-[11px] text-muted">
-            {pod.leader_pid}
+            {pod.leaderPid}
           </span>
         )}
       </td>
       <td className="px-3 py-1">
         {running && last ? (
           <span className="flex items-center gap-2">
-            <MiniSpark data={samples.map((m) => m.mem_bytes)} max={memMax} />
+            <MiniSpark data={samples.map((m) => m.memBytes)} max={memMax} />
             <span className="font-mono text-[11px] text-muted">
-              {fmtBytesShort(last.mem_bytes)}
+              {fmtBytesShort(last.memBytes)}
             </span>
           </span>
         ) : (
@@ -729,12 +743,12 @@ function PodRow({
         {running && last ? (
           <span
             className={
-              pod.cpu_quota_percent > 0 && last.cpu_pct > pod.cpu_quota_percent
+              lim.cpuQuotaPercent > 0 && last.cpuPct > lim.cpuQuotaPercent
                 ? "text-warn"
                 : "text-muted"
             }
           >
-            {last.cpu_pct.toFixed(0)}%
+            {last.cpuPct.toFixed(0)}%
           </span>
         ) : (
           <span className="text-muted">—</span>
@@ -761,7 +775,7 @@ function PodRow({
               e.stopPropagation();
               act(() => api.startPod(pod.name));
             }}
-            className="rounded-md bg-accent px-2 py-0.5 text-[11px] font-medium text-white transition-colors hover:bg-accentHover"
+            className="rounded-md bg-accent px-2 py-0.5 text-[11px] font-medium text-white transition-colors hover:bg-accent-hover"
           >
             Start
           </button>
@@ -776,9 +790,9 @@ function PodsView({
   act,
   onOpen,
 }: {
-  pods: PodInfo[];
+  pods: Pod[];
   act: (f: () => Promise<unknown>) => void;
-  onOpen: (p: PodInfo) => void;
+  onOpen: (p: Pod) => void;
 }) {
   if (pods.length === 0) {
     return (
@@ -813,10 +827,10 @@ function StacksView({
   pods,
   onOpen,
 }: {
-  pods: PodInfo[];
-  onOpen: (p: PodInfo) => void;
+  pods: Pod[];
+  onOpen: (p: Pod) => void;
 }) {
-  const groups = new Map<string, PodInfo[]>();
+  const groups = new Map<string, Pod[]>();
   for (const p of pods.filter((p) => p.stack)) {
     groups.set(p.stack, [...(groups.get(p.stack) ?? []), p]);
   }
@@ -852,7 +866,7 @@ function StacksView({
   );
 }
 
-function ImagesView({ images }: { images: ImageInfo[] }) {
+function ImagesView({ images }: { images: Image[] }) {
   if (images.length === 0) {
     return (
       <p className="mt-10 text-center text-sm text-muted">
@@ -882,7 +896,7 @@ function SettingsView({
   reduceMotion,
   setReduceMotion,
 }: {
-  info: DaemonStatus | null;
+  info: DaemonInfo | null;
   intervalMs: number;
   setIntervalMs: (v: number) => void;
   reduceMotion: boolean;
@@ -894,9 +908,9 @@ function SettingsView({
         {info ? (
           <>
             <Row label="Version" value={info.version} />
-            <Row label="Socket" value={info.socket_path} />
-            <Row label="Data dir" value={info.data_dir} />
-            <Row label="Runtime engine" value={info.runtime_engine} />
+            <Row label="Socket" value={info.socketPath} />
+            <Row label="Data dir" value={info.dataDir} />
+            <Row label="Runtime engine" value={info.runtimeEngine} />
             <Row label="machined" value={String(info.machined)} />
           </>
         ) : (
@@ -940,11 +954,11 @@ function SettingsView({
       </Group>
 
       <Group title="Storage">
-        <Row label="Driver" value={info?.storage_driver ?? "—"} />
+        <Row label="Driver" value={info?.storageDriver ?? "—"} />
         <Row
           label="Quotas"
           value={
-            info?.storage_driver === "btrfs"
+            info?.btrfs
               ? "btrfs qgroups — hot-applied"
               : "unavailable (non-btrfs)"
           }
@@ -953,7 +967,7 @@ function SettingsView({
         <Row
           label="Snapshots"
           value={
-            info?.storage_driver === "btrfs"
+            info?.btrfs
               ? "instant CoW (commit / rollback)"
               : "reflink copy fallback"
           }
@@ -971,9 +985,9 @@ export default function App() {
     const v = new URLSearchParams(location.search).get("view");
     return v === "stacks" || v === "images" || v === "settings" ? v : "pods";
   });
-  const [pods, setPods] = useState<PodInfo[]>([]);
-  const [images, setImages] = useState<ImageInfo[]>([]);
-  const [info, setInfo] = useState<DaemonStatus | null>(null);
+  const [pods, setPods] = useState<Pod[]>([]);
+  const [images, setImages] = useState<Image[]>([]);
+  const [info, setInfo] = useState<DaemonInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [intervalMs, setIntervalMs] = useState(2000);
   const [reduceMotion, setReduceMotion] = useState(false);
@@ -1064,7 +1078,7 @@ export default function App() {
           <div className="border-t border-white/10 px-3 py-2 text-[10px] text-muted">
             {info ? (
               <span className="font-mono">
-                v{info.version} · {info.storage_driver}
+                v{info.version} · {info.storageDriver}
               </span>
             ) : (
               "daemon offline"

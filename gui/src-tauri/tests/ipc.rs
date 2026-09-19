@@ -48,8 +48,9 @@ fn pods_lifecycle_via_ipc() {
     let pods = pods.as_array().unwrap();
     assert!(pods.iter().any(|p| p["name"] == "dev"), "no dev pod: {pods:?}");
 
+    // state is the proto enum: 2 = RUNNING, 3 = STOPPED (POD_STATE_*).
     let stopped = invoke(&wv, "stop_pod", json!({"name": "dev"})).expect("stop failed");
-    assert_eq!(stopped["state"], "stopped");
+    assert_eq!(stopped["state"], 3);
 
     let pods = invoke(&wv, "get_pods", json!({})).unwrap();
     let dev = pods
@@ -58,11 +59,11 @@ fn pods_lifecycle_via_ipc() {
         .iter()
         .find(|p| p["name"] == "dev")
         .unwrap();
-    assert_eq!(dev["state"], "stopped");
+    assert_eq!(dev["state"], 3);
 
     let started = invoke(&wv, "start_pod", json!({"name": "dev"})).expect("start failed");
-    assert_eq!(started["state"], "running");
-    assert!(started["leader_pid"].as_u64().unwrap() > 0);
+    assert_eq!(started["state"], 2);
+    assert!(started["leaderPid"].as_u64().unwrap() > 0);
 
     // Live config update: new limits + a port mapping, hot-applied.
     let updated = invoke(
@@ -78,8 +79,8 @@ fn pods_lifecycle_via_ipc() {
         }),
     )
     .expect("update_pod_config failed");
-    assert_eq!(updated["memory_high_bytes"], 8u64 << 30);
-    assert_eq!(updated["cpu_quota_percent"], 200);
+    assert_eq!(updated["limits"]["memoryHighBytes"], 8u64 << 30);
+    assert_eq!(updated["limits"]["cpuQuotaPercent"], 200);
     assert_eq!(updated["ports"], json!(["18099:22/tcp"]));
 
     // Restore dev's original config.
@@ -99,5 +100,5 @@ fn pods_lifecycle_via_ipc() {
     assert_eq!(restored["ports"], json!([]));
 
     let info = invoke(&wv, "get_daemon_info", json!({})).expect("ping failed");
-    assert_eq!(info["storage_driver"], "btrfs");
+    assert_eq!(info["storageDriver"], "btrfs");
 }
