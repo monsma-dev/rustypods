@@ -25,3 +25,19 @@ podman exec -u nick -w /home/nick/Projects/rustypods arch bash -lc \
 - Mirrors `~/Projects/computer` workspace style: `crates/`, edition 2021,
   anyhow/clap/tracing, Dutch user-facing strings.
 - Never poke Cinnamon/desktop services from an agent (see computer/AGENTS.md).
+
+## Hard-won: never bind /run/user/<uid> read-write into a booting pod
+
+On 2026-09-19 a `--bind=/run/user/1000` (rw) let the pod's logind run
+`user-runtime-dir@1000` session cleanup, which `rm -rf`'d the bound dir —
+wiping the host's user bus + systemd socket (rootless podman dead until
+relogin). The bind is `--bind-ro=` now; socket connects work fine on ro
+mounts. Same class of caution applies to any host dir another init system
+considers "theirs" (`/run`, `/var/lib`, `/etc`).
+
+## Rootless podman caveat
+
+`podman` needs the user session bus (`/run/user/1000/bus`). If `podman
+exec/start` fails with "Interactive authentication required", the user
+session is down — the rustypods daemon itself (root, system bus) is
+unaffected. Builds can then run inside a pod: `rustypods shell dev`.

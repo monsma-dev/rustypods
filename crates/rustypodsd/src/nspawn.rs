@@ -19,10 +19,12 @@ pub fn start_argv(rootfs: &Path, name: &str, ephemeral: bool, private_users: boo
         format!("--machine={name}").into(),
         "--directory".into(),
         rootfs.as_os_str().into(),
-        // distrobox-parity binds: home + tmp + user runtime (Wayland/Pulse).
+        // distrobox-parity binds: home + tmp. /run/user/1000 is READ-ONLY:
+        // container-logind runs user-runtime-dir@1000 whose session cleanup
+        // rm -rf's it — a rw bind wiped the host's user bus once already.
         "--bind=/home/nick".into(),
         "--bind=/tmp".into(),
-        "--bind=/run/user/1000".into(),
+        "--bind-ro=/run/user/1000".into(),
     ];
     if Path::new("/dev/dri").is_dir() {
         a.push("--bind-ro=/dev/dri".into());

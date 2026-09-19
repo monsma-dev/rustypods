@@ -125,7 +125,7 @@ impl PodControl for Svc {
                 return Err(int(anyhow::anyhow!("task: {je}")));
             }
         }
-        sanitize_rootfs(&dest).map_err(int)?;
+        sanitize_rootfs(&dest, &req.distrobox).map_err(int)?;
         let meta = ImageMeta {
             name: name.clone(),
             source: format!("distrobox:{}", req.distrobox),
@@ -353,7 +353,9 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
 
 /// Strip distrobox/podman runtime artifacts so `systemd-nspawn --boot` gets a
 /// clean Arch rootfs: host binds aren't in the export, but init leftovers are.
-fn sanitize_rootfs(root: &Path) -> Result<()> {
+/// `container_id` = the distrobox name — host wrappers in ~/.local/bin check
+/// CONTAINER_ID and exec the local binary directly when it matches.
+fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
     for rel in [
         "etc/hostname",
         "etc/hosts",
@@ -378,6 +380,22 @@ fn sanitize_rootfs(root: &Path) -> Result<()> {
             }
         }
     }
+    // distrobox-export wrappers in ~/.local/bin branch on CONTAINER_ID:
+    // matching the source box name makes them exec the real /usr/bin binary.
+    // Fallback for unset CONTAINER_ID: a shim at the absolute path the
+    // wrappers call, stripping "-n <box> --" and exec'ing the payload.
+    let mut envf = std::fs::read_to_string(root.join("etc/environment")).unwrap_or_default();
+    if !envf.contains("CONTAINER_ID=") {
+        envf.push_str(&format!("CONTAINER_ID={container_id}\n"));
+        std::fs::write(root.join("etc/environment"), envf)?;
+    }
+    let shim = root.join("usr/bin/distrobox-enter");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n# rustypods shim: inside an nspawn pod, exec the payload directly.\nwhile [ $# -gt 0 ]; do [ \"$1\" = \"--\" ] && { shift; break; }; shift; done\nexec \"$@\"\n",
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
     Ok(())
 }
 
