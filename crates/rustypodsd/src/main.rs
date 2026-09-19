@@ -1,0 +1,47 @@
+use anyhow::Result;
+use clap::Parser;
+use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
+
+use rustypodsd::{euid, server, Config};
+
+#[derive(Parser)]
+#[command(
+    name = "rustypodsd",
+    about = "RustyPods daemon — nspawn pods op Btrfs, aangestuurd via UDS+gRPC"
+)]
+struct Args {
+    /// Root voor images/, pods/, logs/, bin/, shm/, state.json.
+    #[arg(long, default_value = rustypods_proto::DATA_DIR)]
+    data_dir: PathBuf,
+
+    /// Unix socket voor de controlplane.
+    #[arg(long, default_value = rustypods_proto::SOCKET_PATH)]
+    socket: PathBuf,
+
+    /// Naast root mag deze uid de daemon aansturen.
+    #[arg(long, default_value_t = 1000)]
+    allowed_uid: u32,
+
+    /// Host-user met de rootless podman store (voor `import --from-distrobox`).
+    #[arg(long, default_value = "nick")]
+    import_user: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
+    let args = Args::parse();
+    if euid() != 0 {
+        tracing::warn!("rustypodsd draait niet als root — nspawn/btrfs/machined zullen falen");
+    }
+    server::serve(Config {
+        data_dir: args.data_dir,
+        socket: args.socket,
+        allowed_uid: args.allowed_uid,
+        import_user: args.import_user,
+    })
+    .await
+}

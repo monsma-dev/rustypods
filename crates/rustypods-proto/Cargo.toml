@@ -1,0 +1,16 @@
+[package]
+name = "rustypods-proto"
+version.workspace = true
+edition.workspace = true
+description = "RustyPods protobuf API + shared constants/util"
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true

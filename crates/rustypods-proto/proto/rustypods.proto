@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+package rustypods.v1;
+
+// Control plane: pod lifecycle over a Unix domain socket.
+// Phase-2 RPCs (Exec, PodMetrics, StreamLogs) are declared now for API
+// stability; the daemon returns UNIMPLEMENTED until then.
+service PodControl {
+  rpc Ping(PingRequest) returns (DaemonInfo);
+
+  rpc ImportImage(ImportImageRequest) returns (Image);
+  rpc ListImages(ListImagesRequest) returns (ImageList);
+  rpc RemoveImage(ImageRef) returns (Empty);
+
+  rpc CreatePod(CreatePodRequest) returns (Pod);
+  rpc StartPod(StartPodRequest) returns (Pod);
+  rpc StopPod(PodRef) returns (Pod);
+  rpc ListPods(ListPodsRequest) returns (PodList);
+  rpc DestroyPod(PodRef) returns (Empty);
+
+  rpc Exec(stream ExecChunk) returns (stream ExecChunk);
+  rpc PodMetrics(PodRef) returns (stream Metric);
+  rpc StreamLogs(PodRef) returns (stream LogLine);
+}
+
+message Empty {}
+message PingRequest {}
+
+message DaemonInfo {
+  string version = 1;
+  string socket_path = 2;
+  string data_dir = 3;
+  bool machined = 4;
+  bool btrfs = 5;
+}
+
+message Image {
+  string name = 1;
+  string path = 2;
+  string source = 3;
+  uint64 created_unix = 4;
+}
+
+message ImageList {
+  repeated Image images = 1;
+}
+
+message ImageRef {
+  string name = 1;
+}
+
+message ListImagesRequest {}
+
+message ImportImageRequest {
+  string name = 1;
+  // Rootless podman container to export (e.g. "arch").
+  string distrobox = 2;
+  // Host user owning the rootless podman store (root podman cannot see it).
+  string import_user = 3;
+}
+
+enum PodState {
+  POD_STATE_UNKNOWN = 0;
+  POD_STATE_CREATED = 1;
+  POD_STATE_RUNNING = 2;
+  POD_STATE_STOPPED = 3;
+  POD_STATE_FAILED = 4;
+}
+
+message Limits {
+  // 0 = unset. Applied to machine-<name>.scope after nspawn registers.
+  uint64 memory_high_bytes = 1;
+  uint64 memory_max_bytes = 2;
+  uint32 cpu_quota_percent = 3;
+}
+
+message Pod {
+  string name = 1;
+  string image = 2;
+  string rootfs = 3;
+  PodState state = 4;
+  uint32 leader_pid = 5;
+  uint64 created_unix = 6;
+  Limits limits = 7;
+  bool ephemeral = 8;
+}
+
+message PodList {
+  repeated Pod pods = 1;
+}
+
+message PodRef {
+  string name = 1;
+}
+
+message ListPodsRequest {}
+
+message CreatePodRequest {
+  string name = 1;
+  string image = 2;
+}
+
+message StartPodRequest {
+  string name = 1;
+  Limits limits = 2;
+  // -x: nspawn snapshots the pod dir itself and discards changes on exit.
+  bool ephemeral = 3;
+  // Stronger isolation at the cost of host-uid identity (breaks shared
+  // home-dir writes as `nick`). Maps to nspawn --private-users=pick.
+  bool private_users = 4;
+}
+
+// Phase 2: fd 0 = stdin, 1 = stdout, 2 = stderr, 3 = winsize change.
+message ExecChunk {
+  int32 fd = 1;
+  bytes data = 2;
+}
+
+message Metric {
+  uint64 ts_unix_ms = 1;
+  uint64 mem_bytes = 2;
+  uint64 mem_high_bytes = 3;
+  double cpu_pct = 4;
+  uint64 pids = 5;
+}
+
+message LogLine {
+  uint64 ts_unix_ms = 1;
+  bytes data = 2;
+}

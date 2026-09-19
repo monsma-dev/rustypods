@@ -1,0 +1,21 @@
+[package]
+name = "rustypods"
+version.workspace = true
+edition.workspace = true
+description = "RustyPods CLI — podman/distrobox-style frontend for rustypodsd"
+
+[[bin]]
+name = "rustypods"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rustypods-proto.workspace = true
+http.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

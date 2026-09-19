@@ -1,0 +1,14 @@
+[Unit]
+Description=RustyPods daemon — nspawn pod orchestrator
+Documentation=file:/home/nick/Projects/rustypods/README.md
+After=systemd-machined.service
+Wants=systemd-machined.service
+
+[Service]
+ExecStart=/usr/local/bin/rustypodsd
+RuntimeDirectory=rustypods
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

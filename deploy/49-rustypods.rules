@@ -1,0 +1,8 @@
+// RustyPods: user nick may manage machined pods without a password prompt
+// (machinectl shell/poweroff/terminate/list). Single-user dev box.
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.machine1.") === 0 &&
+        subject.user === "nick") {
+        return polkit.Result.YES;
+    }
+});
