@@ -33,6 +33,13 @@ pub struct StartSpec {
     pub netns: Option<PathBuf>,
     /// Console output is appended here.
     pub log: PathBuf,
+    /// OCI payload (entrypoint+cmd). Some → non-boot mode: the image has no
+    /// systemd, nspawn execs this argv directly. None → --boot.
+    pub payload: Option<Vec<String>>,
+    /// OCI env ("K=V") → nspawn --setenv.
+    pub env: Vec<String>,
+    /// OCI working dir → nspawn --chdir (non-boot only).
+    pub chdir: String,
 }
 
 #[tonic::async_trait]

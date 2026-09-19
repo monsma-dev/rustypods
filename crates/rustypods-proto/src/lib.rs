@@ -229,6 +229,41 @@ pub fn fmt_bytes(b: u64) -> String {
     }
 }
 
+/// Parse "7d", "24h", "30m", "60s", or a bare second count into seconds.
+pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.as_bytes().last() {
+        Some(b'd') | Some(b'D') => (&s[..s.len() - 1], 86400u64),
+        Some(b'h') | Some(b'H') => (&s[..s.len() - 1], 3600),
+        Some(b'm') | Some(b'M') => (&s[..s.len() - 1], 60),
+        Some(b's') | Some(b'S') => (&s[..s.len() - 1], 1),
+        _ => (s, 1u64),
+    };
+    let v: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration '{s}'"))?;
+    if v < 0.0 {
+        anyhow::bail!("invalid duration '{s}'");
+    }
+    Ok((v * mult as f64) as u64)
+}
+
+/// Seconds back to the coarsest whole unit: 604800 → "7d", 3600 → "1h".
+pub fn fmt_duration(secs: u64) -> String {
+    if secs == 0 {
+        "0s".into()
+    } else if secs % 86400 == 0 {
+        format!("{}d", secs / 86400)
+    } else if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +332,28 @@ mod tests {
         assert_eq!(parse_bytes("512m").unwrap(), 512 << 20);
         assert_eq!(parse_bytes("1024").unwrap(), 1024);
         assert!(parse_bytes("abc").is_err());
+    }
+
+    #[test]
+    fn duration_parsing() {
+        assert_eq!(parse_duration("7d").unwrap(), 7 * 86400);
+        assert_eq!(parse_duration("24h").unwrap(), 24 * 3600);
+        assert_eq!(parse_duration("30m").unwrap(), 30 * 60);
+        assert_eq!(parse_duration("60s").unwrap(), 60);
+        assert_eq!(parse_duration("120").unwrap(), 120);
+        assert_eq!(parse_duration("0").unwrap(), 0);
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("-5d").is_err());
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn duration_formatting() {
+        assert_eq!(fmt_duration(7 * 86400), "7d");
+        assert_eq!(fmt_duration(24 * 3600), "1d"); // coarsest whole unit wins
+        assert_eq!(fmt_duration(36 * 3600), "36h");
+        assert_eq!(fmt_duration(30 * 60), "30m");
+        assert_eq!(fmt_duration(45), "45s");
+        assert_eq!(fmt_duration(0), "0s");
     }
 }

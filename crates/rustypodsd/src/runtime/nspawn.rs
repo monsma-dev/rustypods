@@ -16,13 +16,16 @@ use super::{RuntimeEngine, StartSpec};
 
 /// Pure argv builder — unit-testable.
 pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
-    let mut a: Vec<OsString> = vec![
-        "systemd-nspawn".into(),
-        "--boot".into(),
-        format!("--machine={}", spec.name).into(),
-        "--directory".into(),
-        spec.rootfs.as_os_str().into(),
-    ];
+    let mut a: Vec<OsString> = vec!["systemd-nspawn".into()];
+    // OCI payload images carry no systemd — nspawn execs the entrypoint
+    // directly (non-boot). Distrobox-imported images boot their init.
+    // Non-boot pods still register with machined.
+    if spec.payload.is_none() {
+        a.push("--boot".into());
+    }
+    a.push(format!("--machine={}", spec.name).into());
+    a.push("--directory".into());
+    a.push(spec.rootfs.as_os_str().into());
     // User binds come from the pod conf (validated by validate_bind at write
     // time). rw under /run is refused there: container-logind runs
     // user-runtime-dir@<uid> whose session cleanup rm -rf's it — a rw bind
@@ -62,6 +65,17 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
         // systemd-networkd managing the host side, which most desktop
         // distros (NetworkManager, Netplan) don't run.
         a.push("--network-veth".into());
+    }
+    // OCI env + working dir (only populated for payload images).
+    for kv in &spec.env {
+        a.push(format!("--setenv={kv}").into());
+    }
+    if spec.payload.is_some() && !spec.chdir.is_empty() {
+        a.push(format!("--chdir={}", spec.chdir).into());
+    }
+    if let Some(payload) = &spec.payload {
+        a.push("--".into());
+        a.extend(payload.iter().map(OsString::from));
     }
     a
 }
@@ -161,6 +175,9 @@ mod tests {
             binds: vec![],
             netns: None,
             log: PathBuf::from("/tmp/x.log"),
+            payload: None,
+            env: vec![],
+            chdir: String::new(),
         }
     }
 
@@ -220,5 +237,29 @@ mod tests {
         let a = argv(&s);
         assert!(a.contains(&"--network-namespace-path=/var/run/netns/rustypods-demo".to_string()));
         assert!(!a.contains(&"--network-veth".to_string()));
+    }
+
+    #[test]
+    fn argv_payload_is_non_boot() {
+        let mut s = spec(false, true); // userns still applies in non-boot mode
+        s.payload = Some(vec!["/bin/sh".into(), "-l".into()]);
+        s.env = vec!["PATH=/usr/bin".into(), "HOME=/root".into()];
+        s.chdir = "/app".into();
+        let a = argv(&s);
+        assert!(!a.contains(&"--boot".to_string()), "payload ⇒ no --boot");
+        assert!(a.contains(&"--private-users=pick".to_string()));
+        assert!(a.contains(&"--setenv=PATH=/usr/bin".to_string()));
+        assert!(a.contains(&"--chdir=/app".to_string()));
+        // Payload comes last, after a "--" separator.
+        let tail: Vec<&str> = a[a.len() - 3..].iter().map(|s| s.as_str()).collect();
+        assert_eq!(tail, ["--", "/bin/sh", "-l"]);
+    }
+
+    #[test]
+    fn argv_boot_has_no_payload_bits() {
+        let a = argv(&spec(false, false));
+        assert!(a.contains(&"--boot".to_string()));
+        assert!(!a.iter().any(|s| s == "--"));
+        assert!(!a.iter().any(|s| s.starts_with("--setenv") || s.starts_with("--chdir")));
     }
 }

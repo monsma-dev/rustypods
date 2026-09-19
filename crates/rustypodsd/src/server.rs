@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::{Command as SyncCommand, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::net::UnixListener;
@@ -18,11 +18,13 @@ use rustypods_proto::rpc::*;
 use rustypods_proto::{self as proto};
 
 use crate::agent::{self, ListenerMap, MetricsMap};
+use crate::oci;
 use crate::runtime::{RuntimeEngine, StartSpec};
 use crate::state::{self, ImageMeta, LimitsSpec, PodMeta, State};
 use crate::storage::StorageDriver;
 use crate::{net, runtime, stack, storage, Config};
 
+#[derive(Clone)]
 pub struct Svc {
     cfg: Config,
     st: Arc<Mutex<State>>,
@@ -52,6 +54,8 @@ fn to_image(m: &ImageMeta, path: &Path) -> Image {
         path: path.display().to_string(),
         source: m.source.clone(),
         created_unix: m.created_unix,
+        entrypoint: m.entrypoint.clone(),
+        cmd: m.cmd.clone(),
     }
 }
 
@@ -80,6 +84,8 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         stack: m.stack.clone(),
         binds: m.binds.clone(),
         private_users: m.private_users,
+        snap_keep_last: m.snap_keep_last,
+        snap_max_age_secs: m.snap_max_age_secs,
     }
 }
 
@@ -154,6 +160,43 @@ impl Svc {
         out
     }
 
+    /// Latest agent-pushed metric for a pod (REST /metrics). None when the
+    /// agent never connected — a real sample always has ts_unix_ms > 0.
+    pub(crate) async fn latest_metric(&self, pod: &str) -> Option<Metric> {
+        self.metrics
+            .lock()
+            .await
+            .get(pod)
+            .map(|tx| tx.borrow().clone())
+            .filter(|m| m.ts_unix_ms > 0)
+    }
+
+    /// One snapshot-GC sweep: per-pod retention from the conf (keep_last
+    /// count cap and/or max_age) applied to snapshots/<pod>/, newest first.
+    async fn gc_snapshots(&self) {
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods
+                .values()
+                .filter(|m| m.snap_keep_last > 0 || m.snap_max_age_secs > 0)
+                .cloned()
+                .collect()
+        };
+        let now = state::now_unix();
+        for m in pods {
+            for (i, s) in self.snapshots(&m.name).iter().enumerate() {
+                if snapshot_expired(i, s.created_unix, m.snap_keep_last, m.snap_max_age_secs, now) {
+                    match self.storage.delete_rootfs(Path::new(&s.path)) {
+                        Ok(()) => tracing::info!("gc: deleted snapshot {} of pod {}", s.id, m.name),
+                        Err(e) => {
+                            tracing::warn!("gc: snapshot {} of pod {}: {e:#}", s.id, m.name)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Rebuild the nftables DNAT table from current state (running pods only).
     async fn sync_nat(&self) {
         let pods: Vec<PodMeta> = {
@@ -221,6 +264,47 @@ impl PodControl for Svc {
             name: name.clone(),
             source: format!("distrobox:{}", req.distrobox),
             created_unix: state::now_unix(),
+            entrypoint: vec![],
+            cmd: vec![],
+            env: vec![],
+            working_dir: String::new(),
+        };
+        let mut st = self.st.lock().await;
+        st.images.insert(name.clone(), meta.clone());
+        self.save_image(&meta).map_err(int)?;
+        Ok(Response::new(to_image(&meta, &dest)))
+    }
+
+    /// `rustypods pull <ref>`: native OCI pull — manifest+config+layers
+    /// straight from the registry, untarred into a fresh rootfs. Pulled
+    /// images carry their entrypoint/cmd and run non-boot (no systemd).
+    async fn pull_image(&self, req: Request<PullImageRequest>) -> Result<Response<Image>, Status> {
+        let req = req.into_inner();
+        let name = if req.name.is_empty() {
+            oci::default_name(&req.reference).map_err(bad)?
+        } else {
+            proto::validate_name(&req.name).map_err(bad)?.to_string()
+        };
+        let dest = self.cfg.images_dir().join(&name);
+        if dest.exists() {
+            return Err(Status::already_exists(format!("image {name} already exists")));
+        }
+        self.storage.create_rootfs(&dest).map_err(int)?;
+        let cfg = match oci::pull(&req.reference, &dest).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.storage.delete_rootfs(&dest);
+                return Err(int(e));
+            }
+        };
+        let meta = ImageMeta {
+            name: name.clone(),
+            source: format!("oci:{}", req.reference),
+            created_unix: state::now_unix(),
+            entrypoint: cfg.entrypoint,
+            cmd: cfg.cmd,
+            env: cfg.env,
+            working_dir: cfg.working_dir,
         };
         let mut st = self.st.lock().await;
         st.images.insert(name.clone(), meta.clone());
@@ -248,6 +332,8 @@ impl PodControl for Svc {
                         path: e.path().display().to_string(),
                         source: "(on-disk)".into(),
                         created_unix: 0,
+                        entrypoint: vec![],
+                        cmd: vec![],
                     });
                 }
             }
@@ -316,6 +402,8 @@ impl PodControl for Svc {
             net_index: 0,
             stack: String::new(),
             binds,
+            snap_keep_last: 0,
+            snap_max_age_secs: 0,
         };
         let mut st = self.st.lock().await;
         st.pods.insert(name.clone(), meta.clone());
@@ -524,6 +612,8 @@ impl PodControl for Svc {
                         m.storage_max_bytes = sp.storage_max_bytes;
                         m.stack = def.name.clone();
                         m.net_index = idx;
+                        m.snap_keep_last = sp.snap_keep_last;
+                        m.snap_max_age_secs = sp.snap_max_age_secs;
                         m.clone()
                     }
                     None => {
@@ -549,6 +639,8 @@ impl PodControl for Svc {
                             net_index: idx,
                             stack: def.name.clone(),
                             binds: vec![],
+                            snap_keep_last: sp.snap_keep_last,
+                            snap_max_age_secs: sp.snap_max_age_secs,
                         };
                         st.pods.insert(pname.clone(), m.clone());
                         m
@@ -656,6 +748,41 @@ impl PodControl for Svc {
             }
             binds.push(b);
         }
+        // Boot vs payload: OCI-pulled images record their entrypoint/cmd and
+        // have no systemd → nspawn execs the payload directly (non-boot).
+        // Anything else must carry a real init or it can't be started.
+        let (mut payload, env, chdir) = {
+            let st = self.st.lock().await;
+            match st.images.get(&meta.image) {
+                Some(im) if !im.entrypoint.is_empty() || !im.cmd.is_empty() => {
+                    let mut p = im.entrypoint.clone();
+                    p.extend(im.cmd.iter().cloned());
+                    (Some(p), im.env.clone(), im.working_dir.clone())
+                }
+                _ => (None, Vec::new(), String::new()),
+            }
+        };
+        if let Some(p) = &mut payload {
+            // OCI entrypoints are often bare names ("sh",
+            // "docker-entrypoint.sh") — resolve inside the rootfs so the
+            // error is clear and nspawn gets an absolute path.
+            p[0] = resolve_in_rootfs(&rootfs, &p[0]).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "entrypoint '{}' not found in image {}",
+                    p[0], meta.image
+                ))
+            })?;
+            if !chdir.is_empty() {
+                // Docker semantics: a configured WorkingDir is created if absent.
+                std::fs::create_dir_all(rootfs.join(chdir.trim_start_matches('/')))
+                    .map_err(int)?;
+            }
+        } else if !has_systemd_init(&rootfs) {
+            return Err(Status::failed_precondition(format!(
+                "image '{}' has no systemd init and no OCI entrypoint/cmd — it cannot be started",
+                meta.image
+            )));
+        }
         let run_dir = proto::run_dir(&self.cfg.data_dir, &name);
         let shm_host = proto::shm_host_dir(&name);
         std::fs::create_dir_all(&run_dir).map_err(int)?;
@@ -713,6 +840,9 @@ impl PodControl for Svc {
             binds,
             netns,
             log: log.clone(),
+            payload,
+            env,
+            chdir,
         };
         let leader = match self.engine.start(&spec, &meta.limits).await {
             Ok(pid) => Some(pid),
@@ -882,6 +1012,14 @@ impl PodControl for Svc {
             // Applied at the next start, not live.
             if let Some(bl) = req.binds {
                 m.binds = bl.binds;
+            }
+            // Snapshot retention: persisted only — the GC sweep applies it.
+            // Absent = keep, 0 clears.
+            if let Some(k) = req.snap_keep_last {
+                m.snap_keep_last = k;
+            }
+            if let Some(a) = req.snap_max_age_secs {
+                m.snap_max_age_secs = a;
             }
             let m = m.clone();
             self.save_pod(&m).map_err(int)?;
@@ -1065,12 +1203,113 @@ impl PodControl for Svc {
     type StreamLogsStream = ReceiverStream<Result<LogLine, Status>>;
     async fn stream_logs(
         &self,
-        _req: Request<PodRef>,
+        req: Request<PodRef>,
     ) -> Result<Response<Self::StreamLogsStream>, Status> {
-        Err(Status::unimplemented(
-            "log streaming lands in a later phase — see /var/lib/rustypods/logs",
-        ))
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        // Booted images (no OCI entrypoint/cmd) run systemd → journal to the
+        // host journal under the machine name. Non-boot OCI pods carry no
+        // journal at all: probe `journalctl -M` anyway (a stopped boot pod
+        // fails machined -M resolution too) and fall back to the nspawn
+        // console log the daemon always keeps for started pods.
+        let boot_pod = {
+            let st = self.st.lock().await;
+            let Some(m) = st.pods.get(&name) else {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            };
+            st.images
+                .get(&m.image)
+                .map(|im| im.entrypoint.is_empty() && im.cmd.is_empty())
+                .unwrap_or(true)
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let log_path = self.cfg.logs_dir().join(format!("{name}.log"));
+        tokio::spawn(async move {
+            let has_journal = boot_pod
+                && tokio::process::Command::new("journalctl")
+                    .args(["-M", &name, "-n", "1", "--no-pager"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            let spawned = if has_journal {
+                tokio::process::Command::new("journalctl")
+                    .args(["-M", &name, "-f", "-n", "100", "-o", "short", "--no-pager"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+            } else {
+                // -F (capital): keep retrying if the log doesn't exist yet.
+                tokio::process::Command::new("tail")
+                    .arg("-n")
+                    .arg("100")
+                    .arg("-F")
+                    .arg(&log_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+            };
+            let mut child = match spawned {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("log source spawn: {e}"))))
+                        .await;
+                    return;
+                }
+            };
+            let Some(stdout) = child.stdout.take() else {
+                return;
+            };
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        if tx
+                            .send(Ok(LogLine {
+                                ts_unix_ms: now_unix_ms(),
+                                data: line.into_bytes(),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break; // client gone — kill_on_drop reaps the child
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(int(e))).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Snapshot GC predicate: `snaps` is newest-first; a snapshot is collected
+/// when its index reaches keep_last (if > 0) OR it is older than max_age
+/// (if > 0). Both criteria apply — the union is deleted.
+fn snapshot_expired(idx: usize, created_unix: u64, keep_last: u32, max_age: u64, now: u64) -> bool {
+    (keep_last > 0 && idx >= keep_last as usize)
+        || (max_age > 0 && now.saturating_sub(created_unix) > max_age)
 }
 
 /// Rootless podman lives in the user's store — root can't reach it, so the
@@ -1104,6 +1343,33 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         bail!("tar extract into {} failed", dest.display());
     }
     Ok(())
+}
+
+/// Does the rootfs carry a systemd init? Checked on the pod rootfs at
+/// start: distrobox imports have it, OCI-pulled images don't (they run
+/// non-boot via their recorded entrypoint/cmd instead).
+fn has_systemd_init(rootfs: &Path) -> bool {
+    ["usr/lib/systemd/systemd", "lib/systemd/systemd", "sbin/init"]
+        .iter()
+        .any(|p| rootfs.join(p).exists())
+}
+
+/// Resolve a payload argv[0] inside the rootfs: absolute paths checked
+/// verbatim, bare names searched in the usual container PATH dirs (same
+/// order as nspawn's built-in default). Returns the in-container path.
+fn resolve_in_rootfs(rootfs: &Path, prog: &str) -> Option<String> {
+    if prog.contains('/') {
+        return rootfs
+            .join(prog.trim_start_matches('/'))
+            .exists()
+            .then(|| prog.to_string());
+    }
+    for d in ["usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "bin"] {
+        if rootfs.join(d).join(prog).exists() {
+            return Some(format!("/{d}/{prog}"));
+        }
+    }
+    None
 }
 
 /// "Pre-upgrade v2!" → "pre-upgrade-v2" — snapshot labels become dir names.
@@ -1260,6 +1526,37 @@ pub async fn serve(cfg: Config) -> Result<()> {
         }
     }
 
+    // REST/JSON facade (axum) for automation — NO AUTHENTICATION, so the
+    // default bind is localhost-only. Empty --http-addr disables it.
+    if !cfg.http_addr.is_empty() {
+        match tokio::net::TcpListener::bind(&cfg.http_addr).await {
+            Ok(l) => {
+                tracing::info!("http api listening on http://{} (no auth)", cfg.http_addr);
+                let router = crate::http::router(svc.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(l, router).await {
+                        tracing::warn!("http api: {e}");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!("http api bind {}: {e}", cfg.http_addr),
+        }
+    }
+
+    // Snapshot GC: per-pod retention (snap_keep_last / snap_max_age) applied
+    // every gc_interval_secs. First tick fires immediately (startup sweep).
+    {
+        let gc = svc.clone();
+        let every = Duration::from_secs(cfg.gc_interval_secs.max(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                gc.gc_snapshots().await;
+            }
+        });
+    }
+
     let allowed = cfg.allowed_uid;
     let (tx, rx) = tokio::sync::mpsc::channel::<tokio::net::UnixStream>(32);
     tokio::spawn(async move {
@@ -1292,4 +1589,44 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .await?;
     let _ = std::fs::remove_file(&cfg.socket);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_expired;
+
+    #[test]
+    fn gc_keep_last_counts_from_newest() {
+        // idx 0 is the newest snapshot.
+        assert!(!snapshot_expired(0, 0, 2, 0, 1_000_000));
+        assert!(!snapshot_expired(1, 0, 2, 0, 1_000_000));
+        assert!(snapshot_expired(2, 0, 2, 0, 1_000_000));
+        assert!(snapshot_expired(5, 0, 2, 0, 1_000_000));
+        // keep_last = 0 → count criterion disabled.
+        assert!(!snapshot_expired(99, 0, 0, 0, 1_000_000));
+    }
+
+    #[test]
+    fn gc_max_age_uses_creation_time() {
+        let now = 1_000_000u64;
+        assert!(!snapshot_expired(0, now - 100, 0, 86400, now));
+        assert!(snapshot_expired(0, now - 90000, 0, 86400, now));
+        // Exactly at the boundary is kept (strictly older than max_age).
+        assert!(!snapshot_expired(0, now - 86400, 0, 86400, now));
+        // max_age = 0 → age criterion disabled.
+        assert!(!snapshot_expired(0, 1, 0, 0, now));
+    }
+
+    #[test]
+    fn gc_criteria_are_a_union() {
+        let now = 1_000_000u64;
+        // New snapshot but index beyond keep_last → deleted.
+        assert!(snapshot_expired(3, now, 3, 86400, now));
+        // Old snapshot inside keep_last → deleted.
+        assert!(snapshot_expired(0, now - 99999, 3, 86400, now));
+        // New and inside keep_last → kept.
+        assert!(!snapshot_expired(1, now - 100, 3, 86400, now));
+        // Neither configured → nothing collected.
+        assert!(!snapshot_expired(50, 1, 0, 0, now));
+    }
 }

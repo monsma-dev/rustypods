@@ -9,6 +9,9 @@ service PodControl {
   rpc Ping(PingRequest) returns (DaemonInfo);
 
   rpc ImportImage(ImportImageRequest) returns (Image);
+  // Pull an OCI image straight from a registry (docker.io, ghcr.io, …) —
+  // anonymous auth, native OS/arch, no external tools.
+  rpc PullImage(PullImageRequest) returns (Image);
   rpc ListImages(ListImagesRequest) returns (ImageList);
   rpc RemoveImage(ImageRef) returns (Empty);
 
@@ -97,6 +100,10 @@ message Image {
   string path = 2;
   string source = 3;
   uint64 created_unix = 4;
+  // OCI config (empty for distrobox imports). Pods on images with an
+  // entrypoint/cmd start in non-boot mode — they carry no systemd.
+  repeated string entrypoint = 5;
+  repeated string cmd = 6;
 }
 
 message ImageList {
@@ -115,6 +122,13 @@ message ImportImageRequest {
   string distrobox = 2;
   // Host user owning the rootless podman store (root podman cannot see it).
   string import_user = 3;
+}
+
+message PullImageRequest {
+  // OCI reference, e.g. "busybox:latest" or "ghcr.io/org/tool:v1".
+  string reference = 1;
+  // Optional image name; default = "<repo-basename>-<tag>" slug.
+  string name = 2;
 }
 
 enum PodState {
@@ -153,6 +167,10 @@ message Pod {
   repeated string binds = 12;
   // nspawn --private-users=pick: pod root is not host root.
   bool private_users = 13;
+  // Snapshot GC: keep at most this many commits (0 = unlimited).
+  uint32 snap_keep_last = 14;
+  // Snapshot GC: drop commits older than this many seconds (0 = unlimited).
+  uint64 snap_max_age_secs = 15;
 }
 
 message PodList {
@@ -245,6 +263,10 @@ message UpdatePodConfigRequest {
   // Absent = keep current binds; present (even empty) = replace.
   // Takes effect on the next pod start.
   optional BindList binds = 5;
+  // Absent = keep; 0 = clear (no count-based snapshot GC).
+  optional uint32 snap_keep_last = 6;
+  // Absent = keep; 0 = clear (no age-based snapshot GC).
+  optional uint64 snap_max_age_secs = 7;
 }
 
 message StartPodRequest {

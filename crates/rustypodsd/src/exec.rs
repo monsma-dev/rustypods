@@ -56,6 +56,35 @@ fn chunk_exit(code: i32) -> Result<ExecChunk, tonic::Status> {
     })
 }
 
+/// Resolve an in-image helper binary to its absolute container path. exec
+/// argv can't rely on PATH: the daemon's PATH doesn't include /bin, and a
+/// minimal OCI image (busybox) may have *only* /bin.
+fn image_bin(rootfs: &Path, name: &str) -> Option<String> {
+    ["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin", "usr/local/sbin"]
+        .iter()
+        .find(|d| rootfs.join(d).join(name).exists())
+        .map(|d| format!("/{d}/{name}"))
+}
+
+/// Is `path` (absolute in-container) a busybox applet — symlink to busybox
+/// or a hardlink to the same inode? BusyBox's setpriv lacks --bounding-set
+/// and --reuid entirely, so it counts as "no usable setpriv".
+fn is_busybox_applet(rootfs: &Path, path: &str) -> bool {
+    let f = rootfs.join(path.trim_start_matches('/'));
+    if std::fs::read_link(&f)
+        .map(|t| t.file_name() == Some(std::ffi::OsStr::new("busybox")))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let bb = rootfs.join("bin/busybox");
+    match (std::fs::metadata(&f), std::fs::metadata(&bb)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 /// name → (uid, gid, home, shell), parsed from the image's own /etc/passwd.
 pub fn passwd_entry(rootfs: &Path, user: &str) -> Option<(u32, u32, String, String)> {
     let text = std::fs::read_to_string(rootfs.join("etc/passwd")).ok()?;
@@ -140,25 +169,61 @@ pub fn exec_argv(
         // and scope limits apply, with no host-side cgroup.procs race.
         "--cgroup".into(),
         "--join-cgroup".into(),
-        "--".into(),
     ]);
-    // One setpriv for everyone: drop the bounding set to nspawn's default
-    // cap list (nsenter'd processes would otherwise carry host-root's full
-    // set), then drop to the target uid/gid when not root.
-    a.push("setpriv".into());
-    a.push(format!("--bounding-set=-all,+{}", NSPAWN_DEFAULT_CAPS.join(",+")).into());
-    if uid != 0 {
-        a.extend([
-            format!("--reuid={uid}").into(),
-            format!("--regid={gid}").into(),
-            "--init-groups".into(),
-        ]);
+    // setpriv lives in the image (util-linux): the cap/uid drop must happen
+    // after setns, so it has to run in-container. A busybox setpriv lacks
+    // --bounding-set/--reuid — counts as absent.
+    let setpriv = image_bin(rootfs, "setpriv")
+        .filter(|p| !is_busybox_applet(rootfs, p));
+    let env = image_bin(rootfs, "env")
+        .context("image has no 'env' binary — exec unsupported")?;
+    if setpriv.is_none() {
+        if !private_users {
+            // Without userns confinement an exec'd process would carry the
+            // host's full bounding set (SYS_ADMIN…) — a container escape.
+            anyhow::bail!(
+                "image has no util-linux setpriv — exec needs --private-users \
+                 (bounding-set drop impossible without it)"
+            );
+        }
+        if uid != 0 {
+            // nsenter itself switches ids post-setns (supplementary groups
+            // are lost; minimal images rarely have any).
+            a.push(format!("--setuid={uid}").into());
+            a.push(format!("--setgid={gid}").into());
+        }
+        // The bounding-set drop can't be expressed via nsenter — the exec'd
+        // process keeps its inherited set, confined to the pod's userns.
+        tracing::warn!(
+            "pod {}: image lacks setpriv — exec runs without cap bounding-set drop",
+            start.pod
+        );
     }
     a.push("--".into());
-    a.push("env".into());
+    if let Some(sp) = setpriv {
+        // One setpriv for everyone: drop the bounding set to nspawn's default
+        // cap list (nsenter'd processes would otherwise carry host-root's full
+        // set), then drop to the target uid/gid when not root.
+        a.push(sp.into());
+        a.push(format!("--bounding-set=-all,+{}", NSPAWN_DEFAULT_CAPS.join(",+")).into());
+        if uid != 0 {
+            a.extend([
+                format!("--reuid={uid}").into(),
+                format!("--regid={gid}").into(),
+                "--init-groups".into(),
+            ]);
+        }
+        a.push("--".into());
+    }
+    a.push(env.into());
     a.push(format!("HOME={home}").into());
     a.push(format!("USER={}", if start.user.is_empty() { "root" } else { &start.user }).into());
     a.push(format!("LOGNAME={}", if start.user.is_empty() { "root" } else { &start.user }).into());
+    // A container-default PATH unless the client overrides it — the
+    // daemon's own PATH lacks /bin, which is all a minimal OCI image has.
+    if !start.env.iter().any(|kv| kv.starts_with("PATH=")) {
+        a.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    }
     for kv in &start.env {
         // Must be KEY=VALUE with a POSIX-ish key — anything else (a bare
         // word, or "-i"/"-S x") is an `env` option/command injection.
@@ -431,6 +496,7 @@ async fn run_pipe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn start(user: &str, argv: &[&str]) -> ExecStart {
         ExecStart {
@@ -444,57 +510,108 @@ mod tests {
         }
     }
 
+    /// A minimal fake image: bin/env (+ bin/setpriv when asked), a passwd.
+    fn fake_rootfs(tag: &str, with_setpriv: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rp-exec-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::fs::write(dir.join("bin/env"), b"").unwrap();
+        if with_setpriv {
+            std::fs::write(dir.join("bin/setpriv"), b"").unwrap();
+        }
+        std::fs::write(
+            dir.join("etc/passwd"),
+            "root:x:0:0::/root:/bin/sh\nnick:x:1000:1000::/home/nick:/bin/bash\n",
+        )
+        .unwrap();
+        dir
+    }
+
     #[test]
     fn argv_root_cmd() {
-        let a = exec_argv(42, Path::new("/nonexistent"), &start("root", &["echo", "hi"]), false)
-            .unwrap();
+        let dir = fake_rootfs("root", true);
+        let a = exec_argv(42, &dir, &start("root", &["echo", "hi"]), false).unwrap();
         let s: Vec<&str> = a.iter().map(|o| o.to_str().unwrap()).collect();
         assert!(s.starts_with(&[
             "nsenter", "--target", "42", "--mount", "--uts", "--ipc", "--net", "--pid",
             "--cgroup", "--join-cgroup", "--"
         ]));
-        assert!(s.iter().any(|x| *x == "setpriv"), "everyone gets the cap drop");
+        // helpers resolve to absolute in-container paths
+        assert!(s.iter().any(|x| *x == "/bin/setpriv"), "everyone gets the cap drop");
+        assert!(s.iter().any(|x| *x == "/bin/env"));
         assert!(!s.iter().any(|x| x.starts_with("--reuid")), "root gets no reuid");
         assert!(s.iter().any(|x| *x == "HOME=/root"));
         assert!(s.ends_with(&["echo", "hi"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn argv_cap_drop() {
-        let a = exec_argv(42, Path::new("/nonexistent"), &start("root", &["true"]), false).unwrap();
+        let dir = fake_rootfs("cap", true);
+        let a = exec_argv(42, &dir, &start("root", &["true"]), false).unwrap();
         let s: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
         let bset = s.iter().find(|x| x.starts_with("--bounding-set=")).unwrap();
         assert!(bset.contains("+sys_admin"));
         assert!(!bset.contains("sys_module"));
         assert!(!bset.contains("net_admin"));
-        let pu = exec_argv(42, Path::new("/nonexistent"), &start("root", &["true"]), true).unwrap();
+        let pu = exec_argv(42, &dir, &start("root", &["true"]), true).unwrap();
         let ps: Vec<String> = pu.iter().map(|o| o.to_string_lossy().into_owned()).collect();
         assert!(ps.iter().any(|x| x == "--user"));
         assert!(!s.iter().any(|x| x == "--user"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No setpriv in the image (minimal OCI): nsenter carries the uid/gid
+    /// switch itself; the cap drop is skipped (logged) — confined to the
+    /// pod userns under --private-users, refused without it.
+    #[test]
+    fn argv_no_setpriv_fallback() {
+        let dir = fake_rootfs("nosetpriv", false);
+        let a = exec_argv(42, &dir, &start("nick", &["id"]), true).unwrap();
+        let s: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(!s.iter().any(|x| x.contains("setpriv")));
+        assert!(s.iter().any(|x| x == "--setuid=1000"));
+        assert!(s.iter().any(|x| x == "--setgid=1000"));
+        assert!(s.iter().any(|x| *x == "/bin/env"));
+        // root on a setpriv-less image: no id switch at all.
+        let a = exec_argv(42, &dir, &start("root", &["id"]), true).unwrap();
+        let s: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(!s.iter().any(|x| x.starts_with("--setuid") || x.contains("setpriv")));
+        // …but without userns confinement it's refused outright.
+        assert!(exec_argv(42, &dir, &start("root", &["id"]), false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A busybox setpriv can't do --bounding-set — counts as absent.
+    #[test]
+    fn busybox_setpriv_is_no_setpriv() {
+        let dir = fake_rootfs("bb", false);
+        std::fs::write(dir.join("bin/busybox"), b"fake-bb").unwrap();
+        std::fs::hard_link(dir.join("bin/busybox"), dir.join("bin/setpriv")).unwrap();
+        assert!(exec_argv(42, &dir, &start("root", &["id"]), true).is_ok());
+        assert!(exec_argv(42, &dir, &start("root", &["id"]), false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn env_option_injection_rejected() {
+        let dir = fake_rootfs("inj", true);
         let mut s = start("root", &["true"]);
         s.env = vec!["TERM=xterm".into(), "-i".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_err());
+        assert!(exec_argv(42, &dir, &s, false).is_err());
         s.env = vec!["-S x".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_err());
+        assert!(exec_argv(42, &dir, &s, false).is_err());
         s.env = vec!["FOO".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_err());
+        assert!(exec_argv(42, &dir, &s, false).is_err());
         s.env = vec!["A_1=b=c".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_ok());
+        assert!(exec_argv(42, &dir, &s, false).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn argv_user_login_shell() {
-        let dir = std::env::temp_dir().join("rp-exec-test");
-        std::fs::create_dir_all(dir.join("etc")).unwrap();
-        std::fs::write(
-            dir.join("etc/passwd"),
-            "root:x:0:0::/root:/bin/bash\nnick:x:1000:1000::/home/nick:/bin/bash\n",
-        )
-        .unwrap();
+        let dir = fake_rootfs("login", true);
         let a = exec_argv(7, &dir, &start("nick", &[]), false).unwrap();
         let s: Vec<&str> = a.iter().map(|o| o.to_str().unwrap()).collect();
         assert!(s.iter().any(|x| *x == "--reuid=1000"));

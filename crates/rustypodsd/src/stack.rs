@@ -43,6 +43,12 @@ pub struct StackPod {
     pub storage_max_bytes: u64,
     #[serde(default)]
     pub limits: LimitsSpec,
+    /// Snapshot GC: keep at most N commits (0 = unlimited).
+    #[serde(default)]
+    pub snap_keep_last: u32,
+    /// Snapshot GC: drop commits older than this, e.g. "7d" (0 = unlimited).
+    #[serde(rename = "snap_max_age", default, with = "crate::state::duration_field")]
+    pub snap_max_age_secs: u64,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.
@@ -120,6 +126,8 @@ ports = ["8080:80", "53:53/udp"]
 [pods.db]
 image = "arch-base"
 storage_max = "5G"
+snap_keep_last = 3
+snap_max_age = "7d"
 [pods.db.limits]
 memory_max = "1G"
 cpu_quota_percent = 50
@@ -128,6 +136,8 @@ cpu_quota_percent = 50
         assert_eq!(d.pods.len(), 2);
         assert_eq!(d.pods["db"].storage_max_bytes, 5 << 30);
         assert_eq!(d.pods["db"].limits.memory_max_bytes, 1 << 30);
+        assert_eq!(d.pods["db"].snap_max_age_secs, 7 * 86400);
+        assert_eq!(d.pods["db"].snap_keep_last, 3);
         assert_eq!(member_name("shop", "web"), "shop-web");
     }
 

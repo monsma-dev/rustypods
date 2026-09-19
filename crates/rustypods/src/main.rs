@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use rustypods_client::connect;
 use rustypods_proto::rpc::*;
-use rustypods_proto::{fmt_bytes, parse_bytes, SOCKET_PATH};
+use rustypods_proto::{fmt_bytes, parse_bytes, parse_duration, SOCKET_PATH};
 
 #[derive(Parser)]
 #[command(name = "rustypods", version, about = "nspawn pods on Btrfs — podman/distrobox-light")]
@@ -41,6 +41,15 @@ enum Cmd {
         /// Host user owning the rootless podman store (default: $USER).
         #[arg(long)]
         user: Option<String>,
+    },
+    /// Pull an OCI image from a registry (native — no podman/docker needed).
+    /// Supports docker.io, ghcr.io and any OCI-compliant registry.
+    Pull {
+        /// Image reference, e.g. "busybox:latest" or "ghcr.io/org/tool:v1".
+        reference: String,
+        /// Image name (default: <repo-basename>-<tag>, e.g. "node-20-alpine").
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Remove an image.
     Rmi { name: String },
@@ -144,9 +153,23 @@ enum Cmd {
         /// Remove all bind mounts (applied at the next start).
         #[arg(long)]
         clear_binds: bool,
+        /// Snapshot GC: keep at most N commits (0 = keep all).
+        #[arg(long)]
+        snap_keep: Option<u32>,
+        /// Snapshot GC: drop commits older than this, e.g. 7d (0 = keep forever).
+        #[arg(long)]
+        snap_max_age: Option<String>,
     },
     /// Reread a hand-edited <pod>.conf and apply it.
     Reload { name: String },
+    /// Pod logs: journal for booted pods, the console log otherwise.
+    /// Prints the recent backlog; -f keeps following new output.
+    Logs {
+        name: String,
+        /// Follow the stream instead of exiting once the backlog goes quiet.
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Live telemetry from the pod (rustypods-agent → daemon).
     Metrics { name: String },
     /// Shared-memory segments: mmap'able files, host /dev/shm ↔ pod /run/rustypods/shm.
@@ -407,10 +430,35 @@ async fn main() -> Result<()> {
         Cmd::Images => {
             let l = connect(cli.socket.clone(), cli.remote.clone()).await?.list_images(ListImagesRequest {}).await?.into_inner();
             for i in &l.images {
-                println!("{:<20} {:<20} {}", i.name, i.source, i.path);
+                let mut extra = String::new();
+                if !i.entrypoint.is_empty() || !i.cmd.is_empty() {
+                    extra = format!(
+                        "  run: {}",
+                        i.entrypoint.iter().chain(i.cmd.iter()).cloned().collect::<Vec<_>>().join(" ")
+                    );
+                }
+                println!("{:<20} {:<28} {}{}", i.name, i.source, i.path, extra);
             }
             if l.images.is_empty() {
-                println!("no images — `rustypods import --from-distrobox arch`");
+                println!("no images — `rustypods pull busybox:latest` or `rustypods import --from-distrobox arch`");
+            }
+        }
+        Cmd::Pull { reference, name } => {
+            println!("pulling {reference} (this can take a while)...");
+            let img = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .pull_image(PullImageRequest {
+                    reference,
+                    name: name.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!("image {} → {}", img.name, img.path);
+            if !img.entrypoint.is_empty() || !img.cmd.is_empty() {
+                println!(
+                    "  runs non-boot: {}",
+                    img.entrypoint.iter().chain(img.cmd.iter()).cloned().collect::<Vec<_>>().join(" ")
+                );
             }
         }
         Cmd::Import { from_distrobox, name, user } => {
@@ -606,7 +654,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds } => {
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -650,6 +698,11 @@ async fn main() -> Result<()> {
                     storage_max_bytes,
                     ports: None,
                     binds,
+                    snap_keep_last: snap_keep,
+                    snap_max_age_secs: snap_max_age
+                        .as_deref()
+                        .map(parse_duration)
+                        .transpose()?,
                 })
                 .await?
                 .into_inner();
@@ -662,6 +715,32 @@ async fn main() -> Result<()> {
                 .await?
                 .into_inner();
             print_pod(&p);
+        }
+        Cmd::Logs { name, follow } => {
+            use std::io::Write;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let mut s = c.stream_logs(PodRef { name }).await?.into_inner();
+            // The daemon streams backlog + follow forever. Without -f we
+            // drain the backlog and exit once the stream goes quiet.
+            loop {
+                let next: Option<Result<Option<LogLine>, tonic::Status>> = if follow {
+                    Some(s.message().await)
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), s.message())
+                        .await
+                        .ok()
+                };
+                match next {
+                    Some(Ok(Some(l))) => {
+                        let mut out = std::io::stdout().lock();
+                        out.write_all(&l.data)?;
+                        out.write_all(b"\n")?;
+                        out.flush()?;
+                    }
+                    Some(Ok(None)) | None => break,
+                    Some(Err(e)) => return Err(e.into()),
+                }
+            }
         }
         Cmd::Metrics { name } => {
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;

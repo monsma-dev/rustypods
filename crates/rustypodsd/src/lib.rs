@@ -1,7 +1,9 @@
 pub mod agent;
 pub mod dbus;
 pub mod exec;
+pub mod http;
 pub mod net;
+pub mod oci;
 pub mod runtime;
 pub mod server;
 pub mod stack;
@@ -20,6 +22,11 @@ pub struct Config {
     pub allowed_uid: u32,
     /// Host user that owns the rootless podman store (for distrobox import).
     pub import_user: String,
+    /// REST/JSON API bind address; "" disables the HTTP listener.
+    /// There is no authentication — localhost only.
+    pub http_addr: String,
+    /// Snapshot GC sweep interval.
+    pub gc_interval_secs: u64,
 }
 
 impl Config {

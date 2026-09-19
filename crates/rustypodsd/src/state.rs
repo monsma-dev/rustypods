@@ -76,6 +76,31 @@ fn val_to_bytes(v: &toml::Value, key: &str) -> std::result::Result<u64, String> 
     }
 }
 
+/// Serde module for standalone duration fields (seconds): writes `"7d"`,
+/// reads a duration string or a bare integer.
+pub(crate) mod duration_field {
+    use rustypods_proto::{fmt_duration, parse_duration};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        if *v == 0 {
+            "".serialize(s)
+        } else {
+            fmt_duration(*v).serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let v = toml::Value::deserialize(d)?;
+        match v {
+            toml::Value::String(s) if s.is_empty() => Ok(0),
+            toml::Value::String(s) => parse_duration(&s).map_err(serde::de::Error::custom),
+            toml::Value::Integer(i) if i >= 0 => Ok(i as u64),
+            other => Err(serde::de::Error::custom(format!("invalid duration {other}"))),
+        }
+    }
+}
+
 /// Serde module for standalone byte fields: writes `"20G"`, reads str or int.
 pub(crate) mod bytes_field {
     use rustypods_proto::{fmt_bytes, parse_bytes};
@@ -120,9 +145,21 @@ impl<'de> Deserialize<'de> for LimitsSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {
     pub name: String,
-    /// Human-readable origin, e.g. "distrobox:arch".
+    /// Human-readable origin, e.g. "distrobox:arch" or "oci:busybox:latest".
     pub source: String,
     pub created_unix: u64,
+    /// OCI image config — empty for distrobox imports. Pods on images with
+    /// an entrypoint/cmd run non-boot (no systemd inside OCI images).
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// OCI env, "K=V" entries → nspawn --setenv.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// OCI working dir → nspawn --chdir (non-boot only).
+    #[serde(default)]
+    pub working_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +195,13 @@ pub struct PodMeta {
     /// "host[:pod][:ro]" bind mounts, applied at start.
     #[serde(default)]
     pub binds: Vec<String>,
+    /// Snapshot GC: keep at most this many commits (0 = unlimited).
+    #[serde(default)]
+    pub snap_keep_last: u32,
+    /// Snapshot GC: drop commits older than this (0 = unlimited).
+    /// Serialized as `snap_max_age = "7d"`.
+    #[serde(rename = "snap_max_age", default, with = "duration_field")]
+    pub snap_max_age_secs: u64,
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +337,10 @@ fn migrate_json(data_dir: &Path) {
             name: i.name.clone(),
             source: i.source.clone(),
             created_unix: i.created_unix,
+            entrypoint: vec![],
+            cmd: vec![],
+            env: vec![],
+            working_dir: String::new(),
         };
         if let Err(e) = save_image(data_dir, &m) {
             tracing::warn!("migrate image {name}: {e:#}");
@@ -317,6 +365,8 @@ fn migrate_json(data_dir: &Path) {
             net_index: 0,
             stack: String::new(),
             binds: vec![],
+            snap_keep_last: 0,
+            snap_max_age_secs: 0,
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");

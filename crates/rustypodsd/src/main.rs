@@ -26,6 +26,15 @@ struct Args {
     /// Host user owning the rootless podman store (for `import --from-distrobox`).
     #[arg(long, default_value = "nick")]
     import_user: String,
+
+    /// REST/JSON API bind address — no authentication, bind localhost only.
+    /// Empty string disables the HTTP listener.
+    #[arg(long, default_value = "127.0.0.1:9180")]
+    http_addr: String,
+
+    /// Snapshot GC sweep interval in seconds.
+    #[arg(long, default_value_t = 300)]
+    gc_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -42,6 +51,8 @@ async fn main() -> Result<()> {
         socket: args.socket,
         allowed_uid: args.allowed_uid,
         import_user: args.import_user,
+        http_addr: args.http_addr,
+        gc_interval_secs: args.gc_interval_secs,
     })
     .await
 }
