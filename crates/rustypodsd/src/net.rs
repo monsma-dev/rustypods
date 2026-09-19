@@ -89,6 +89,72 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
     }
 }
 
+// --- stacks: one shared netns per stack (the K8s pod model) -----------------
+
+/// Named netns for a stack: `ip netns add rustypods-<stack>`.
+pub fn netns_name(stack: &str) -> String {
+    format!("rustypods-{stack}")
+}
+
+/// The path nspawn's --network-namespace-path expects (ip netns bind-mounts
+/// the ns file there).
+pub fn netns_path(stack: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/var/run/netns/{}", netns_name(stack)))
+}
+
+/// Peer interface inside the stack netns (host side stays ve-<stack>).
+fn stack_peer(stack: &str) -> String {
+    format!("vp-{}", &stack[..stack.len().min(12)])
+}
+
+/// Create (idempotently) the shared stack netns + its veth uplink:
+/// ve-<stack> in the root ns gets .1/30, vp-<stack> inside the netns gets
+/// .2/30 + a default route. Pods then join via --network-namespace-path and
+/// share lo — every member sees the same 127.0.0.1.
+pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
+    let ns = netns_name(stack);
+    if !netns_path(stack).exists() {
+        run("ip", &["netns", "add", &ns])?;
+    }
+    let host_v = veth_name(stack);
+    let peer = stack_peer(stack);
+    if !Path::new(&format!("/sys/class/net/{host_v}")).exists() {
+        run("ip", &["link", "add", &host_v, "type", "veth", "peer", "name", &peer])?;
+        run("ip", &["link", "set", &peer, "netns", &ns])?;
+    }
+    run("ip", &["link", "set", &host_v, "up"])?;
+    run(
+        "ip",
+        &["addr", "replace", &format!("{}/30", host_ip(idx)), "dev", &host_v],
+    )?;
+    // Same localhost-DNAT martian guard as standalone pods.
+    let _ = std::fs::write(
+        format!("/proc/sys/net/ipv4/conf/{host_v}/route_localnet"),
+        "1",
+    );
+    run("ip", &["netns", "exec", &ns, "ip", "link", "set", "lo", "up"])?;
+    run("ip", &["netns", "exec", &ns, "ip", "link", "set", &peer, "up"])?;
+    run(
+        "ip",
+        &[
+            "netns", "exec", &ns, "ip", "addr", "replace",
+            &format!("{}/30", pod_ip(idx)), "dev", &peer,
+        ],
+    )?;
+    run(
+        "ip",
+        &["netns", "exec", &ns, "ip", "route", "replace", "default", "via", &host_ip(idx).to_string()],
+    )?;
+    Ok(())
+}
+
+/// Tear the stack netns down: deleting the host veth also kills the peer
+/// inside the ns; `ip netns del` removes the named namespace itself.
+pub fn teardown_stack_net(stack: &str) {
+    let _ = run("ip", &["link", "del", &veth_name(stack)]);
+    let _ = run("ip", &["netns", "del", &netns_name(stack)]);
+}
+
 /// Wait for nspawn to create the veth, then give the host end its address.
 pub async fn configure_host_veth(pod: &str, idx: u32) -> Result<()> {
     let veth = veth_name(pod);

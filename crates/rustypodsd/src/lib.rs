@@ -5,6 +5,7 @@ pub mod exec;
 pub mod net;
 pub mod nspawn;
 pub mod server;
+pub mod stack;
 pub mod state;
 
 use std::path::PathBuf;

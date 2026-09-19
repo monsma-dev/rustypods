@@ -25,6 +25,11 @@ service PodControl {
   // Reread a hand-edited conf from disk and apply it.
   rpc ReloadPodConfig(PodRef) returns (Pod);
 
+  // Stacks (Compose/K8s-pod model): the CLI sends the stack.toml contents;
+  // members run as pods named <stack>-<member> inside one shared netns.
+  rpc ApplyStack(ApplyStackRequest) returns (ApplyStackResponse);
+  rpc DestroyStack(PodRef) returns (Empty);
+
   rpc Exec(stream ExecChunk) returns (stream ExecChunk);
   rpc PodMetrics(PodRef) returns (stream Metric);
   rpc StreamLogs(PodRef) returns (stream LogLine);
@@ -127,8 +132,12 @@ message Pod {
   bool ephemeral = 8;
   // Btrfs qgroup cap on the pod's rootfs subvolume (0 = none).
   uint64 storage_max_bytes = 9;
-  // "hostPort:podPort" mappings; imply --network-veth (private netns).
+  // "hostPort:podPort" mappings; imply --network-veth (private netns)
+  // for standalone pods, or publish on the shared netns IP for stacks.
   repeated string ports = 10;
+  // Stack this pod belongs to ("" = standalone). Stack members share one
+  // netns — they reach each other on 127.0.0.1, like K8s pod containers.
+  string stack = 11;
 }
 
 message PodList {
@@ -151,6 +160,16 @@ message CreatePodRequest {
 message ClonePodRequest {
   string source = 1;
   string dest = 2;
+}
+
+message ApplyStackRequest {
+  // Raw stack.toml — sent over the wire so `apply` also works via --remote.
+  bytes toml = 1;
+}
+
+message ApplyStackResponse {
+  string name = 1;
+  repeated Pod pods = 2;
 }
 
 message UpdatePodConfigRequest {

@@ -89,6 +89,14 @@ enum Cmd {
     Destroy { name: String },
     /// Instant CoW clone: snapshot a pod's rootfs + conf under a new name.
     Clone { source: String, dest: String },
+    /// Apply a stack.toml: create/update grouped pods sharing one netns
+    /// (K8s-pod model — members reach each other on 127.0.0.1).
+    Apply { file: PathBuf },
+    /// Stack-level lifecycle: start/stop/destroy all members at once.
+    Stack {
+        #[command(subcommand)]
+        sub: StackCmd,
+    },
     /// Adjust limits live (writes the conf + applies to the running scope).
     Config {
         name: String,
@@ -124,6 +132,16 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum StackCmd {
+    /// Start every pod in the stack (shares one netns, one IP).
+    Start { name: String },
+    /// Stop every pod in the stack.
+    Stop { name: String },
+    /// Stop+delete every member pod and tear down the shared netns.
+    Destroy { name: String },
 }
 
 #[derive(Subcommand)]
@@ -426,6 +444,9 @@ fn print_pod(p: &Pod) {
     if !p.ports.is_empty() {
         extra.push_str(&format!(" ports=[{}]", p.ports.join(",")));
     }
+    if !p.stack.is_empty() {
+        extra.push_str(&format!(" stack={}", p.stack));
+    }
     println!(
         "{:<20} {:<8} {:<8} pid={:<7} {}",
         p.name,
@@ -547,6 +568,59 @@ async fn main() -> Result<()> {
             print_pod(&p);
             if !p.ports.is_empty() {
                 eprintln!("note: ports copied — running both pods needs distinct host ports (edit conf/pods/{}.conf + reload)", p.name);
+            }
+        }
+        Cmd::Apply { file } => {
+            let toml = std::fs::read(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let r = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .apply_stack(ApplyStackRequest { toml })
+                .await?
+                .into_inner();
+            println!("stack {} applied ({} pods, shared netns)", r.name, r.pods.len());
+            for p in &r.pods {
+                print_pod(p);
+            }
+            println!("start: rustypods stack start {}", r.name);
+        }
+        Cmd::Stack { sub } => {
+            let start = matches!(sub, StackCmd::Start { .. });
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            match sub {
+                StackCmd::Destroy { name } => {
+                    c.destroy_stack(PodRef { name: name.clone() }).await?;
+                    println!("stack {name} destroyed");
+                }
+                StackCmd::Start { name } | StackCmd::Stop { name } => {
+                    let members: Vec<String> = c
+                        .list_pods(ListPodsRequest {})
+                        .await?
+                        .into_inner()
+                        .pods
+                        .into_iter()
+                        .filter(|p| p.stack == name)
+                        .map(|p| p.name)
+                        .collect();
+                    if members.is_empty() {
+                        anyhow::bail!("stack {name} not found");
+                    }
+                    for m in members {
+                        let p = if start {
+                            c.start_pod(StartPodRequest {
+                                name: m,
+                                limits: None,
+                                ephemeral: false,
+                                private_users: false,
+                            })
+                            .await?
+                            .into_inner()
+                        } else {
+                            c.stop_pod(PodRef { name: m }).await?.into_inner()
+                        };
+                        print_pod(&p);
+                    }
+                }
             }
         }
         Cmd::Config { name, memory_high, memory_max, cpu, storage_max } => {

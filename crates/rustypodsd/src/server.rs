@@ -19,7 +19,7 @@ use rustypods_proto::{self as proto};
 
 use crate::agent::{self, ListenerMap, MetricsMap};
 use crate::state::{self, ImageMeta, LimitsSpec, PodMeta, State};
-use crate::{btrfs, dbus, net, nspawn, Config};
+use crate::{btrfs, dbus, net, nspawn, stack, Config};
 
 pub struct Svc {
     cfg: Config,
@@ -68,6 +68,7 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         ephemeral: m.ephemeral,
         storage_max_bytes: m.storage_max_bytes,
         ports: m.ports.clone(),
+        stack: m.stack.clone(),
     }
 }
 
@@ -233,6 +234,7 @@ impl PodControl for Svc {
             storage_max_bytes: req.storage_max_bytes,
             ports: req.ports.clone(),
             net_index: 0,
+            stack: String::new(),
         };
         let mut st = self.st.lock().await;
         st.pods.insert(name.clone(), meta.clone());
@@ -270,13 +272,136 @@ impl PodControl for Svc {
             // Fresh identity: net_index is reallocated on first start so two
             // clones can run side by side. Ports are kept — running BOTH
             // clones with identical host ports is a user-visible conflict.
+            // Stack membership is dropped: a clone is standalone, not a
+            // silent extra member of the source's shared netns.
             net_index: 0,
+            stack: String::new(),
             ..meta
         };
         let mut st = self.st.lock().await;
         st.pods.insert(dest.clone(), meta.clone());
         self.save_pod(&meta).map_err(int)?;
         Ok(Response::new(to_pod(&meta, &dst_root, None)))
+    }
+
+    /// `rustypods apply stack.toml`: one shared netns for all members
+    /// (they see each other on 127.0.0.1), one /30 + one net_index for the
+    /// stack, members stored as pods named <stack>-<member>. Re-applying an
+    /// existing stack is idempotent: confs update, rootfs is kept.
+    async fn apply_stack(
+        &self,
+        req: Request<ApplyStackRequest>,
+    ) -> Result<Response<ApplyStackResponse>, Status> {
+        let toml_text = String::from_utf8(req.into_inner().toml)
+            .map_err(|e| bad(anyhow::anyhow!("stack file is not UTF-8: {e}")))?;
+        let def = {
+            let st = self.st.lock().await;
+            let img_dir = self.cfg.images_dir();
+            stack::parse(&toml_text, |i| {
+                st.images.contains_key(i) || img_dir.join(i).is_dir()
+            })
+            .map_err(bad)?
+        };
+        // One index per stack: reuse a live member's, else allocate fresh.
+        let idx = {
+            let st = self.st.lock().await;
+            def.pods
+                .keys()
+                .filter_map(|m| st.pods.get(&stack::member_name(&def.name, m)))
+                .map(|m| m.net_index)
+                .find(|i| *i > 0)
+                .unwrap_or_else(|| net::alloc_index(&st.pods))
+        };
+        if idx == 0 {
+            return Err(Status::failed_precondition(
+                "network pool exhausted (255 veths/stacks max)",
+            ));
+        }
+        let mut out = Vec::new();
+        for (member, sp) in &def.pods {
+            let pname = stack::member_name(&def.name, member);
+            let rootfs = self.pod_rootfs(&pname);
+            let meta = {
+                let mut st = self.st.lock().await;
+                match st.pods.get_mut(&pname) {
+                    Some(m) => {
+                        m.ports = sp.ports.clone();
+                        m.limits = sp.limits;
+                        m.storage_max_bytes = sp.storage_max_bytes;
+                        m.stack = def.name.clone();
+                        m.net_index = idx;
+                        m.clone()
+                    }
+                    None => {
+                        btrfs::snapshot(&self.cfg.images_dir().join(&sp.image), &rootfs)
+                            .map_err(int)?;
+                        let m = PodMeta {
+                            name: pname.clone(),
+                            image: sp.image.clone(),
+                            created_unix: state::now_unix(),
+                            limits: sp.limits,
+                            ephemeral: false,
+                            private_users: false,
+                            started: false,
+                            storage_max_bytes: sp.storage_max_bytes,
+                            ports: sp.ports.clone(),
+                            net_index: idx,
+                            stack: def.name.clone(),
+                        };
+                        st.pods.insert(pname.clone(), m.clone());
+                        m
+                    }
+                }
+            };
+            self.save_pod(&meta).map_err(int)?;
+            out.push(meta);
+        }
+        // Fail loudly at apply-time if netns/veth wiring doesn't work —
+        // better here than on the first `stack start`.
+        net::ensure_stack_net(&def.name, idx).map_err(int)?;
+        net::ensure_ip_forward().map_err(int)?;
+        let pods = out
+            .iter()
+            .map(|m| to_pod(m, &self.pod_rootfs(&m.name), None))
+            .collect();
+        Ok(Response::new(ApplyStackResponse {
+            name: def.name,
+            pods,
+        }))
+    }
+
+    /// `rustypods stack destroy <name>`: stop+delete every member, then
+    /// tear down the shared netns and veth pair.
+    async fn destroy_stack(&self, req: Request<PodRef>) -> Result<Response<Empty>, Status> {
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        let members: Vec<String> = {
+            let st = self.st.lock().await;
+            st.pods
+                .values()
+                .filter(|m| m.stack == name)
+                .map(|m| m.name.clone())
+                .collect()
+        };
+        if members.is_empty() {
+            return Err(Status::not_found(format!("stack {name} not found")));
+        }
+        for pname in &members {
+            let _ = dbus::stop(&self.dbus, pname).await; // may already be down
+            agent::stop_listener(&self.listeners, pname).await;
+            btrfs::delete(&self.pod_rootfs(pname)).map_err(int)?;
+            state::remove_pod(&self.cfg.data_dir, pname);
+            agent::cleanup_pod_dirs(
+                &proto::run_dir(&self.cfg.data_dir, pname),
+                &proto::shm_host_dir(pname),
+            );
+            let mut st = self.st.lock().await;
+            st.pods.remove(pname);
+        }
+        net::teardown_stack_net(&name);
+        self.sync_nat().await;
+        Ok(Response::new(Empty {}))
     }
 
     async fn start_pod(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
@@ -294,7 +419,7 @@ impl PodControl for Svc {
             }
             meta.ephemeral = req.ephemeral;
             meta.private_users = req.private_users;
-            if !meta.ports.is_empty() && meta.net_index == 0 {
+            if (!meta.ports.is_empty() || !meta.stack.is_empty()) && meta.net_index == 0 {
                 meta.net_index = next_idx;
             }
             let m = meta.clone();
@@ -322,16 +447,33 @@ impl PodControl for Svc {
         )
         .await
         .map_err(int)?;
-        // Static host0 config must exist in the rootfs before boot.
-        if !meta.ports.is_empty() {
+        // Networking is wired BEFORE spawn: stack members join a pre-made
+        // netns (nspawn opens the path at exec), standalone port-pods get
+        // their static host0 config written into the rootfs.
+        let netns = if meta.stack.is_empty() {
+            if !meta.ports.is_empty() {
+                if meta.net_index == 0 {
+                    agent::stop_listener(&self.listeners, &name).await;
+                    return Err(Status::failed_precondition(
+                        "port pool exhausted (255 port-mapped pods max)",
+                    ));
+                }
+                net::write_pod_network(&rootfs, meta.net_index).map_err(int)?;
+            }
+            None
+        } else {
             if meta.net_index == 0 {
                 agent::stop_listener(&self.listeners, &name).await;
                 return Err(Status::failed_precondition(
                     "port pool exhausted (255 port-mapped pods max)",
                 ));
             }
-            net::write_pod_network(&rootfs, meta.net_index).map_err(int)?;
-        }
+            net::ensure_stack_net(&meta.stack, meta.net_index).map_err(int)?;
+            if let Err(e) = net::ensure_ip_forward() {
+                tracing::warn!("ip_forward: {e:#}");
+            }
+            Some(net::netns_path(&meta.stack))
+        };
         let argv = nspawn::start_argv(
             &rootfs,
             &name,
@@ -341,6 +483,7 @@ impl PodControl for Svc {
             &run_dir,
             &shm_host,
             &meta.ports,
+            netns.as_deref(),
         );
         let log = self.cfg.logs_dir().join(format!("{name}.log"));
         if let Err(e) = nspawn::spawn(&argv, &log).await {
@@ -365,20 +508,25 @@ impl PodControl for Svc {
                 tracing::warn!("storage cap {name}: {e:#}");
             }
         }
-        // Port forwarding: configure the host veth once nspawn creates it,
-        // then rebuild the NAT table. Async — the pod boot continues.
-        if !meta.ports.is_empty() {
+        // NAT: standalone port-pods wait for nspawn's veth to appear, then
+        // configure it; stack members are already wired (the shared netns
+        // exists pre-boot) and just need the table rebuilt — that also
+        // installs the egress masquerade stacks rely on.
+        if !meta.ports.is_empty() || !meta.stack.is_empty() {
             if let Err(e) = net::ensure_ip_forward() {
                 tracing::warn!("ip_forward: {e:#}");
             }
             let pod = name.clone();
             let idx = meta.net_index;
+            let is_stack = !meta.stack.is_empty();
             let st = self.st.clone();
             let conn = self.dbus.clone();
             tokio::spawn(async move {
-                if let Err(e) = net::configure_host_veth(&pod, idx).await {
-                    tracing::warn!("veth setup {pod}: {e:#}");
-                    return;
+                if !is_stack {
+                    if let Err(e) = net::configure_host_veth(&pod, idx).await {
+                        tracing::warn!("veth setup {pod}: {e:#}");
+                        return;
+                    }
                 }
                 let pods: Vec<PodMeta> = {
                     let g = st.lock().await;
@@ -447,8 +595,17 @@ impl PodControl for Svc {
             &proto::shm_host_dir(&name),
         );
         let mut st = self.st.lock().await;
-        st.pods.remove(&name);
+        let removed = st.pods.remove(&name);
+        // GC: last member of a stack going away individually still tears
+        // the shared netns down — `stack destroy` is just the bulk path.
+        let orphan_netns = removed
+            .map(|m| m.stack)
+            .filter(|s| !s.is_empty())
+            .filter(|s| !st.pods.values().any(|m| &m.stack == s));
         drop(st);
+        if let Some(stack) = orphan_netns {
+            net::teardown_stack_net(&stack);
+        }
         self.sync_nat().await;
         Ok(Response::new(Empty {}))
     }

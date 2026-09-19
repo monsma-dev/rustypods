@@ -18,6 +18,7 @@ pub fn start_argv(
     run_dir: &Path,
     shm_dir: &Path,
     ports: &[String],
+    netns: Option<&Path>,
 ) -> Vec<OsString> {
     let mut a: Vec<OsString> = vec![
         "systemd-nspawn".into(),
@@ -52,7 +53,11 @@ pub fn start_argv(
         a.push("--private-users=pick".into());
         a.push("--private-users-chown".into());
     }
-    if !ports.is_empty() {
+    if let Some(ns) = netns {
+        // Stack member: join the shared netns — all stack pods share lo and
+        // the stack IP (K8s pod model). The daemon wires the netns itself.
+        a.push(format!("--network-namespace-path={}", ns.display()).into());
+    } else if !ports.is_empty() {
         // Port mappings require private networking: --network-veth gives the
         // pod its own netns on ve-<name> (no host-net parity anymore). The
         // actual DNAT is ours (crate::net) — nspawn's --port relies on
@@ -105,6 +110,7 @@ mod tests {
             &PathBuf::from("/bin"),      // exists → run bind
             &PathBuf::from("/definitely-missing"), // skipped
             &[],
+            None,
         )
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
@@ -140,10 +146,31 @@ mod tests {
             &PathBuf::from("/bin"),
             &PathBuf::from("/missing"),
             &ports,
+            None,
         )
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
         assert!(a.contains(&"--network-veth".to_string()));
+    }
+
+    #[test]
+    fn argv_stack_joins_shared_netns() {
+        let a: Vec<String> = start_argv(
+            &PathBuf::from("/pods/demo-web"),
+            "demo-web",
+            false,
+            false,
+            &PathBuf::from("/bin"),
+            &PathBuf::from("/bin"),
+            &PathBuf::from("/missing"),
+            &["8080:80".to_string()], // ports on a stack must NOT imply veth
+            Some(&PathBuf::from("/var/run/netns/rustypods-demo")),
+        )
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+        assert!(a.contains(&"--network-namespace-path=/var/run/netns/rustypods-demo".to_string()));
+        assert!(!a.contains(&"--network-veth".to_string()));
     }
 }

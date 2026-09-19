@@ -19,6 +19,8 @@ rustypods (CLI) ──UDS+gRPC──> rustypodsd (root)
 dataplane: /dev/shm/rustypods/<pod>/  ──bind──>  /run/rustypods/shm/  (mmap = real shared pages)
 channel:   /var/lib/rustypods/run/<pod>/agent.sock ──bind──> /run/rustypods/run/
 network:   pods with --port get a private netns: ve-<pod> (10.220.<idx>.1/30) ↔ host0 (10.220.<idx>.2/30)
+stacks:    all members share ONE named netns (rustypods-<stack>) — 127.0.0.1 is shared, K8s-pod style
+remote:    rustypods --remote user@host … — gRPC over `ssh … socat - UNIX-CONNECT:` (no extra ports)
 ```
 
 - `crates/rustypods-proto` — gRPC contract + shared helpers
@@ -55,7 +57,9 @@ rustypods shell dev                         # native Exec RPC: nsenter + host pt
 rustypods shell dev -- cargo build          # or run a command (exit code comes back)
 echo hi | rustypods shell dev cat           # pipes work too
 rustypods stop dev
+rustypods clone dev dev-test              # instant CoW clone (snapshot + fresh net identity)
 rustypods destroy dev
+rustypods --remote user@server ps         # manage a remote daemon over SSH (needs socat there)
 ```
 
 Handy flags: `start --ephemeral` (throwaway run, `-x`) and `start --private-users`
@@ -97,6 +101,42 @@ sysctls (`ip_forward`, `route_localnet` on the veth) are enabled
 automatically. Privileged pod ports (<1024) need `--user root` inside the
 pod, same as anywhere. Note: pods with ports lose host-net parity — DNS and
 outbound go through the NAT, and the pod's own IP replaces `localhost`.
+
+## Stacks (Compose / K8s-pod model)
+
+```toml
+# stack.toml
+name = "demo"
+
+[pods.web]
+image = "arch-base"
+ports = ["8081:8080"]        # published on the shared stack IP
+
+[pods.api]
+image = "arch-base"
+storage_max = "3G"
+
+[pods.api.limits]
+memory_max = "1G"
+cpu_quota_percent = 100
+```
+
+```bash
+rustypods apply stack.toml       # creates demo-web + demo-api, wires rustypods-demo netns
+rustypods stack start demo       # both pods join the SAME network namespace
+rustypods stack stop demo
+rustypods stack destroy demo     # members + netns + veth + NAT gone
+```
+
+Every stack gets one named netns (`rustypods-<name>`) with a single
+`/30` uplink: `ve-<stack>` on the host (`10.220.<idx>.1`) ↔ `vp-<stack>`
+inside (`10.220.<idx>.2`). Members start with
+`--network-namespace-path=/var/run/netns/rustypods-<stack>` — like
+containers in a Kubernetes pod they share `lo`, so `demo-api` reaches a
+server in `demo-web` on `127.0.0.1:8080` directly (no DNS, no proxy).
+Host port mappings DNAT to the shared stack IP; two members therefore
+can't publish the same host port (rejected at apply). Re-applying a
+stack.toml is idempotent — confs update, running rootfs stays.
 
 ## Exec RPC
 

@@ -77,7 +77,7 @@ fn val_to_bytes(v: &toml::Value, key: &str) -> std::result::Result<u64, String> 
 }
 
 /// Serde module for standalone byte fields: writes `"20G"`, reads str or int.
-mod bytes_field {
+pub(crate) mod bytes_field {
     use rustypods_proto::{fmt_bytes, parse_bytes};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -147,9 +147,14 @@ pub struct PodMeta {
     #[serde(default)]
     pub ports: Vec<String>,
     /// Index into the 10.220.<idx>.0/30 pool for veth addressing; 0 = none.
-    /// Allocated at first start when ports are configured.
+    /// Allocated at first start when ports are configured, or at apply
+    /// time for stack members (one index shared by the whole stack).
     #[serde(default)]
     pub net_index: u32,
+    /// Stack membership ("" = standalone). Members share one named netns:
+    /// rustypods-<stack>, joined via nspawn --network-namespace-path.
+    #[serde(default)]
+    pub stack: String,
 }
 
 #[derive(Debug, Default)]
@@ -303,6 +308,7 @@ fn migrate_json(data_dir: &Path) {
             storage_max_bytes: 0,
             ports: vec![],
             net_index: 0,
+            stack: String::new(),
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");
