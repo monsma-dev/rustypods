@@ -5,12 +5,12 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Adwaita-ish dark palette
-        bg: "#1e1e24",
-        bg2: "#26262e",
-        card: "#2d2d36",
-        cardHover: "#36363f",
-        border: "#3d3d47",
+        // Deep Adwaita-dark palette — near-black chrome, tinted panels
+        bg: "#111114",
+        bg2: "#17171c",
+        card: "#1c1c23",
+        cardHover: "#23232b",
+        border: "#2a2a32",
         fg: "#eeeeee",
         muted: "#9a9aa5",
         accent: "#3584e4",     // GNOME blue

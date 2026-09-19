@@ -16,6 +16,82 @@ const GIB = 2 ** 30;
 const fmtGib = (bytes: number) =>
   bytes === 0 ? "unlimited" : `${(bytes / GIB).toFixed(1)} GiB`;
 
+/** Live metric ring buffer (30 samples) for one pod — only when running. */
+function useMetrics(pod: string, active: boolean): MetricSample[] {
+  const [samples, setSamples] = useState<MetricSample[]>([]);
+  useEffect(() => {
+    if (!active) {
+      setSamples([]);
+      return;
+    }
+    let un: (() => void) | undefined;
+    let dead = false;
+    api
+      .onMetrics(pod, (m) => {
+        if (!dead) setSamples((s) => [...s.slice(-29), m]);
+      })
+      .then((u) => (un = u));
+    api.watchMetrics(pod);
+    return () => {
+      dead = true;
+      un?.();
+      api.unwatchMetrics(pod);
+    };
+  }, [pod, active]);
+  return samples;
+}
+
+/* ---------- headerbar (frameless window chrome) ---------- */
+
+function WinBtn({
+  label,
+  onClick,
+  danger = false,
+}: {
+  label: string;
+  onClick: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex h-7 w-9 items-center justify-center text-xs text-muted transition-colors hover:bg-white/10 ${
+        danger ? "hover:bg-err hover:text-white" : ""
+      }`}
+      aria-label={label}
+    >
+      {label}
+    </button>
+  );
+}
+
+function HeaderBar({ title }: { title: string }) {
+  const win = api.inTauri
+    ? () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow())
+    : null;
+  const act = (f: (w: any) => void) => () => win?.().then(f);
+  return (
+    <header
+      data-tauri-drag-region
+      className="flex h-9 shrink-0 items-center justify-between border-b border-white/10 bg-bg2 select-none"
+    >
+      <div
+        data-tauri-drag-region
+        className="flex items-center gap-2 px-3 text-[12px] font-semibold"
+      >
+        <span data-tauri-drag-region className="text-accent">◆</span>
+        RustyPods
+        <span data-tauri-drag-region className="font-normal text-muted">— {title}</span>
+      </div>
+      <div className="flex h-full items-stretch">
+        <WinBtn label="–" onClick={act((w) => w.minimize())} />
+        <WinBtn label="▢" onClick={act((w) => w.toggleMaximize())} />
+        <WinBtn label="✕" danger onClick={act((w) => w.close())} />
+      </div>
+    </header>
+  );
+}
+
 /* ---------- atoms ---------- */
 
 function StateBadge({ state }: { state: PodInfo["state"] }) {
@@ -574,6 +650,127 @@ function PodDetail({
 
 /* ---------- views ---------- */
 
+/** Tiny inline sparkline for datagrid cells (w=72 fixed). */
+function MiniSpark({ data, max }: { data: number[]; max: number }) {
+  if (data.length < 2) return null;
+  const w = 72,
+    h = 14;
+  const pts = data
+    .map(
+      (v, i) =>
+        `${((i / (data.length - 1)) * w).toFixed(1)},${(h - Math.min(1, v / max) * (h - 1)).toFixed(1)}`
+    )
+    .join(" ");
+  return (
+    <svg width={w} height={h} className="inline-block align-middle">
+      <polyline points={pts} fill="none" stroke="#3584e4" strokeWidth={1} />
+    </svg>
+  );
+}
+
+function PodRow({
+  pod,
+  act,
+  onOpen,
+}: {
+  pod: PodInfo;
+  act: (f: () => Promise<unknown>) => void;
+  onOpen: (p: PodInfo) => void;
+}) {
+  const running = pod.state === "running";
+  const samples = useMetrics(pod.name, running);
+  const last = samples[samples.length - 1];
+  const memMax = Math.max(
+    pod.memory_max_bytes,
+    pod.memory_high_bytes,
+    ...samples.map((m) => m.mem_bytes),
+    1
+  );
+  const limits = [
+    pod.memory_max_bytes > 0 && `≤${pod.memory_max}`,
+    pod.cpu_quota_percent > 0 && `${pod.cpu_quota_percent}%`,
+    pod.storage_max_bytes > 0 && `${pod.storage_max}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <tr
+      onClick={() => onOpen(pod)}
+      className="h-9 cursor-pointer border-b border-white/5 transition-colors hover:bg-white/[0.04]"
+    >
+      <td className="px-3 py-1">
+        <span className="font-medium">{pod.name}</span>
+        <span className="ml-2 text-[11px] text-muted">
+          {pod.image}
+          {pod.stack && ` · ${pod.stack}`}
+        </span>
+      </td>
+      <td className="px-3 py-1">
+        <StateBadge state={pod.state} />
+        {running && (
+          <span className="ml-2 font-mono text-[11px] text-muted">
+            {pod.leader_pid}
+          </span>
+        )}
+      </td>
+      <td className="px-3 py-1">
+        {running && last ? (
+          <span className="flex items-center gap-2">
+            <MiniSpark data={samples.map((m) => m.mem_bytes)} max={memMax} />
+            <span className="font-mono text-[11px] text-muted">
+              {fmtBytesShort(last.mem_bytes)}
+            </span>
+          </span>
+        ) : (
+          <span className="text-[11px] text-muted">—</span>
+        )}
+      </td>
+      <td className="px-3 py-1 font-mono text-[11px]">
+        {running && last ? (
+          <span
+            className={
+              pod.cpu_quota_percent > 0 && last.cpu_pct > pod.cpu_quota_percent
+                ? "text-warn"
+                : "text-muted"
+            }
+          >
+            {last.cpu_pct.toFixed(0)}%
+          </span>
+        ) : (
+          <span className="text-muted">—</span>
+        )}
+      </td>
+      <td className="px-3 py-1 text-[11px] text-muted">{limits || "—"}</td>
+      <td className="px-3 py-1 font-mono text-[11px] text-muted">
+        {pod.ports.join(", ") || "—"}
+      </td>
+      <td className="px-3 py-1 text-right">
+        {running ? (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              act(() => api.stopPod(pod.name));
+            }}
+            className="rounded-md bg-err/15 px-2 py-0.5 text-[11px] font-medium text-err transition-colors hover:bg-err/25"
+          >
+            Stop
+          </button>
+        ) : (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              act(() => api.startPod(pod.name));
+            }}
+            className="rounded-md bg-accent px-2 py-0.5 text-[11px] font-medium text-white transition-colors hover:bg-accentHover"
+          >
+            Start
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+}
+
 function PodsView({
   pods,
   act,
@@ -585,89 +782,30 @@ function PodsView({
 }) {
   if (pods.length === 0) {
     return (
-      <p className="mt-10 text-center text-sm text-muted">
+      <p className="mt-10 text-center text-xs text-muted">
         No pods — create one with <code>rustypods create …</code>
       </p>
     );
   }
   return (
-    <div className="overflow-hidden rounded-xl border border-white/10 bg-card">
-      <table className="w-full text-left text-[13px]">
-        <thead className="border-b border-white/10 bg-white/[0.03] text-[11px] uppercase tracking-wider text-muted">
-          <tr>
-            <th className="px-4 py-2 font-medium">Pod</th>
-            <th className="px-3 py-2 font-medium">Status</th>
-            <th className="px-3 py-2 font-medium">Limits</th>
-            <th className="px-3 py-2 font-medium">Ports</th>
-            <th className="px-3 py-2 text-right font-medium">Actions</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-white/5">
-          {pods.map((p) => {
-            const running = p.state === "running";
-            const limits = [
-              p.memory_max_bytes > 0 && `≤${p.memory_max}`,
-              p.cpu_quota_percent > 0 && `${p.cpu_quota_percent}% cpu`,
-              p.storage_max_bytes > 0 && `${p.storage_max} disk`,
-            ]
-              .filter(Boolean)
-              .join(" · ");
-            return (
-              <tr
-                key={p.name}
-                onClick={() => onOpen(p)}
-                className="cursor-pointer transition-colors hover:bg-white/[0.04]"
-              >
-                <td className="px-4 py-2.5">
-                  <div className="font-medium">{p.name}</div>
-                  <div className="text-[11px] text-muted">
-                    {p.image}
-                    {p.stack && ` · ${p.stack}`}
-                  </div>
-                </td>
-                <td className="px-3 py-2.5">
-                  <StateBadge state={p.state} />
-                  {running && (
-                    <span className="ml-2 font-mono text-[11px] text-muted">
-                      {p.leader_pid}
-                    </span>
-                  )}
-                </td>
-                <td className="px-3 py-2.5 text-xs text-muted">
-                  {limits || "—"}
-                </td>
-                <td className="px-3 py-2.5 font-mono text-xs text-muted">
-                  {p.ports.join(", ") || "—"}
-                </td>
-                <td className="px-3 py-2.5 text-right">
-                  {running ? (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        act(() => api.stopPod(p.name));
-                      }}
-                      className="rounded-lg bg-err/15 px-2.5 py-1 text-xs font-medium text-err transition-colors hover:bg-err/25"
-                    >
-                      Stop
-                    </button>
-                  ) : (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        act(() => api.startPod(p.name));
-                      }}
-                      className="rounded-lg bg-accent px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-accentHover"
-                    >
-                      Start
-                    </button>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
+    <table className="w-full text-left text-[13px]">
+      <thead className="sticky top-0 bg-bg text-[10px] uppercase tracking-wider text-muted">
+        <tr className="border-b border-white/10">
+          <th className="px-3 py-1.5 font-medium">Pod</th>
+          <th className="px-3 py-1.5 font-medium">Status</th>
+          <th className="px-3 py-1.5 font-medium">Memory</th>
+          <th className="px-3 py-1.5 font-medium">CPU</th>
+          <th className="px-3 py-1.5 font-medium">Limits</th>
+          <th className="px-3 py-1.5 font-medium">Ports</th>
+          <th className="px-3 py-1.5 text-right font-medium"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {pods.map((p) => (
+          <PodRow key={p.name} pod={p} act={act} onOpen={onOpen} />
+        ))}
+      </tbody>
+    </table>
   );
 }
 
@@ -894,81 +1032,76 @@ export default function App() {
   };
 
   return (
-    <div className={`flex h-screen ${reduceMotion ? "lean" : ""}`}>
-      <aside className="flex w-52 flex-col border-r border-white/10 bg-bg2">
-        <div className="border-b border-white/10 px-4 py-3.5">
-          <h1 className="text-[15px] font-bold tracking-tight">RustyPods</h1>
-          <p className="text-[10px] text-muted">bare-metal pod engine</p>
-        </div>
-        <nav className="flex-1 space-y-0.5 p-2">
-          {NAV.map((n) => (
-            <button
-              key={n.id}
-              onClick={() => setView(n.id)}
-              className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${
-                view === n.id
-                  ? "bg-accent/15 font-medium text-accent"
-                  : "text-fg/80 hover:bg-white/5"
-              }`}
-            >
-              <span className="w-4 text-center">{n.icon}</span>
-              {n.label}
-              {n.id === "pods" && pods.length > 0 && (
-                <span className="ml-auto rounded-md bg-white/5 px-1.5 text-[10px] text-muted">
-                  {pods.length}
-                </span>
-              )}
-            </button>
-          ))}
-        </nav>
-        <div className="border-t border-white/10 px-4 py-2.5 text-[10px] text-muted">
-          {info ? (
-            <span className="font-mono">
-              v{info.version} · {info.storage_driver}
-            </span>
-          ) : (
-            "daemon offline"
-          )}
-        </div>
-      </aside>
+    <div
+      className={`flex h-screen flex-col overflow-hidden ${reduceMotion ? "lean" : ""}`}
+    >
+      <HeaderBar
+        title={`${titles[view]}${busy ? " · working…" : ""}${info && !info.machined ? " · machined degraded" : ""}`}
+      />
+      <div className="flex min-h-0 flex-1">
+        <aside className="flex w-48 shrink-0 flex-col border-r border-white/10 bg-bg2">
+          <nav className="flex-1 space-y-px overflow-y-auto p-1.5">
+            {NAV.map((n) => (
+              <button
+                key={n.id}
+                onClick={() => setView(n.id)}
+                className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] transition-colors ${
+                  view === n.id
+                    ? "bg-accent/15 font-medium text-accent"
+                    : "text-fg/80 hover:bg-white/5"
+                }`}
+              >
+                <span className="w-4 text-center">{n.icon}</span>
+                {n.label}
+                {n.id === "pods" && pods.length > 0 && (
+                  <span className="ml-auto rounded bg-white/5 px-1.5 text-[10px] text-muted">
+                    {pods.length}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+          <div className="border-t border-white/10 px-3 py-2 text-[10px] text-muted">
+            {info ? (
+              <span className="font-mono">
+                v{info.version} · {info.storage_driver}
+              </span>
+            ) : (
+              "daemon offline"
+            )}
+          </div>
+        </aside>
 
-      <main className="flex-1 overflow-y-auto">
-        <header className="sticky top-0 z-10 flex items-center justify-between border-b border-white/10 bg-bg/80 px-5 py-3 backdrop-blur">
-          <h2 className="text-[15px] font-semibold">{titles[view]}</h2>
-          <div className="flex items-center gap-3">
-            {busy && <span className="text-[11px] text-muted">working…</span>}
-            {info && (
-              <span
-                className={`h-2 w-2 rounded-full ${info.machined ? "bg-ok" : "bg-warn"}`}
-                title={info.machined ? "machined ok" : "machined degraded"}
+        <main className="flex-1 overflow-y-auto">
+          <div className="p-3">
+            {error && (
+              <div className="mb-3 rounded-lg border border-err/40 bg-err/10 px-3 py-1.5 text-xs text-err">
+                {error}
+              </div>
+            )}
+            {view === "pods" && (
+              <PodsView
+                pods={pods}
+                act={act}
+                onOpen={(p) => setSelected(p.name)}
+              />
+            )}
+            {view === "stacks" && (
+              <StacksView pods={pods} onOpen={(p) => setSelected(p.name)} />
+            )}
+            {view === "images" && <ImagesView images={images} />}
+            {view === "settings" && (
+              <SettingsView
+                info={info}
+                intervalMs={intervalMs}
+                setIntervalMs={setIntervalMs}
+                reduceMotion={reduceMotion}
+                setReduceMotion={setReduceMotion}
               />
             )}
           </div>
-        </header>
-        <div className="p-5">
-          {error && (
-            <div className="mb-4 rounded-xl border border-err/40 bg-err/10 px-4 py-2 text-xs text-err">
-              {error}
-            </div>
-          )}
-          {view === "pods" && (
-            <PodsView pods={pods} act={act} onOpen={(p) => setSelected(p.name)} />
-          )}
-          {view === "stacks" && (
-            <StacksView pods={pods} onOpen={(p) => setSelected(p.name)} />
-          )}
-          {view === "images" && <ImagesView images={images} />}
-          {view === "settings" && (
-            <SettingsView
-              info={info}
-              intervalMs={intervalMs}
-              setIntervalMs={setIntervalMs}
-              reduceMotion={reduceMotion}
-              setReduceMotion={setReduceMotion}
-            />
-          )}
-        </div>
-      </main>
+        </main>
+      </div>
 
       {selectedPod && (
         <PodDetail

@@ -4,7 +4,7 @@ import type { DaemonStatus, ImageInfo, MetricSample, PodInfo } from "./types";
 
 // Outside the Tauri webview (plain `npm run dev` in a browser) there is no IPC
 // bridge — serve mock data so the UI stays demoable/testable.
-const inTauri = "__TAURI_INTERNALS__" in window;
+export const inTauri = "__TAURI_INTERNALS__" in window;
 
 const MOCK_PODS: PodInfo[] = [
   {

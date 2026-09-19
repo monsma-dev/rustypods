@@ -5,6 +5,7 @@
 body {
   @apply bg-bg text-fg antialiased;
   font-family: "Cantarell", "Inter", system-ui, sans-serif;
+  font-size: 13px; /* desktop density, not web */
 }
 
 /* Lean (RPi) mode: kill every animation/transition. */
