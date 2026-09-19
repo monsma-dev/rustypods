@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     tracing::info!("rustypods-agent v{} → {}", env!("CARGO_PKG_VERSION"), POD_AGENT_SOCK);
     loop {
         if let Err(e) = run().await {
-            tracing::warn!("daemon-kanaal: {e:#}");
+            tracing::warn!("daemon channel: {e:#}");
         }
         tokio::time::sleep(INTERVAL).await;
     }

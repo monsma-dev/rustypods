@@ -94,7 +94,7 @@ pub async fn spawn_listener(
             })
             .await;
         let _ = std::fs::remove_file(&sock_path);
-        tracing::info!("agent-listener {pod_name} gestopt");
+        tracing::info!("agent listener {pod_name} stopped");
     });
     Ok(())
 }

@@ -10,9 +10,9 @@ use rustypods_proto::rpc::*;
 use rustypods_proto::{fmt_bytes, parse_bytes, SOCKET_PATH};
 
 #[derive(Parser)]
-#[command(name = "rustypods", version, about = "nspawn pods op Btrfs — podman/distrobox-light")]
+#[command(name = "rustypods", version, about = "nspawn pods on Btrfs — podman/distrobox-light")]
 struct Cli {
-    /// Pad naar de daemon-socket.
+    /// Path to the daemon socket.
     #[arg(long, global = true, default_value = SOCKET_PATH)]
     socket: PathBuf,
 
@@ -22,86 +22,96 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Daemon-status (versie, machined, btrfs).
+    /// Daemon status (version, machined, btrfs).
     Ping,
-    /// Toon images.
+    /// List images.
     Images,
-    /// Importeer een rootless podman/distrobox container als image.
+    /// Import a rootless podman/distrobox container as an image.
     Import {
-        /// Container om te exporteren (bijv. "arch").
+        /// Container to export (e.g. "arch").
         #[arg(long)]
         from_distrobox: String,
-        /// Image-naam (default: <container>-base).
+        /// Image name (default: <container>-base).
         #[arg(long)]
         name: Option<String>,
-        /// Host-user die de rootless podman store bezit (default: $USER).
+        /// Host user owning the rootless podman store (default: $USER).
         #[arg(long)]
         user: Option<String>,
     },
-    /// Verwijder een image.
+    /// Remove an image.
     Rmi { name: String },
-    /// Maak een pod: Btrfs-snapshot van een image.
+    /// Create a pod: a Btrfs snapshot of an image.
     Create {
         name: String,
         #[arg(long)]
         image: String,
+        /// Btrfs quota cap on the pod rootfs, e.g. 20G (0 = none).
+        #[arg(long)]
+        storage_max: Option<String>,
+        /// Port mapping hostPort:podPort[/tcp|/udp]; repeatable.
+        /// Implies private networking (--network-veth), so no host-net parity.
+        #[arg(long)]
+        port: Vec<String>,
     },
-    /// Start een pod (nspawn --boot, machined-registratie).
+    /// Start a pod (nspawn --boot, machined registration).
     Start {
         name: String,
-        /// Soft cap, bijv. 10G — kernel drukt richting zram i.p.v. te crashen.
+        /// Soft cap, e.g. 10G — kernel pushes towards swap instead of OOM.
         #[arg(long)]
         memory_high: Option<String>,
-        /// Harde cap, bijv. 12G.
+        /// Hard cap, e.g. 12G.
         #[arg(long)]
         memory_max: Option<String>,
-        /// CPU-limiet in procent (400 = vier cores).
+        /// CPU limit in percent (400 = four cores).
         #[arg(long)]
         cpu: Option<u32>,
-        /// Wegwerp-run: schijf-wijzigingen verdwijnen bij stop.
+        /// Throwaway run: disk changes vanish on stop.
         #[arg(long)]
         ephemeral: bool,
-        /// Sterkere isolatie; breekt shared-home uid-mapping.
+        /// Stronger isolation; breaks shared-home uid mapping.
         #[arg(long)]
         private_users: bool,
     },
-    /// Stop een pod (machinectl poweroff → terminate).
+    /// Stop a pod (SIGRTMIN+3 → terminate).
     Stop { name: String },
-    /// Herstart met de opgeslagen limits.
+    /// Restart with the persisted limits.
     Restart { name: String },
-    /// Toon pods.
+    /// List pods.
     Ps,
-    /// Stop en verwijder een pod (Btrfs-snapshot weg).
+    /// Stop and remove a pod (Btrfs snapshot gone).
     Destroy { name: String },
-    /// Limieten live aanpassen (schrijft conf + apply op draaiende scope).
+    /// Adjust limits live (writes the conf + applies to the running scope).
     Config {
         name: String,
-        /// Soft cap, bijv. 8G — "0" = weghalen.
+        /// Soft cap, e.g. 8G — "0" removes it.
         #[arg(long)]
         memory_high: Option<String>,
-        /// Harde cap, bijv. 12G — "0" = weghalen.
+        /// Hard cap, e.g. 12G — "0" removes it.
         #[arg(long)]
         memory_max: Option<String>,
-        /// CPU-limiet in procent (0 = weghalen).
+        /// CPU limit in percent (0 removes it).
         #[arg(long)]
         cpu: Option<u32>,
+        /// Btrfs quota cap, e.g. 20G — "0" removes it (hot-applied).
+        #[arg(long)]
+        storage_max: Option<String>,
     },
-    /// Herlees een hand-ge-editte <pod>.conf en pas toe.
+    /// Reread a hand-edited <pod>.conf and apply it.
     Reload { name: String },
-    /// Live telemetrie uit de pod (rustypods-agent → daemon).
+    /// Live telemetry from the pod (rustypods-agent → daemon).
     Metrics { name: String },
-    /// Shared-memory segmenten: mmap-bare files, host /dev/shm ↔ pod /run/rustypods/shm.
+    /// Shared-memory segments: mmap'able files, host /dev/shm ↔ pod /run/rustypods/shm.
     Shm {
         #[command(subcommand)]
         sub: ShmCmd,
     },
-    /// Shell in een draaiende pod (eigen Exec-RPC: nsenter + host-pty).
+    /// Shell into a running pod (native Exec RPC: nsenter + host pty).
     Shell {
         name: String,
-        /// Inloggen als deze container-user (default: $USER).
+        /// Log in as this container user (default: $USER).
         #[arg(long)]
         user: Option<String>,
-        /// Commando i.p.v. interactieve shell.
+        /// Command instead of an interactive shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
@@ -109,16 +119,16 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ShmCmd {
-    /// Maak een segment (default 64M).
+    /// Create a segment (default 64M).
     Create {
         pod: String,
         name: String,
         #[arg(long, default_value = "64M")]
         size: String,
     },
-    /// Toon segmenten van een pod.
+    /// List a pod's segments.
     Ls { pod: String },
-    /// Verwijder een segment.
+    /// Remove a segment.
     Rm { pod: String, name: String },
 }
 
@@ -129,7 +139,7 @@ async fn connect(path: PathBuf) -> Result<PodControlClient<Channel>> {
             async move { UnixStream::connect(p).await.map(hyper_util::rt::TokioIo::new) }
         }))
         .await
-        .context("verbinden met rustypodsd — draait hij? (sudo systemctl start rustypodsd)")?;
+        .context("connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)")?;
     Ok(PodControlClient::new(ch))
 }
 
@@ -142,9 +152,9 @@ fn limits_proto(high: Option<&str>, max: Option<&str>, cpu: Option<u32>) -> Resu
     Ok((l.memory_high_bytes > 0 || l.memory_max_bytes > 0 || l.cpu_quota_percent > 0).then_some(l))
 }
 
-/// `rustypods shell` via de Exec-RPC: de daemon nsentert op de machined
-/// leader-pid, een host-pty geeft job control, de remote exit-code komt
-/// exact terug. Raw mode + SIGWINCH-forwarding aan deze kant.
+/// `rustypods shell` over the Exec RPC: the daemon nsenters on the machined
+/// leader pid, a host pty gives job control, the remote exit code comes back
+/// exactly. Raw mode + SIGWINCH forwarding on this side.
 async fn shell_exec(
     sock: PathBuf,
     name: String,
@@ -181,10 +191,10 @@ async fn shell_exec(
     let mut c = connect(sock).await?;
     let mut inbound = c.exec(ReceiverStream::new(rx)).await?.into_inner();
 
-    // Raw mode zodat de remote pty alle toetsaanslagen onbewerkt krijgt.
+    // Raw mode so the remote pty gets every keystroke unprocessed.
     let raw = if tty { RawGuard::enter() } else { None };
 
-    // SIGWINCH → daemon → TIOCSWINSZ op de pty (kernel signaleert fg-groep)
+    // SIGWINCH → daemon → TIOCSWINSZ on the pty (kernel signals the fg group)
     if tty {
         let tx_w = tx.clone();
         tokio::spawn(async move {
@@ -202,9 +212,9 @@ async fn shell_exec(
             }
         });
     }
-    // stdin → daemon. tx MOVET hierheen: bij stdin-EOF valt de laatste
-    // sender weg (non-tty) → outbound stream eindigt → daemon sluit
-    // child-stdin → remote proces ziet EOF en exit.
+    // stdin → daemon. tx MOVES here: on stdin-EOF the last sender drops
+    // (non-tty) → outbound stream ends → daemon closes child-stdin → the
+    // remote process sees EOF and exits.
     let stdin_task = tokio::spawn(async move {
         let mut si = tokio::io::stdin();
         let mut buf = [0u8; 8192];
@@ -245,7 +255,7 @@ async fn shell_exec(
         }
     }
     stdin_task.abort();
-    drop(raw); // termios herstellen vóór exit
+    drop(raw); // restore termios before exit
     std::process::exit(code);
 }
 
@@ -260,7 +270,7 @@ fn term_size() -> (u32, u32) {
     }
 }
 
-/// Zet stdin in raw mode; Drop herstelt termios.
+/// Put stdin in raw mode; Drop restores termios.
 struct RawGuard {
     orig: libc::termios,
 }
@@ -310,13 +320,20 @@ fn print_pod(p: &Pod) {
         }
         s.trim().to_string()
     });
+    let mut extra = lim.unwrap_or_default();
+    if p.storage_max_bytes > 0 {
+        extra.push_str(&format!(" disk={}", fmt_bytes(p.storage_max_bytes)));
+    }
+    if !p.ports.is_empty() {
+        extra.push_str(&format!(" ports=[{}]", p.ports.join(",")));
+    }
     println!(
         "{:<20} {:<8} {:<8} pid={:<7} {}",
         p.name,
         p.image,
         pod_state(p),
         p.leader_pid,
-        lim.unwrap_or_default()
+        extra.trim()
     );
 }
 
@@ -340,13 +357,13 @@ async fn main() -> Result<()> {
                 println!("{:<20} {:<20} {}", i.name, i.source, i.path);
             }
             if l.images.is_empty() {
-                println!("geen images — `rustypods import --from-distrobox arch`");
+                println!("no images — `rustypods import --from-distrobox arch`");
             }
         }
         Cmd::Import { from_distrobox, name, user } => {
             let name = name.unwrap_or_else(|| format!("{from_distrobox}-base"));
             let user = user.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "nick".into()));
-            println!("exporteren: {from_distrobox} → {name} (dit kan even duren)...");
+            println!("exporting: {from_distrobox} → {name} (this can take a while)...");
             let img = connect(cli.socket)
                 .await?
                 .import_image(ImportImageRequest {
@@ -360,12 +377,16 @@ async fn main() -> Result<()> {
         }
         Cmd::Rmi { name } => {
             connect(cli.socket).await?.remove_image(ImageRef { name: name.clone() }).await?;
-            println!("image {name} verwijderd");
+            println!("image {name} removed");
         }
-        Cmd::Create { name, image } => {
+        Cmd::Create { name, image, storage_max, port } => {
+            let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
+            if !port.is_empty() {
+                eprintln!("note: --port implies a private netns (--network-veth); the pod no longer shares host networking");
+            }
             let p = connect(cli.socket)
                 .await?
-                .create_pod(CreatePodRequest { name, image })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port })
                 .await?
                 .into_inner();
             print_pod(&p);
@@ -408,15 +429,15 @@ async fn main() -> Result<()> {
                 print_pod(p);
             }
             if l.pods.is_empty() {
-                println!("geen pods — `rustypods create <naam> --image <image>`");
+                println!("no pods — `rustypods create <name> --image <image>`");
             }
         }
         Cmd::Destroy { name } => {
             connect(cli.socket).await?.destroy_pod(PodRef { name: name.clone() }).await?;
-            println!("pod {name} vernietigd");
+            println!("pod {name} destroyed");
         }
-        Cmd::Config { name, memory_high, memory_max, cpu } => {
-            // Ontbrekende vlaggen = huidige waarden behouden → eerst ophalen.
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max } => {
+            // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket).await?;
             let cur = c
                 .list_pods(ListPodsRequest {})
@@ -425,23 +446,32 @@ async fn main() -> Result<()> {
                 .pods
                 .into_iter()
                 .find(|p| p.name == name)
-                .context(format!("pod {name} niet gevonden"))?;
-            let cur = cur.limits.unwrap_or_default();
+                .context(format!("pod {name} not found"))?;
+            let cur_lim = cur.limits.clone().unwrap_or_default();
             let lim = Limits {
                 memory_high_bytes: memory_high
                     .as_deref()
                     .map(parse_bytes)
                     .transpose()?
-                    .unwrap_or(cur.memory_high_bytes),
+                    .unwrap_or(cur_lim.memory_high_bytes),
                 memory_max_bytes: memory_max
                     .as_deref()
                     .map(parse_bytes)
                     .transpose()?
-                    .unwrap_or(cur.memory_max_bytes),
-                cpu_quota_percent: cpu.unwrap_or(cur.cpu_quota_percent),
+                    .unwrap_or(cur_lim.memory_max_bytes),
+                cpu_quota_percent: cpu.unwrap_or(cur_lim.cpu_quota_percent),
             };
+            let storage_max_bytes = storage_max
+                .as_deref()
+                .map(parse_bytes)
+                .transpose()?
+                .unwrap_or(cur.storage_max_bytes);
             let p = c
-                .update_pod_config(UpdatePodConfigRequest { name, limits: Some(lim) })
+                .update_pod_config(UpdatePodConfigRequest {
+                    name,
+                    limits: Some(lim),
+                    storage_max_bytes,
+                })
                 .await?
                 .into_inner();
             print_pod(&p);
@@ -496,12 +526,12 @@ async fn main() -> Result<()> {
                         println!("{:<20} {:>10}  {}", s.name, fmt_bytes(s.size_bytes), s.host_path);
                     }
                     if l.segs.is_empty() {
-                        println!("geen segmenten");
+                        println!("no segments");
                     }
                 }
                 ShmCmd::Rm { pod, name } => {
                     c.remove_shm(ShmRef { pod, name: name.clone() }).await?;
-                    println!("segment {name} verwijderd");
+                    println!("segment {name} removed");
                 }
             }
         }

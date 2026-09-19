@@ -8,6 +8,7 @@ use std::path::Path;
 use tokio::process::Command;
 
 /// Pure argv builder — unit-testable.
+#[allow(clippy::too_many_arguments)]
 pub fn start_argv(
     rootfs: &Path,
     name: &str,
@@ -16,6 +17,7 @@ pub fn start_argv(
     agent_bin: &Path,
     run_dir: &Path,
     shm_dir: &Path,
+    ports: &[String],
 ) -> Vec<OsString> {
     let mut a: Vec<OsString> = vec![
         "systemd-nspawn".into(),
@@ -49,6 +51,14 @@ pub fn start_argv(
         // Breaks shared-home writes (mapped uids); opt-in isolation.
         a.push("--private-users=pick".into());
         a.push("--private-users-chown".into());
+    }
+    if !ports.is_empty() {
+        // Port mappings require private networking: --network-veth gives the
+        // pod its own netns on ve-<name> (no host-net parity anymore). The
+        // actual DNAT is ours (crate::net) — nspawn's --port relies on
+        // systemd-networkd managing the host side, which most desktop
+        // distros (NetworkManager, Netplan) don't run.
+        a.push("--network-veth".into());
     }
     a
 }
@@ -94,6 +104,7 @@ mod tests {
             &PathBuf::from("/bin"),      // exists → agent-bin bind
             &PathBuf::from("/bin"),      // exists → run bind
             &PathBuf::from("/definitely-missing"), // skipped
+            &[],
         )
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
@@ -114,5 +125,25 @@ mod tests {
         let a = argv(true, true);
         assert!(a.contains(&"-x".to_string()));
         assert!(a.contains(&"--private-users=pick".to_string()));
+        assert!(!a.contains(&"--network-veth".to_string()));
+    }
+
+    #[test]
+    fn argv_ports_imply_veth() {
+        let ports = vec!["8080:80".to_string(), "53:53/udp".to_string()];
+        let a: Vec<String> = start_argv(
+            &PathBuf::from("/pods/dev"),
+            "dev",
+            false,
+            false,
+            &PathBuf::from("/bin"),
+            &PathBuf::from("/bin"),
+            &PathBuf::from("/missing"),
+            &ports,
+        )
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+        assert!(a.contains(&"--network-veth".to_string()));
     }
 }

@@ -58,7 +58,7 @@ pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<Os
         (0u32, 0u32, "/root".to_string(), "/bin/sh".to_string())
     } else {
         passwd_entry(rootfs, &start.user)
-            .with_context(|| format!("user '{}' niet in image passwd", start.user))?
+            .with_context(|| format!("user '{}' not in image passwd", start.user))?
     };
     let mut a: Vec<OsString> = vec![
         "nsenter".into(),
@@ -88,7 +88,7 @@ pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<Os
         a.push(kv.clone().into());
     }
     if start.argv.is_empty() {
-        // cd $HOME eerst (machinectl-gedrag), dan exec login-shell.
+        // cd $HOME first (machinectl behavior), then exec login shell.
         a.push("/bin/sh".into());
         a.push("-c".into());
         a.push("cd \"$HOME\" && exec \"$0\" \"$@\"".into());
@@ -100,10 +100,8 @@ pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<Os
     Ok(a)
 }
 
-/// Move the exec'd process into the pod's machined scope so the pod's
-/// resource limits govern it. Fallback chain for the no-internal-process rule.
-/// nsenter fork't met -p: de gespawnde pid is de wachter, zijn kind is de
-/// echte payload in de pod-pidns. Wacht tot het kind zichtbaar is.
+/// nsenter forks with -p: the spawned pid is the waiter, its child is the
+/// real payload in the pod pidns. Poll until the child shows up.
 async fn nsenter_child_pid(parent: u32) -> Option<u32> {
     let f = format!("/proc/{parent}/task/{parent}/children");
     for _ in 0..60 {
@@ -117,7 +115,8 @@ async fn nsenter_child_pid(parent: u32) -> Option<u32> {
     None
 }
 
-/// Verplaats de payload zodra die forked (los van de io-brug).
+/// Move the payload into the pod scope as soon as it forks (decoupled from
+/// the io bridge). Fallback chain below handles the no-internal-process rule.
 fn spawn_cgroup_join(pod: String, nsenter_pid: u32) {
     tokio::spawn(async move {
         if let Some(child) = nsenter_child_pid(nsenter_pid).await {
@@ -141,13 +140,13 @@ fn join_pod_cgroup(pod: &str, pid: u32) {
             Err(e) => tracing::info!("exec: {procs}: {e}"),
         }
     }
-    // Delegated parents weigeren procs (no-internal-process); eigen leaf werkt.
+    // Delegated parents refuse procs (no-internal-process); own leaf works.
     let leaf = format!("{base}/rustypods-exec");
     match std::fs::create_dir_all(&leaf)
         .and_then(|_| std::fs::write(format!("{leaf}/cgroup.procs"), pid.to_string()))
     {
         Ok(()) => tracing::info!("exec: {pid} via {leaf}"),
-        Err(e) => tracing::warn!("exec {pid} niet in pod-cgroup: {e}"),
+        Err(e) => tracing::warn!("exec {pid} not moved into pod cgroup: {e}"),
     }
 }
 
@@ -166,7 +165,7 @@ fn set_winsize(fd: std::os::fd::RawFd, rows: u32, cols: u32) {
     }
 }
 
-/// openpty(3) via libc: master+slave als OwnedFd, optionele start-winsize.
+/// openpty(3) via libc: master+slave as OwnedFd, optional initial winsize.
 fn openpty(rows: u16, cols: u16) -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     use std::os::fd::FromRawFd;
     unsafe {
@@ -270,9 +269,9 @@ async fn run_tty(
 
     // Inbound: stdin bytes → master; winsize → TIOCSWINSZ (kernel raises
     // SIGWINCH on the fg process group). master_file is owned here — stdin
-    // writes and winsize ioctls share the fd. Stream-einde = client weg:
-    // bij tty is dat een disconnect (Ctrl-D is data, geen EOF) → kill child,
-    // anders blijft de remote shell als zombie op de open pty hangen.
+    // writes and winsize ioctls share the fd. Stream end = client gone:
+    // for a tty that's a disconnect (Ctrl-D is data, not EOF) → kill child,
+    // else the remote shell lingers as a zombie on the open pty.
     let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         use std::os::unix::io::AsRawFd;
@@ -405,7 +404,7 @@ mod tests {
         assert!(s.starts_with(&[
             "nsenter", "--target", "42", "--mount", "--uts", "--ipc", "--net", "--pid", "--"
         ]));
-        assert!(!s.iter().any(|x| *x == "setpriv"), "root krijgt geen setpriv");
+        assert!(!s.iter().any(|x| *x == "setpriv"), "root gets no setpriv");
         assert!(s.iter().any(|x| *x == "HOME=/root"));
         assert!(s.ends_with(&["echo", "hi"]));
     }

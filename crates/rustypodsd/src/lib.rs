@@ -2,6 +2,7 @@ pub mod agent;
 pub mod btrfs;
 pub mod dbus;
 pub mod exec;
+pub mod net;
 pub mod nspawn;
 pub mod server;
 pub mod state;

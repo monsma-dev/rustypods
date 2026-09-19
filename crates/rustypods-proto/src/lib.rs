@@ -34,7 +34,7 @@ pub fn shm_host_dir(pod: &str) -> PathBuf {
     PathBuf::from("/dev/shm/rustypods").join(pod)
 }
 /// Per-entity TOML confs: conf/pods/<name>.conf, conf/images/<name>.conf.
-/// Hand-editable; `rustypods reload <pod>` leest opnieuw in.
+/// Hand-editable; `rustypods reload <pod>` rereads them.
 pub fn conf_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("conf")
 }
@@ -61,7 +61,7 @@ pub fn validate_name(name: &str) -> anyhow::Result<&str> {
         Ok(name)
     } else {
         anyhow::bail!(
-            "ongeldige naam '{name}' — gebruik [a-z][a-z0-9-_]{{0,31}} (begint met een letter)"
+            "invalid name '{name}' — use [a-z][a-z0-9-_]{{0,31}} (must start with a letter)"
         )
     }
 }
@@ -76,7 +76,7 @@ pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
         Some(b'B') | Some(b'b') => (&s[..s.len() - 1], 1u64),
         _ => (s, 1u64),
     };
-    let v: f64 = num.parse().map_err(|_| anyhow::anyhow!("ongeldige grootte '{s}'"))?;
+    let v: f64 = num.parse().map_err(|_| anyhow::anyhow!("invalid size '{s}'"))?;
     Ok((v * mult as f64) as u64)
 }
 

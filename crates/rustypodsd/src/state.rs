@@ -1,7 +1,7 @@
-//! Pod/image-state als per-entiteit TOML-confs:
-//!   <data>/conf/pods/<name>.conf   en   <data>/conf/images/<name>.conf
-//! Leesbaar voor sysadmins (limits als "10G"), hand-edits inleesbaar via
-//! `rustypods reload <pod>`. state.json wordt eenmalig gemigreerd.
+//! Pod/image state as per-entity TOML confs:
+//!   <data>/conf/pods/<name>.conf   and   <data>/conf/images/<name>.conf
+//! Human-readable (limits as "10G"), hand-edits load via
+//! `rustypods reload <pod>`. A legacy state.json is migrated once.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -25,8 +25,8 @@ impl LimitsSpec {
     }
 }
 
-/// TOML-vorm van LimitsSpec: `memory_high = "10G"` (of een kale int),
-/// `cpu_quota_percent = 400`. Leeg/0 = geen cap.
+/// TOML shape of LimitsSpec: `memory_high = "10G"` (or a bare int),
+/// `cpu_quota_percent = 400`. Empty/0 = no cap.
 #[derive(Serialize)]
 struct LimitsToml {
     memory_high: String,
@@ -52,7 +52,7 @@ impl From<LimitsSpec> for LimitsToml {
     }
 }
 
-/// Accepteert "10G", 10737418240, en de legacy *_bytes sleutels.
+/// Accepts "10G", 10737418240, and the legacy *_bytes keys.
 #[derive(Deserialize, Default)]
 struct LimitsTomlIn {
     #[serde(default)]
@@ -72,7 +72,31 @@ fn val_to_bytes(v: &toml::Value, key: &str) -> std::result::Result<u64, String> 
         toml::Value::String(s) if s.is_empty() => Ok(0),
         toml::Value::String(s) => parse_bytes(s).map_err(|e| format!("{key}: {e:#}")),
         toml::Value::Integer(i) if *i >= 0 => Ok(*i as u64),
-        other => Err(format!("{key}: ongeldige waarde {other}")),
+        other => Err(format!("{key}: invalid value {other}")),
+    }
+}
+
+/// Serde module for standalone byte fields: writes `"20G"`, reads str or int.
+mod bytes_field {
+    use rustypods_proto::{fmt_bytes, parse_bytes};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        if *v == 0 {
+            "".serialize(s)
+        } else {
+            fmt_bytes(*v).serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let v = toml::Value::deserialize(d)?;
+        match v {
+            toml::Value::String(s) if s.is_empty() => Ok(0),
+            toml::Value::String(s) => parse_bytes(&s).map_err(serde::de::Error::custom),
+            toml::Value::Integer(i) if i >= 0 => Ok(i as u64),
+            other => Err(serde::de::Error::custom(format!("invalid size {other}"))),
+        }
     }
 }
 
@@ -114,6 +138,18 @@ pub struct PodMeta {
     pub private_users: bool,
     #[serde(default)]
     pub started: bool,
+    /// Btrfs qgroup cap on the pod rootfs; 0 = none.
+    /// Serialized as `storage_max = "20G"`.
+    #[serde(default, with = "bytes_field")]
+    pub storage_max_bytes: u64,
+    /// "hostPort:podPort" — imply private netns (--network-veth).
+    /// Only applied at start; changing them requires a pod restart.
+    #[serde(default)]
+    pub ports: Vec<String>,
+    /// Index into the 10.220.<idx>.0/30 pool for veth addressing; 0 = none.
+    /// Allocated at first start when ports are configured.
+    #[serde(default)]
+    pub net_index: u32,
 }
 
 #[derive(Debug, Default)]
@@ -139,7 +175,7 @@ fn image_conf(data_dir: &Path, name: &str) -> PathBuf {
 fn write_conf(path: &Path, body: &str) -> Result<()> {
     let tmp = path.with_extension("conf.tmp");
     std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename naar {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
 
@@ -158,10 +194,10 @@ pub fn remove_image(data_dir: &Path, name: &str) {
     let _ = std::fs::remove_file(image_conf(data_dir, name));
 }
 
-/// Eén conf inlezen (hand-edit → `rustypods reload <pod>`).
+/// Read a single conf (hand edit → `rustypods reload <pod>`).
 pub fn load_pod(data_dir: &Path, name: &str) -> Result<PodMeta> {
     let p = pod_conf(data_dir, name);
-    let s = std::fs::read_to_string(&p).with_context(|| format!("lees {}", p.display()))?;
+    let s = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
     toml::from_str(&s).with_context(|| format!("parse {}", p.display()))
 }
 
@@ -179,7 +215,7 @@ fn scan<T: for<'de> Deserialize<'de>>(dir: &Path, out: &mut BTreeMap<String, T>,
             Some(m) => {
                 out.insert(name_of(&m).to_string(), m);
             }
-            None => tracing::warn!("conf {} overgeslagen (parse-fout)", p.display()),
+            None => tracing::warn!("conf {} skipped (parse error)", p.display()),
         }
     }
 }
@@ -194,7 +230,7 @@ pub fn load(data_dir: &Path) -> State {
     st
 }
 
-// --- eenmalige migratie van centrale state.json ------------------------------
+// --- one-time migration from the central state.json ---------------------------
 
 #[derive(Deserialize, Default)]
 struct LegacyLimits {
@@ -237,7 +273,7 @@ fn migrate_json(data_dir: &Path) {
     let f = data_dir.join("state.json");
     let Ok(s) = std::fs::read_to_string(&f) else { return };
     let Ok(old) = serde_json::from_str::<LegacyState>(&s) else {
-        tracing::warn!("state.json onparseerbaar — laat staan, start met lege state");
+        tracing::warn!("state.json unparseable — left in place, starting with empty state");
         return;
     };
     for (name, i) in &old.images {
@@ -247,7 +283,7 @@ fn migrate_json(data_dir: &Path) {
             created_unix: i.created_unix,
         };
         if let Err(e) = save_image(data_dir, &m) {
-            tracing::warn!("migratie image {name}: {e:#}");
+            tracing::warn!("migrate image {name}: {e:#}");
         }
     }
     for (name, p) in &old.pods {
@@ -262,15 +298,18 @@ fn migrate_json(data_dir: &Path) {
             },
             ephemeral: p.ephemeral,
             private_users: p.private_users,
-            // started is vluchtig; running wordt live via machined bepaald.
+            // started is volatile; running state comes from machined live.
             started: false,
+            storage_max_bytes: 0,
+            ports: vec![],
+            net_index: 0,
         };
         if let Err(e) = save_pod(data_dir, &m) {
-            tracing::warn!("migratie pod {name}: {e:#}");
+            tracing::warn!("migrate pod {name}: {e:#}");
         }
     }
     let _ = std::fs::rename(&f, f.with_extension("json.migrated"));
-    tracing::info!("state.json → conf/*.conf gemigreerd");
+    tracing::info!("state.json migrated to conf/*.conf");
 }
 
 pub fn now_unix() -> u64 {

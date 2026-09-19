@@ -1,14 +1,14 @@
-//! Native D-Bus calls naar machined + systemd — vervangt de
-//! `machinectl`/`systemctl` subprocessen. Één gedeelde system-bus
-//! `Connection` in Svc; zbus multiplext alle calls eroverheen.
+//! Native D-Bus calls to machined + systemd — replaces the
+//! `machinectl`/`systemctl` subprocesses. One shared system-bus `Connection`
+//! in Svc; zbus multiplexes all calls over it.
 //!
-//! Geverifieerd op systemd 257 (busctl introspect + live trace):
+//! Verified on systemd 257 (busctl introspect + live experiments):
 //! - `machinectl poweroff` ≙ `KillMachine(name, "leader", SIGRTMIN+3)`
-//!   — container-systemd interpreteert 37 als clean shutdown.
+//!   — the container's systemd interprets 37 as clean shutdown.
 //! - `machinectl terminate` ≙ `TerminateMachine(name)` (hard kill).
 //! - `systemctl set-property <scope> K=V` ≙
-//!   `SetUnitProperties(unit, runtime=true, [("K", v)])` — CPUQuota heet
-//!   op de bus `CPUQuotaPerSecUSec` (100% = 1_000_000 µs).
+//!   `SetUnitProperties(unit, runtime=true, [("K", v)])` — CPUQuota is called
+//!   `CPUQuotaPerSecUSec` on the bus (100% = 1_000_000 µs).
 
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
@@ -18,7 +18,7 @@ use zbus::{proxy, Connection};
 
 use crate::state::LimitsSpec;
 
-/// glibc SIGRTMIN (kernel 32 + 2 NPTL-reserves). +3 = poweroff in de pod.
+/// glibc SIGRTMIN (kernel 32 + 2 NPTL reserves). +3 = poweroff in the pod.
 const SIGRTMIN: i32 = 34;
 
 #[proxy(
@@ -40,7 +40,7 @@ trait MachineManager {
 trait Machine {
     #[zbus(property)]
     fn leader(&self) -> zbus::Result<u32>;
-    /// Authoritative scope-naam ("machine-dev.scope") — geen gokwerk.
+    /// Authoritative scope name ("machine-dev.scope") — no guessing.
     #[zbus(property)]
     fn unit(&self) -> zbus::Result<String>;
 }
@@ -64,14 +64,14 @@ async fn machine<'a>(conn: &'a Connection, name: &str) -> Result<Option<MachineP
     let mgr = MachineManagerProxy::new(conn).await?;
     let path = match mgr.get_machine(name).await {
         Ok(p) => p,
-        Err(_) => return Ok(None), // NoSuchMachine → niet geregistreerd
+        Err(_) => return Ok(None), // NoSuchMachine → not registered
     };
     Ok(Some(
         MachineProxy::builder(conn).path(path)?.build().await?,
     ))
 }
 
-/// machined is socket-activated; ping de systemd-manager om hem te waken.
+/// machined is socket-activated; ping the systemd manager to wake it.
 pub async fn wake_machined(conn: &Connection) -> Result<()> {
     SystemdManagerProxy::new(conn)
         .await?
@@ -80,7 +80,7 @@ pub async fn wake_machined(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Is machined bereikbaar op de bus? (voor de `ping`-output)
+/// Is machined reachable on the bus? (for the `ping` output)
 pub async fn machined_up(conn: &Connection) -> bool {
     match MachineManagerProxy::new(conn).await {
         Ok(p) => p.list_machines().await.is_ok(),
@@ -88,13 +88,13 @@ pub async fn machined_up(conn: &Connection) -> bool {
     }
 }
 
-/// Leader-pid via machined; None als de pod niet draait.
+/// Leader pid via machined; None when the pod isn't running.
 pub async fn leader_pid(conn: &Connection, name: &str) -> Option<u32> {
     let m = machine(conn, name).await.ok()??;
     m.leader().await.ok().filter(|p| *p > 0)
 }
 
-/// Poll machined tot de pod geregistreerd is (nspawn doet dat zelf).
+/// Poll machined until the pod is registered (nspawn does that itself).
 pub async fn wait_registered(conn: &Connection, name: &str, dur: Duration) -> Result<u32> {
     timeout(dur, async {
         loop {
@@ -105,14 +105,14 @@ pub async fn wait_registered(conn: &Connection, name: &str, dur: Duration) -> Re
         }
     })
     .await
-    .with_context(|| format!("machined registratie timeout voor {name}"))
+    .with_context(|| format!("machined registration timeout for {name}"))
 }
 
-/// Guardrails op de machined scope — SetUnitProperties(runtime=true),
-/// equivalent aan `systemctl set-property --runtime`.
+/// Guardrails on the machined scope — SetUnitProperties(runtime=true),
+/// equivalent to `systemctl set-property --runtime`.
 pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Result<()> {
     let Some(m) = machine(conn, name).await? else {
-        bail!("machine {name} niet bij machined geregistreerd")
+        bail!("machine {name} not registered with machined")
     };
     let unit = m.unit().await?;
     let mut props: Vec<(&str, Value)> = Vec::new();
@@ -123,7 +123,7 @@ pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Re
         props.push(("MemoryMax", Value::from(lim.memory_max_bytes)));
     }
     if lim.cpu_quota_percent > 0 {
-        // CPUQuota op de bus: µs per seconde; 100% = 1_000_000.
+        // CPUQuota on the bus: µs per second; 100% = 1_000_000.
         props.push((
             "CPUQuotaPerSecUSec",
             Value::from(u64::from(lim.cpu_quota_percent) * 10_000),
@@ -139,7 +139,7 @@ pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Re
         .with_context(|| format!("SetUnitProperties {unit}"))
 }
 
-/// Clean shutdown (SIGRTMIN+3 → leader) → terminate → geef luidkeels op.
+/// Clean shutdown (SIGRTMIN+3 → leader) → terminate → give up loudly.
 pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
     if leader_pid(conn, name).await.is_none() {
         return Ok(());
@@ -152,7 +152,7 @@ pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
         }
         sleep(Duration::from_millis(200)).await;
     }
-    tracing::warn!("{name}: poweroff timeout — terminate");
+    tracing::warn!("{name}: poweroff timeout — terminating");
     let _ = mgr.terminate_machine(name).await;
     for _ in 0..25 {
         if leader_pid(conn, name).await.is_none() {
@@ -160,5 +160,5 @@ pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
         }
         sleep(Duration::from_millis(200)).await;
     }
-    bail!("pod {name} weigert te stoppen")
+    bail!("pod {name} refuses to stop")
 }

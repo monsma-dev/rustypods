@@ -8,22 +8,22 @@ use rustypodsd::{euid, server, Config};
 #[derive(Parser)]
 #[command(
     name = "rustypodsd",
-    about = "RustyPods daemon — nspawn pods op Btrfs, aangestuurd via UDS+gRPC"
+    about = "RustyPods daemon — nspawn pods on Btrfs, driven over UDS+gRPC"
 )]
 struct Args {
-    /// Root voor images/, pods/, logs/, bin/, shm/, state.json.
+    /// Root for images/, pods/, logs/, bin/, shm/, conf/.
     #[arg(long, default_value = rustypods_proto::DATA_DIR)]
     data_dir: PathBuf,
 
-    /// Unix socket voor de controlplane.
+    /// Unix socket for the control plane.
     #[arg(long, default_value = rustypods_proto::SOCKET_PATH)]
     socket: PathBuf,
 
-    /// Naast root mag deze uid de daemon aansturen.
+    /// Besides root, this uid may drive the daemon.
     #[arg(long, default_value_t = 1000)]
     allowed_uid: u32,
 
-    /// Host-user met de rootless podman store (voor `import --from-distrobox`).
+    /// Host user owning the rootless podman store (for `import --from-distrobox`).
     #[arg(long, default_value = "nick")]
     import_user: String,
 }
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     if euid() != 0 {
-        tracing::warn!("rustypodsd draait niet als root — nspawn/btrfs/machined zullen falen");
+        tracing::warn!("rustypodsd is not running as root — nspawn/btrfs/machined will fail");
     }
     server::serve(Config {
         data_dir: args.data_dir,

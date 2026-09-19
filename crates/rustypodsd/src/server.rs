@@ -19,14 +19,14 @@ use rustypods_proto::{self as proto};
 
 use crate::agent::{self, ListenerMap, MetricsMap};
 use crate::state::{self, ImageMeta, LimitsSpec, PodMeta, State};
-use crate::{btrfs, dbus, nspawn, Config};
+use crate::{btrfs, dbus, net, nspawn, Config};
 
 pub struct Svc {
     cfg: Config,
     st: Arc<Mutex<State>>,
     metrics: MetricsMap,
     listeners: ListenerMap,
-    /// Gedeelde system-bus connectie (zbus multiplext alle calls erover).
+    /// Shared system-bus connection (zbus multiplexes all calls over it).
     dbus: zbus::Connection,
 }
 
@@ -66,6 +66,8 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
             cpu_quota_percent: m.limits.cpu_quota_percent,
         }),
         ephemeral: m.ephemeral,
+        storage_max_bytes: m.storage_max_bytes,
+        ports: m.ports.clone(),
     }
 }
 
@@ -89,6 +91,21 @@ impl Svc {
     fn pod_rootfs(&self, name: &str) -> std::path::PathBuf {
         self.cfg.pods_dir().join(name)
     }
+
+    /// Rebuild the nftables DNAT table from current state (running pods only).
+    async fn sync_nat(&self) {
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods.values().cloned().collect()
+        };
+        let mut running = std::collections::BTreeSet::new();
+        for m in &pods {
+            if dbus::leader_pid(&self.dbus, &m.name).await.is_some() {
+                running.insert(m.name.clone());
+            }
+        }
+        net::rebuild_nat(pods.iter(), &running);
+    }
 }
 
 #[tonic::async_trait]
@@ -111,7 +128,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
         let dest = self.cfg.images_dir().join(&name);
         if dest.exists() {
-            return Err(Status::already_exists(format!("image {name} bestaat al")));
+            return Err(Status::already_exists(format!("image {name} already exists")));
         }
         let user = if req.import_user.is_empty() {
             self.cfg.import_user.clone()
@@ -180,7 +197,7 @@ impl PodControl for Svc {
         let mut st = self.st.lock().await;
         if st.pods.values().any(|p| p.image == name) {
             return Err(Status::failed_precondition(format!(
-                "image {name} wordt nog door een pod gebruikt"
+                "image {name} is still in use by a pod"
             )));
         }
         btrfs::delete(&self.cfg.images_dir().join(&name)).map_err(int)?;
@@ -195,11 +212,14 @@ impl PodControl for Svc {
         let image = proto::validate_name(&req.image).map_err(bad)?.to_string();
         let img_dir = self.cfg.images_dir().join(&image);
         if !img_dir.is_dir() {
-            return Err(Status::not_found(format!("image {image} niet gevonden")));
+            return Err(Status::not_found(format!("image {image} not found")));
         }
         let dest = self.pod_rootfs(&name);
         if dest.exists() {
-            return Err(Status::already_exists(format!("pod {name} bestaat al")));
+            return Err(Status::already_exists(format!("pod {name} already exists")));
+        }
+        for p in &req.ports {
+            validate_port(p).map_err(bad)?;
         }
         btrfs::snapshot(&img_dir, &dest).map_err(int)?;
         let meta = PodMeta {
@@ -210,6 +230,9 @@ impl PodControl for Svc {
             ephemeral: false,
             private_users: false,
             started: false,
+            storage_max_bytes: req.storage_max_bytes,
+            ports: req.ports.clone(),
+            net_index: 0,
         };
         let mut st = self.st.lock().await;
         st.pods.insert(name.clone(), meta.clone());
@@ -222,8 +245,9 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
         let meta = {
             let mut st = self.st.lock().await;
+            let next_idx = net::alloc_index(&st.pods);
             let Some(meta) = st.pods.get_mut(&name) else {
-                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+                return Err(Status::not_found(format!("pod {name} not found")));
             };
             let lim = limits_from(req.limits);
             if !lim.is_empty() {
@@ -231,12 +255,15 @@ impl PodControl for Svc {
             }
             meta.ephemeral = req.ephemeral;
             meta.private_users = req.private_users;
+            if !meta.ports.is_empty() && meta.net_index == 0 {
+                meta.net_index = next_idx;
+            }
             let m = meta.clone();
             self.save_pod(&m).map_err(int)?;
             m
         };
         if dbus::leader_pid(&self.dbus, &name).await.is_some() {
-            return Err(Status::failed_precondition(format!("pod {name} draait al")));
+            return Err(Status::failed_precondition(format!("pod {name} is already running")));
         }
         let rootfs = self.pod_rootfs(&name);
         let run_dir = proto::run_dir(&self.cfg.data_dir, &name);
@@ -256,6 +283,16 @@ impl PodControl for Svc {
         )
         .await
         .map_err(int)?;
+        // Static host0 config must exist in the rootfs before boot.
+        if !meta.ports.is_empty() {
+            if meta.net_index == 0 {
+                agent::stop_listener(&self.listeners, &name).await;
+                return Err(Status::failed_precondition(
+                    "port pool exhausted (255 port-mapped pods max)",
+                ));
+            }
+            net::write_pod_network(&rootfs, meta.net_index).map_err(int)?;
+        }
         let argv = nspawn::start_argv(
             &rootfs,
             &name,
@@ -264,6 +301,7 @@ impl PodControl for Svc {
             &self.cfg.bin_dir(),
             &run_dir,
             &shm_host,
+            &meta.ports,
         );
         let log = self.cfg.logs_dir().join(format!("{name}.log"));
         if let Err(e) = nspawn::spawn(&argv, &log).await {
@@ -273,13 +311,48 @@ impl PodControl for Svc {
         if let Err(e) = dbus::wait_registered(&self.dbus, &name, Duration::from_secs(15)).await {
             agent::stop_listener(&self.listeners, &name).await;
             let _ = dbus::stop(&self.dbus, &name).await;
-            return Err(int(e.context(format!("boot mislukt — zie {}", log.display()))));
+            return Err(int(e.context(format!("boot failed — see {}", log.display()))));
         }
         // Guardrails are the point: a pod that can't be capped gets stopped.
         if let Err(e) = dbus::apply_limits(&self.dbus, &name, &meta.limits).await {
             agent::stop_listener(&self.listeners, &name).await;
             let _ = dbus::stop(&self.dbus, &name).await;
-            return Err(int(e.context("limits zetten mislukt")));
+            return Err(int(e.context("applying limits failed")));
+        }
+        // Btrfs qgroup cap: quota accounting doesn't survive a remount, so
+        // re-enable + re-apply on every start.
+        if meta.storage_max_bytes > 0 {
+            if let Err(e) = apply_storage_cap(&self.cfg, &meta) {
+                tracing::warn!("storage cap {name}: {e:#}");
+            }
+        }
+        // Port forwarding: configure the host veth once nspawn creates it,
+        // then rebuild the NAT table. Async — the pod boot continues.
+        if !meta.ports.is_empty() {
+            if let Err(e) = net::ensure_ip_forward() {
+                tracing::warn!("ip_forward: {e:#}");
+            }
+            let pod = name.clone();
+            let idx = meta.net_index;
+            let st = self.st.clone();
+            let conn = self.dbus.clone();
+            tokio::spawn(async move {
+                if let Err(e) = net::configure_host_veth(&pod, idx).await {
+                    tracing::warn!("veth setup {pod}: {e:#}");
+                    return;
+                }
+                let pods: Vec<PodMeta> = {
+                    let g = st.lock().await;
+                    g.pods.values().cloned().collect()
+                };
+                let mut running = std::collections::BTreeSet::new();
+                for m in &pods {
+                    if dbus::leader_pid(&conn, &m.name).await.is_some() {
+                        running.insert(m.name.clone());
+                    }
+                }
+                net::rebuild_nat(pods.iter(), &running);
+            });
         }
         let leader = dbus::leader_pid(&self.dbus, &name).await;
         let mut st = self.st.lock().await;
@@ -300,9 +373,12 @@ impl PodControl for Svc {
         agent::stop_listener(&self.listeners, &name).await;
         let st = self.st.lock().await;
         let Some(m) = st.pods.get(&name) else {
-            return Err(Status::not_found(format!("pod {name} niet gevonden")));
+            return Err(Status::not_found(format!("pod {name} not found")));
         };
-        Ok(Response::new(to_pod(m, &self.pod_rootfs(&name), None)))
+        let p = to_pod(m, &self.pod_rootfs(&name), None);
+        drop(st);
+        self.sync_nat().await;
+        Ok(Response::new(p))
     }
 
     async fn list_pods(&self, _req: Request<ListPodsRequest>) -> Result<Response<PodList>, Status> {
@@ -333,10 +409,12 @@ impl PodControl for Svc {
         );
         let mut st = self.st.lock().await;
         st.pods.remove(&name);
+        drop(st);
+        self.sync_nat().await;
         Ok(Response::new(Empty {}))
     }
 
-    /// `rustypods config`: conf bijwerken + direct live op de scope toepassen.
+    /// `rustypods config`: update the conf + live-apply to the scope.
     async fn update_pod_config(
         &self,
         req: Request<UpdatePodConfigRequest>,
@@ -347,24 +425,26 @@ impl PodControl for Svc {
         let meta = {
             let mut st = self.st.lock().await;
             let Some(m) = st.pods.get_mut(&name) else {
-                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+                return Err(Status::not_found(format!("pod {name} not found")));
             };
             m.limits = lim;
+            m.storage_max_bytes = req.storage_max_bytes;
             let m = m.clone();
             self.save_pod(&m).map_err(int)?;
             m
         };
-        // Hot-apply als de pod draait — geen restart nodig.
+        // Hot-apply while the pod runs — no restart needed.
         if dbus::leader_pid(&self.dbus, &name).await.is_some() {
             dbus::apply_limits(&self.dbus, &name, &meta.limits)
                 .await
                 .map_err(int)?;
         }
+        apply_storage_cap(&self.cfg, &meta).map_err(int)?;
         let leader = dbus::leader_pid(&self.dbus, &name).await;
         Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
     }
 
-    /// `rustypods reload`: conf opnieuw van schijf (hand-edits) + apply.
+    /// `rustypods reload`: reread the conf from disk (hand edits) + apply.
     async fn reload_pod_config(
         &self,
         req: Request<PodRef>,
@@ -376,7 +456,7 @@ impl PodControl for Svc {
         {
             let mut st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
-                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+                return Err(Status::not_found(format!("pod {name} not found")));
             }
             st.pods.insert(name.clone(), meta.clone());
         }
@@ -385,6 +465,7 @@ impl PodControl for Svc {
                 .await
                 .map_err(int)?;
         }
+        apply_storage_cap(&self.cfg, &meta).map_err(int)?;
         let leader = dbus::leader_pid(&self.dbus, &name).await;
         Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
     }
@@ -399,7 +480,7 @@ impl PodControl for Svc {
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&pod) {
-                return Err(Status::not_found(format!("pod {pod} niet gevonden")));
+                return Err(Status::not_found(format!("pod {pod} not found")));
             }
         }
         let dir = proto::shm_host_dir(&pod);
@@ -463,20 +544,20 @@ impl PodControl for Svc {
         let start = match stream.next().await {
             Some(Ok(c)) => match c.kind {
                 Some(Kind::Start(s)) => s,
-                _ => return Err(Status::invalid_argument("eerste chunk moet ExecStart zijn")),
+                _ => return Err(Status::invalid_argument("first chunk must be ExecStart")),
             },
             Some(Err(e)) => return Err(e),
-            None => return Err(Status::invalid_argument("lege exec-stream")),
+            None => return Err(Status::invalid_argument("empty exec stream")),
         };
         let name = proto::validate_name(&start.pod).map_err(bad)?.to_string();
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
-                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+                return Err(Status::not_found(format!("pod {name} not found")));
             }
         }
         let Some(leader) = dbus::leader_pid(&self.dbus, &name).await else {
-            return Err(Status::failed_precondition(format!("pod {name} draait niet")));
+            return Err(Status::failed_precondition(format!("pod {name} is not running")));
         };
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         crate::exec::run(start, &self.pod_rootfs(&name), leader, stream, tx)
@@ -496,7 +577,7 @@ impl PodControl for Svc {
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
-                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+                return Err(Status::not_found(format!("pod {name} not found")));
             }
         }
         let mut rx = agent::latest_rx(&self.metrics, &name).await;
@@ -524,7 +605,9 @@ impl PodControl for Svc {
         &self,
         _req: Request<PodRef>,
     ) -> Result<Response<Self::StreamLogsStream>, Status> {
-        Err(Status::unimplemented("logs streamen komt in fase 2 — zie /var/lib/rustypods/logs"))
+        Err(Status::unimplemented(
+            "log streaming lands in a later phase — see /var/lib/rustypods/logs",
+        ))
     }
 }
 
@@ -553,12 +636,43 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
     let s_exp = exp.wait()?;
     let s_tar = tar.wait()?;
     if !s_exp.success() {
-        bail!("podman export '{container}' mislukt — bestaat de box? (podman ps -a)");
+        bail!("podman export '{container}' failed — does the box exist? (podman ps -a)");
     }
     if !s_tar.success() {
-        bail!("tar-extract naar {} mislukt", dest.display());
+        bail!("tar extract into {} failed", dest.display());
     }
     Ok(())
+}
+
+/// Validate "hostPort:podPort[/proto]" — both ports must be 1..=65535.
+fn validate_port(spec: &str) -> Result<()> {
+    let (ports, proto) = match spec.split_once('/') {
+        Some((p, pr)) => (p, Some(pr)),
+        None => (spec, None),
+    };
+    let ok = matches!(proto, None | Some("tcp") | Some("udp"))
+        && ports.split(':').count() == 2
+        && ports
+            .split(':')
+            .all(|s| s.parse::<u16>().map(|n| n > 0).unwrap_or(false));
+    if ok {
+        Ok(())
+    } else {
+        bail!("invalid port mapping '{spec}' — expected hostPort:podPort[/tcp|/udp]")
+    }
+}
+
+/// Apply/clear the pod's btrfs qgroup cap. Best-effort caller sites decide
+/// whether failure is fatal (config apply) or a warning (pod start).
+fn apply_storage_cap(cfg: &Config, meta: &PodMeta) -> Result<()> {
+    if !btrfs::is_btrfs(&cfg.data_dir) {
+        if meta.storage_max_bytes > 0 {
+            bail!("storage_max needs btrfs — {} is not", cfg.data_dir.display());
+        }
+        return Ok(());
+    }
+    btrfs::quota_enable(&cfg.data_dir)?;
+    btrfs::set_quota_limit(&cfg.pods_dir().join(&meta.name), meta.storage_max_bytes)
 }
 
 /// Strip distrobox/podman runtime artifacts so `systemd-nspawn --boot` gets a
@@ -645,11 +759,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o666))?;
 
-    // System-bus connectie — machined/systemd gaan voortaan via zbus,
-    // geen subprocessen meer.
+    // System-bus connection — machined/systemd calls go through zbus,
+    // no subprocesses anymore.
     let dbus_conn = zbus::Connection::system()
         .await
-        .context("verbinden met system D-Bus")?;
+        .context("connecting to system D-Bus")?;
 
     // Wake machined (socket-activated; best effort).
     let _ = dbus::wake_machined(&dbus_conn).await;
@@ -689,10 +803,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 Ok((s, _)) => match s.peer_cred() {
                     Ok(c) if c.uid() == 0 || c.uid() == allowed => {
                         if tx.try_send(s).is_err() {
-                            tracing::warn!("accept-queue vol, verbinding gedropt");
+                            tracing::warn!("accept queue full, connection dropped");
                         }
                     }
-                    Ok(c) => tracing::warn!("uid {} geweigerd op rustypods.sock", c.uid()),
+                    Ok(c) => tracing::warn!("uid {} refused on rustypods.sock", c.uid()),
                     Err(e) => tracing::warn!("peer_cred: {e}"),
                 },
                 Err(e) => {
@@ -704,7 +818,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     });
 
     let incoming = ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
-    tracing::info!("rustypodsd luistert op {}", cfg.socket.display());
+    tracing::info!("rustypodsd listening on {}", cfg.socket.display());
     Server::builder()
         .add_service(PodControlServer::new(svc))
         .serve_with_incoming_shutdown(incoming, async {

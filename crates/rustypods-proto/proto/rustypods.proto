@@ -17,9 +17,9 @@ service PodControl {
   rpc StopPod(PodRef) returns (Pod);
   rpc ListPods(ListPodsRequest) returns (PodList);
   rpc DestroyPod(PodRef) returns (Empty);
-  // Hot-reload limits: schrijf conf + pas direct toe op de scope (geen reboot).
+  // Hot-reload limits: write the conf + apply to the live scope (no reboot).
   rpc UpdatePodConfig(UpdatePodConfigRequest) returns (Pod);
-  // Herlees een hand-ge-editte conf van schijf en pas toe.
+  // Reread a hand-edited conf from disk and apply it.
   rpc ReloadPodConfig(PodRef) returns (Pod);
 
   rpc Exec(stream ExecChunk) returns (stream ExecChunk);
@@ -122,6 +122,10 @@ message Pod {
   uint64 created_unix = 6;
   Limits limits = 7;
   bool ephemeral = 8;
+  // Btrfs qgroup cap on the pod's rootfs subvolume (0 = none).
+  uint64 storage_max_bytes = 9;
+  // "hostPort:podPort" mappings; imply --network-veth (private netns).
+  repeated string ports = 10;
 }
 
 message PodList {
@@ -137,11 +141,16 @@ message ListPodsRequest {}
 message CreatePodRequest {
   string name = 1;
   string image = 2;
+  uint64 storage_max_bytes = 3;
+  repeated string ports = 4;
 }
 
 message UpdatePodConfigRequest {
   string name = 1;
   Limits limits = 2;
+  // Concrete value — the CLI resolves "flag absent = keep current" itself.
+  // 0 = no cap. Hot-applied via btrfs qgroup on the pod rootfs.
+  uint64 storage_max_bytes = 3;
 }
 
 message StartPodRequest {

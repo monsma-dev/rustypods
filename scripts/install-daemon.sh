@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Draai met sudo:  sudo bash scripts/install-daemon.sh" >&2
+  echo "Run with sudo:  sudo bash scripts/install-daemon.sh" >&2
   exit 1
 fi
 
@@ -21,7 +21,7 @@ install -Dm755 target/release/rustypods-agent /var/lib/rustypods/bin/rustypods-a
 echo "==> [3/5] data dirs (btrfs CoW lives here)"
 mkdir -p /var/lib/rustypods/{images,pods,logs,shm}
 
-echo "==> [4/5] systemd unit + polkit rule (nick mag machines beheren)"
+echo "==> [4/5] systemd unit + polkit rule (nick may manage machines)"
 install -Dm644 deploy/rustypodsd.service /etc/systemd/system/rustypodsd.service
 install -Dm644 deploy/49-rustypods.rules /etc/polkit-1/rules.d/49-rustypods.rules
 

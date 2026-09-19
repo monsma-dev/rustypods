@@ -1,109 +1,152 @@
 # RustyPods
 
-nspawn pods op Btrfs, aangestuurd door een Rust-daemon over UDS+gRPC.
-Podman/distrobox-light zonder overlayfs, zonder containerd, zonder proxy-overhead.
+nspawn pods on Btrfs, driven by a Rust daemon over UDS+gRPC.
+Podman/distrobox-light without overlayfs, without containerd, without proxy overhead.
 
-## Architectuur
+## Architecture
 
 ```
 rustypods (CLI) ──UDS+gRPC──> rustypodsd (root)
                                   │
                                   ├─ btrfs subvolume snapshot   (images → pods, instant CoW)
-                                  ├─ systemd-nspawn --boot      (payload op de host-kernel)
-                                  ├─ machined via zbus          (machine-<pod>.scope, leader-lookup, poweroff)
+                                  ├─ btrfs qgroups              (per-pod storage caps)
+                                  ├─ systemd-nspawn --boot      (payload on the host kernel)
+                                  ├─ machined via zbus          (machine-<pod>.scope, leader lookup, poweroff)
                                   ├─ systemd1 via zbus          (SetUnitProperties: MemoryHigh/Max/CPUQuota)
-                                  └─ <──UDS── rustypods-agent   (in-pod telemetrie: cgroup v2 + PSI)
+                                  ├─ nftables DNAT              (port forwarding, own `ip rustypods` table)
+                                  └─ <──UDS── rustypods-agent   (in-pod telemetry: cgroup v2 + PSI)
 
-dataplane: /dev/shm/rustypods/<pod>/  ──bind──>  /run/rustypods/shm/  (mmap = echte gedeelde pages)
-kanaal:    /var/lib/rustypods/run/<pod>/agent.sock ──bind──> /run/rustypods/run/
+dataplane: /dev/shm/rustypods/<pod>/  ──bind──>  /run/rustypods/shm/  (mmap = real shared pages)
+channel:   /var/lib/rustypods/run/<pod>/agent.sock ──bind──> /run/rustypods/run/
+network:   pods with --port get a private netns: ve-<pod> (10.220.<idx>.1/30) ↔ host0 (10.220.<idx>.2/30)
 ```
 
-- `crates/rustypods-proto` — gRPC contract + gedeelde helpers
+- `crates/rustypods-proto` — gRPC contract + shared helpers
 - `crates/rustypodsd` — root daemon (`/run/rustypods/daemon.sock`, data in `/var/lib/rustypods`)
 - `crates/rustypods` — CLI
-- `crates/rustypods-agent` — in-pod telemetrie (gestart door `rustypods-agent.service`, gedropt in de image bij import)
+- `crates/rustypods-agent` — in-pod telemetry (started by `rustypods-agent.service`, dropped into the image at import)
 
-## Bouwen
+## Build
 
-De host heeft geen Rust-toolchain — bouwen gebeurt in de `arch` distrobox:
+The host has no Rust toolchain — builds happen inside the `arch` distrobox:
 
 ```bash
 bash scripts/build.sh
 ```
 
-## Installeren (sudo)
+## Install (sudo)
 
 ```bash
-sudo bash scripts/install-daemon.sh   # systemd-container + unit + polkit-regel
+sudo bash scripts/install-daemon.sh   # systemd-container + unit + polkit rule
 ```
 
-## Gebruik
+## Usage
 
 ```bash
-rustypods import --from-distrobox arch      # exporteert je arch box → image arch-base
+rustypods import --from-distrobox arch      # export your arch box → image arch-base
 rustypods images
-rustypods create dev --image arch-base      # instant Btrfs-snapshot
+rustypods create dev --image arch-base      # instant Btrfs snapshot
 rustypods start dev --memory-high 10G --memory-max 12G --cpu 400
 rustypods ps
-rustypods config dev --memory-high 8G       # live hot-reload, geen restart
-rustypods reload dev                        # na hand-edit van conf/pods/dev.conf
-rustypods shell dev                         # eigen Exec-RPC: nsenter + host-pty
-rustypods shell dev -- cargo build          # of direct een commando (exit-code komt terug)
-echo hi | rustypods shell dev cat           # pipes werken ook
+rustypods config dev --memory-high 8G       # live hot-reload, no restart
+rustypods config dev --storage-max 20G      # btrfs qgroup cap, hot-applied
+rustypods reload dev                        # after hand-editing conf/pods/dev.conf
+rustypods shell dev                         # native Exec RPC: nsenter + host pty
+rustypods shell dev -- cargo build          # or run a command (exit code comes back)
+echo hi | rustypods shell dev cat           # pipes work too
 rustypods stop dev
 rustypods destroy dev
 ```
 
-Handige vlaggen: `start --ephemeral` (wegwerp-run, `-x`) en `start --private-users`
-(sterkere isolatie, maar breekt de naadloze `/home/nick`-uid-mapping).
+Handy flags: `start --ephemeral` (throwaway run, `-x`) and `start --private-users`
+(stronger isolation, but breaks the seamless `/home/nick` uid mapping).
 
-## Exec-RPC (fase 2b)
-
-`rustypods shell` gebruikt géén `machinectl` meer: de daemon draait
-`nsenter -t <leader> -m -u -i -n -p` met een host-pty (`setsid`+`TIOCSCTTY`
-→ echte job control), schakelt naar de container-user via `setpriv` met
-passwd-data uit de image, en verplaatst de payload naar
-`machine-<pod>.scope/rustypods-exec` zodat exec'd processen onder dezelfde
-resource-limits vallen. SIGWINCH en exit-codes worden over de stream
-doorgestuurd; machined wordt alleen nog gebruikt voor de leader-pid-lookup.
-
-Bekende beperking: `tty(1)` faalt op path-resolutie (de pty-fd leeft in de
-host-devpts); de fd zelf werkt volledig.
-
-## Telemetrie & shared memory (fase 2a)
+## Storage quotas (btrfs qgroups)
 
 ```bash
-rustypods metrics dev                     # live stream: mem/cpu/pids/PSI uit de pod
-rustypods shm create dev ring --size 64M  # mmap-baar segment
+rustypods create web --image arch-base --storage-max 5G
+rustypods config dev --storage-max 20G      # hot-applied to the live subvolume
+```
+
+The daemon enables quota accounting on the data dir (one-time tree scan) and
+sets an exclusive qgroup limit on the pod's subvolume. Writes beyond the cap
+fail with ENOSPC inside the pod. Quota state doesn't survive a remount, so
+limits are re-applied at every pod start.
+
+## Networking & port forwarding
+
+```bash
+rustypods create web --image arch-base --port 18080:80 --port 53:53/udp
+```
+
+Any pod with `--port` gets a private network namespace (`--network-veth`):
+host side `ve-<pod>` gets `10.220.<idx>.1/30`, the pod's `host0` gets a static
+`10.220.<idx>.2/30` (written into the rootfs before boot; index is stable per
+pod). The daemon manages its own `ip rustypods` nftables table:
+
+- DNAT `host:port → pod:port` in prerouting + output (external *and*
+  localhost clients work)
+- SNAT of host-originated traffic to the veth address (otherwise the pod
+  would answer 127.0.0.1 on *its* loopback)
+- masquerade for pod egress
+
+We do **not** use nspawn's `--port`: it depends on the host side of the veth
+being managed by systemd-networkd (its `80-container-ve.network` provides the
+DHCP+nft glue), which NetworkManager/Netplan desktops don't run. Required
+sysctls (`ip_forward`, `route_localnet` on the veth) are enabled
+automatically. Privileged pod ports (<1024) need `--user root` inside the
+pod, same as anywhere. Note: pods with ports lose host-net parity — DNS and
+outbound go through the NAT, and the pod's own IP replaces `localhost`.
+
+## Exec RPC
+
+`rustypods shell` no longer uses `machinectl`: the daemon runs
+`nsenter -t <leader> -m -u -i -n -p` with a host pty (`setsid`+`TIOCSCTTY`
+→ real job control), drops to the container user via `setpriv` with passwd
+data from the image, and moves the payload into
+`machine-<pod>.scope/rustypods-exec` so exec'd processes live under the same
+resource limits. SIGWINCH and exit codes are forwarded over the stream;
+machined is only used for the leader-pid lookup.
+
+Known limitation: `tty(1)` fails on path resolution (the pty fd lives in the
+host devpts); the fd itself works fully.
+
+## Telemetry & shared memory
+
+```bash
+rustypods metrics dev                     # live stream: mem/cpu/pids/PSI from the pod
+rustypods shm create dev ring --size 64M  # mmap'able segment
 rustypods shm ls dev
 rustypods shm rm dev ring
 ```
 
-Host-side: `/dev/shm/rustypods/<pod>/<naam>`; pod-side: `/run/rustypods/shm/<naam>`.
-Zelfde tmpfs-pages — een `mmap` aan beide kanten is letterlijk zero-copy.
-Geschreven door uid 1000 zodat host- en pod-processen als `nick` kunnen mappen.
+Host side: `/dev/shm/rustypods/<pod>/<name>`; pod side: `/run/rustypods/shm/<name>`.
+Same tmpfs pages — an `mmap` on both sides is literally zero-copy.
+Files are owned by uid 1000 so host and pod processes can map them as `nick`.
 
-## Design-notities
+## Design notes
 
-- **Guardrails via machined-scope**: nspawn registreert zelf bij machined; de
-  payload belandt in `machine-<pod>.scope`. Limits gaan daar op via
-  `SetUnitProperties` op de system-bus (CPUQuota heet daar
-  `CPUQuotaPerSecUSec`, 100% = 1_000_000µs) — een `systemd-run`-wrapper zou
-  alleen de supervisor cappen. Pod die niet te cappen is, wordt gestopt.
-- **D-Bus via zbus**: machined-calls (`GetMachine`/`KillMachine`/
-  `TerminateMachine`/`ListMachines`) en systemd (`SetUnitProperties`,
-  `StartUnit`) gaan native over één gedeelde `Connection` — geen
-  `machinectl`/`systemctl`-subprocessen meer in de daemon.
-- **Config = TOML per entiteit**: `conf/pods/<naam>.conf` en
-  `conf/images/<naam>.conf` onder `/var/lib/rustypods` (géén centrale
-  state.json — die wordt eenmalig gemigreerd). Limits leesbaar als
-  `memory_high = "10.0G"`; `rustypods config` past live toe via
-  SetUnitProperties, `rustypods reload` leest een hand-edit opnieuw in.
-- **Stop-semantiek**: `stop` = `KillMachine(name, "leader", SIGRTMIN+3)`
-  (clean poweroff, empirisch geverifieerd) → `TerminateMachine` als fallback.
-- **UID's**: identity mapping (geen `--private-users` default) zodat container-`nick`
-  = host-uid 1000 en `/home/nick` writes direct kloppen — distrobox-pariteit.
-- **Sanitize bij import**: distrobox-restjes (`/etc/hostname`, `machine-id`,
-  entrypoint-bins, profile.d-hooks) worden gewist zodat `--boot` schoon start.
-- **Fase 2 restant**: computer-oom worker-subgroups/freeze,
-  ringbuffer-protocol bovenop de SHM-segmenten.
+- **Guardrails via the machined scope**: nspawn registers itself with
+  machined; the payload lands in `machine-<pod>.scope`. Limits go on that
+  scope via `SetUnitProperties` on the system bus (CPUQuota is called
+  `CPUQuotaPerSecUSec` there, 100% = 1_000_000µs) — a `systemd-run` wrapper
+  would only cap the supervisor. A pod that can't be capped gets stopped.
+- **D-Bus via zbus**: machined calls (`GetMachine`/`KillMachine`/
+  `TerminateMachine`/`ListMachines`) and systemd (`SetUnitProperties`,
+  `StartUnit`) go natively over one shared `Connection` — no
+  `machinectl`/`systemctl` subprocesses in the daemon.
+- **Config = TOML per entity**: `conf/pods/<name>.conf` and
+  `conf/images/<name>.conf` under `/var/lib/rustypods` (no central
+  state.json — it's migrated once). Limits are readable as
+  `memory_high = "10.0G"`; `rustypods config` applies live via
+  SetUnitProperties, `rustypods reload` rereads a hand edit.
+- **Stop semantics**: `stop` = `KillMachine(name, "leader", SIGRTMIN+3)`
+  (clean poweroff, empirically verified) → `TerminateMachine` as fallback.
+- **UIDs**: identity mapping (no `--private-users` by default) so
+  container-`nick` = host uid 1000 and `/home/nick` writes just work —
+  distrobox parity.
+- **Sanitize on import**: distrobox leftovers (`/etc/hostname`,
+  `machine-id`, entrypoint bins, profile.d hooks) are wiped so `--boot`
+  starts cleanly.
+- **Remaining phase-2 items**: computer-oom worker subgroups/freeze,
+  ringbuffer protocol on top of the SHM segments.
