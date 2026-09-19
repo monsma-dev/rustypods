@@ -136,7 +136,7 @@ impl RuntimeEngine for SystemdNspawn {
             .await
             .context("applying limits failed")?;
         dbus::leader_pid(&self.dbus, &spec.name)
-            .await
+            .await?
             .context("registered but no leader pid")
     }
 
@@ -145,7 +145,14 @@ impl RuntimeEngine for SystemdNspawn {
     }
 
     async fn running_pid(&self, pod: &str) -> Option<u32> {
-        dbus::leader_pid(&self.dbus, pod).await
+        // Some(0) = registered but still booting (leader property is 0).
+        // Bus errors collapse to None here — callers needing the truth use
+        // registered() (destroy) or get a clear error (stop).
+        dbus::running_pid(&self.dbus, pod).await.ok().flatten()
+    }
+
+    async fn registered(&self, pod: &str) -> Result<bool> {
+        dbus::registered(&self.dbus, pod).await
     }
 
     async fn apply_limits(&self, pod: &str, limits: &LimitsSpec) -> Result<()> {

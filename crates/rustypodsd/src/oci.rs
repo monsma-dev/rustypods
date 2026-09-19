@@ -77,10 +77,40 @@ pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
     for layer in &manifest.layers {
         pull_layer(&client, &image, layer, dest).await?;
     }
-    // Same convention as sanitize_rootfs: empty machine-id = uninitialized.
-    std::fs::create_dir_all(dest.join("etc"))?;
-    std::fs::write(dest.join("etc/machine-id"), b"")?;
+    write_machine_id(dest)?;
     Ok(cfg)
+}
+
+/// Same convention as sanitize_rootfs: an empty etc/machine-id marks the
+/// rootfs uninitialized so the container generates its own. But `etc` may
+/// be an image-planted symlink (e.g. `etc -> /host/dir`): only write when
+/// it resolves to a real directory *inside* the rootfs — never follow the
+/// link out and clobber a host file.
+fn write_machine_id(dest: &Path) -> Result<()> {
+    let etc = dest.join("etc");
+    let real_dir = match std::fs::symlink_metadata(&etc) {
+        // Absent → create a real dir ourselves (create_dir_all can't plant
+        // a symlink at the final component; a symlinked earlier component
+        // is caught by the canonicalize check below).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(&etc)
+            .and_then(|_| std::fs::symlink_metadata(&etc))
+            .map(|m| m.is_dir())
+            .unwrap_or(false),
+        Ok(md) => md.is_dir(),
+        Err(_) => false,
+    };
+    let inside_dest = matches!(
+        (etc.canonicalize(), dest.canonicalize()),
+        (Ok(e), Ok(d)) if e.starts_with(&d)
+    );
+    if real_dir && inside_dest {
+        std::fs::write(etc.join("machine-id"), b"")?;
+    } else {
+        tracing::warn!(
+            "image 'etc' is a symlink or escapes the rootfs — skipping machine-id write"
+        );
+    }
+    Ok(())
 }
 
 /// Fetch one layer blob to a temp file next to `dest` (same fs, cheap),
@@ -200,7 +230,26 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_prefix(".wh."))
         {
+            // The whiteout's parent may traverse an in-rootfs symlink a
+            // previous layer planted (d -> /tmp/x, then d/.wh.victim) —
+            // deleting through it would erase files OUTSIDE the rootfs.
+            // Canonicalize and require the resolved parent to stay inside
+            // dest and to be a real directory (not a symlink) first.
             let parent = dest.join(rel.parent().unwrap_or(Path::new("")));
+            let safe = match parent.canonicalize() {
+                Ok(canon) => {
+                    canon.starts_with(&dest)
+                        && std::fs::symlink_metadata(&parent)
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                }
+                // Doesn't exist → nothing to whiteout anyway.
+                Err(_) => false,
+            };
+            if !safe {
+                tracing::warn!("skipping whiteout via unsafe path {}", rel.display());
+                continue;
+            }
             if name == ".wh..opq" {
                 remove_children(&parent);
             } else if !name.is_empty() {
@@ -412,6 +461,81 @@ mod tests {
         assert!(dest.join("opq").is_dir());
         assert!(!dest.join("opq/a").exists() && !dest.join("opq/b").exists());
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// A whiteout under an in-rootfs symlink must NOT delete files outside
+    /// the rootfs: layer1 plants `d` -> <outside>, layer2 carries
+    /// `d/.wh.victim` — the real victim file must survive.
+    #[test]
+    fn whiteout_symlink_escape() {
+        let base = std::env::temp_dir().join(format!("rp-oci-whesc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dest = base.join("rootfs");
+        let outside = base.join("wh-escape-target");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), b"v").unwrap();
+
+        // Layer 1: a symlink pointing out of the rootfs.
+        let mut t1 = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Symlink);
+        hdr.set_mode(0o777);
+        hdr.set_size(0);
+        t1.append_link(&mut hdr, "d", &outside).unwrap();
+        let layer1 = t1.into_inner().unwrap();
+        unpack_tar(&layer1[..], &dest).unwrap();
+        assert!(dest.join("d").is_symlink());
+
+        // Layer 2: whiteout through that symlink — must be skipped.
+        let mut t2 = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_mode(0o644);
+        hdr.set_size(0);
+        hdr.set_cksum();
+        t2.append_data(&mut hdr, "d/.wh.victim", std::io::empty())
+            .unwrap();
+        let layer2 = t2.into_inner().unwrap();
+        unpack_tar(&layer2[..], &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read(outside.join("victim")).unwrap(),
+            b"v",
+            "whiteout escaped the rootfs through a symlink"
+        );
+        // The whiteout marker itself must not linger inside the rootfs.
+        assert!(!dest.join("d/.wh.victim").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `pull()` writes etc/machine-id — but never through an image-planted
+    /// `etc` symlink pointing outside the rootfs.
+    #[test]
+    fn machine_id_write_skips_symlinked_etc() {
+        let base = std::env::temp_dir().join(format!("rp-oci-mid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dest = base.join("rootfs");
+        let outside = base.join("outside-etc");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("etc")).unwrap();
+
+        write_machine_id(&dest).unwrap();
+        assert!(
+            !outside.join("machine-id").exists(),
+            "machine-id write followed the etc symlink out of the rootfs"
+        );
+
+        // A real etc dir still gets the file.
+        let dest2 = base.join("rootfs2");
+        std::fs::create_dir_all(&dest2).unwrap();
+        write_machine_id(&dest2).unwrap();
+        assert_eq!(
+            std::fs::read(dest2.join("etc/machine-id")).unwrap(),
+            b""
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

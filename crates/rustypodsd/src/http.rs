@@ -2,13 +2,22 @@
 //! methods the CLI uses, exposed for automation and agents. Proto types
 //! serialize camelCase, so responses match the protobuf field names.
 //!
-//! **No authentication.** The default bind is 127.0.0.1:9180; do not expose
-//! this listener on a routable address.
+//! **Bearer-token auth.** Every `/v1/*` request needs
+//! `Authorization: Bearer <token>`; the token is generated at daemon start
+//! and written to /run/rustypods/http-token (mode 0400, owned by the
+//! allowed uid). Requests carrying `Origin` or `Sec-Fetch-Site` headers are
+//! rejected outright — browsers have no business here (CSRF/drive-by).
+//! `/healthz` stays open. The bind address is loopback-only unless the
+//! operator sets RUSTYPODS_HTTP_INSECURE=1.
+
+use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Request as AxumRequest, State},
     http::StatusCode,
+    middleware::Next,
+    response::Response,
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -213,9 +222,33 @@ async fn destroy_stack(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub fn router(svc: Svc) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+/// Bearer auth + browser-header rejection for /v1/*. Two gates:
+/// 1. Any `Origin` or `Sec-Fetch-Site` header → 403. Browsers attach those
+///    to cross-origin requests; a local web page must never drive the API.
+/// 2. Missing/wrong `Authorization: Bearer <token>` → 401.
+async fn require_token(
+    State(expected): State<Arc<str>>,
+    req: AxumRequest,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let h = req.headers();
+    if h.contains_key(axum::http::header::ORIGIN) || h.contains_key("sec-fetch-site") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let want = format!("Bearer {expected}");
+    let ok = h
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == want)
+        .unwrap_or(false);
+    if !ok {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(req).await)
+}
+
+pub fn router(svc: Svc, token: Arc<str>) -> Router {
+    let v1 = Router::new()
         .route("/v1/daemon", get(daemon_info))
         .route("/v1/pods", get(list_pods).post(create_pod))
         .route("/v1/images", get(list_images))
@@ -225,5 +258,12 @@ pub fn router(svc: Svc) -> Router {
         .route("/v1/pods/{name}", patch(update_pod).delete(destroy_pod))
         .route("/v1/stacks", post(apply_stack))
         .route("/v1/stacks/{name}", delete(destroy_stack))
+        .route_layer(axum::middleware::from_fn_with_state(
+            token,
+            require_token,
+        ));
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(v1)
         .with_state(svc)
 }

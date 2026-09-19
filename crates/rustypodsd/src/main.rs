@@ -27,8 +27,9 @@ struct Args {
     #[arg(long, default_value = "nick")]
     import_user: String,
 
-    /// REST/JSON API bind address — no authentication, bind localhost only.
-    /// Empty string disables the HTTP listener.
+    /// REST/JSON API bind address — bearer-token gated, loopback only by
+    /// default. Empty string disables the HTTP listener. A non-loopback
+    /// bind needs RUSTYPODS_HTTP_INSECURE=1 in the environment.
     #[arg(long, default_value = "127.0.0.1:9180")]
     http_addr: String,
 
@@ -43,6 +44,22 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
+    // The REST API is bearer-token gated but carries root-equivalent power
+    // over plain HTTP — keep it on loopback unless the operator opts out.
+    if !args.http_addr.is_empty() {
+        let loopback = args
+            .http_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false);
+        if !loopback && std::env::var_os("RUSTYPODS_HTTP_INSECURE").is_none() {
+            anyhow::bail!(
+                "refusing to bind the REST API to non-loopback '{}' — \
+                 set RUSTYPODS_HTTP_INSECURE=1 to override",
+                args.http_addr
+            );
+        }
+    }
     if euid() != 0 {
         tracing::warn!("rustypodsd is not running as root — nspawn/btrfs/machined will fail");
     }

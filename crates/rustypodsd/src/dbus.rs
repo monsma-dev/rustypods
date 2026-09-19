@@ -60,11 +60,28 @@ trait SystemdManager {
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
 }
 
+/// machined's GetMachine answer for an unknown machine.
+const NO_SUCH_MACHINE: &str = "org.freedesktop.machine1.NoSuchMachine";
+
+fn is_no_such_machine(e: &zbus::Error) -> bool {
+    match e {
+        zbus::Error::MethodError(name, ..) => name.as_str() == NO_SUCH_MACHINE,
+        // A nested fdo error can wrap the reply on some paths — look inside.
+        zbus::Error::FDO(e) => e.to_string().contains(NO_SUCH_MACHINE),
+        _ => false,
+    }
+}
+
 async fn machine<'a>(conn: &'a Connection, name: &str) -> Result<Option<MachineProxy<'a>>> {
     let mgr = MachineManagerProxy::new(conn).await?;
     let path = match mgr.get_machine(name).await {
         Ok(p) => p,
-        Err(_) => return Ok(None), // NoSuchMachine → not registered
+        // Only NoSuchMachine means "not registered". Every other failure
+        // (bus down, machined hung, access denied) must propagate — before
+        // this, any error looked like "pod not running" and destroy_pod
+        // would happily delete a live pod's rootfs.
+        Err(e) if is_no_such_machine(&e) => return Ok(None),
+        Err(e) => return Err(e).context("machined GetMachine"),
     };
     Ok(Some(
         MachineProxy::builder(conn).path(path)?.build().await?,
@@ -88,24 +105,45 @@ pub async fn machined_up(conn: &Connection) -> bool {
     }
 }
 
-/// Leader pid via machined; None when the pod isn't running.
-pub async fn leader_pid(conn: &Connection, name: &str) -> Option<u32> {
-    let m = machine(conn, name).await.ok()??;
-    m.leader().await.ok().filter(|p| *p > 0)
+/// Leader pid via machined; Ok(None) when the pod isn't registered OR is
+/// registered-but-still-booting (leader property reads 0). Use
+/// `registered()` or `running_pid()` to tell those apart.
+pub async fn leader_pid(conn: &Connection, name: &str) -> Result<Option<u32>> {
+    let Some(m) = machine(conn, name).await? else {
+        return Ok(None);
+    };
+    Ok(m.leader().await.ok().filter(|p| *p > 0))
 }
 
-/// Poll machined until the pod is registered (nspawn does that itself).
+/// Is the pod registered with machined at all? A booting pod (leader 0)
+/// counts — it exists and must still be stoppable/undeletable.
+pub async fn registered(conn: &Connection, name: &str) -> Result<bool> {
+    machine(conn, name).await.map(|m| m.is_some())
+}
+
+/// Some(leader) while the pod is registered — leader 0 means booting.
+/// Callers that need a real pid (nsenter) must handle 0; callers that only
+/// distinguish running/not get the right answer either way.
+pub async fn running_pid(conn: &Connection, name: &str) -> Result<Option<u32>> {
+    let Some(m) = machine(conn, name).await? else {
+        return Ok(None);
+    };
+    Ok(Some(m.leader().await.unwrap_or(0)))
+}
+
+/// Poll machined until the pod has a live leader (nspawn registers first,
+/// the leader appears once init is up).
 pub async fn wait_registered(conn: &Connection, name: &str, dur: Duration) -> Result<u32> {
     timeout(dur, async {
         loop {
-            if let Some(pid) = leader_pid(conn, name).await {
-                return pid;
+            if let Some(pid) = leader_pid(conn, name).await? {
+                return anyhow::Ok(pid);
             }
             sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .with_context(|| format!("machined registration timeout for {name}"))
+    .with_context(|| format!("machined registration timeout for {name}"))?
 }
 
 /// Guardrails on the machined scope — SetUnitProperties(runtime=true),
@@ -142,14 +180,19 @@ pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Re
 /// Clean shutdown (SIGRTMIN+3 → leader) → terminate → give up loudly.
 /// The poweroff grace is ~8s — long enough for systemd to unmount cleanly,
 /// short enough that `stop` doesn't stall a GUI click for 15s.
+///
+/// "Stopped" means *unregistered* — a booting pod (leader 0) has no signal
+/// target but must still be terminated by name, not mistaken for stopped.
 pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
-    if leader_pid(conn, name).await.is_none() {
+    if !registered(conn, name).await? {
         return Ok(());
     }
     let mgr = MachineManagerProxy::new(conn).await?;
+    // kill_machine("leader") fails on a leader-less booting pod — fine,
+    // TerminateMachine below works by name either way.
     let _ = mgr.kill_machine(name, "leader", SIGRTMIN + 3).await;
     for _ in 0..40 {
-        if leader_pid(conn, name).await.is_none() {
+        if !registered(conn, name).await.unwrap_or(true) {
             return Ok(());
         }
         sleep(Duration::from_millis(200)).await;
@@ -157,7 +200,7 @@ pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
     tracing::warn!("{name}: poweroff timeout — terminating");
     let _ = mgr.terminate_machine(name).await;
     for _ in 0..20 {
-        if leader_pid(conn, name).await.is_none() {
+        if !registered(conn, name).await.unwrap_or(true) {
             return Ok(());
         }
         sleep(Duration::from_millis(200)).await;

@@ -98,6 +98,68 @@ fn limits_from(l: Option<Limits>) -> LimitsSpec {
     .unwrap_or_default()
 }
 
+/// "hostPort:podPort[/proto]" → (host_port, "tcp"|"udp"). Specs reach here
+/// only after proto::validate_port, so both halves parse.
+fn host_port_proto(spec: &str) -> (u16, &str) {
+    let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
+    let hp = ports
+        .split(':')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (hp, if proto == "udp" { "udp" } else { "tcp" })
+}
+
+/// Server-side port policy on top of proto::validate_port's syntax check —
+/// these need live state, so they can't live in the pure validator:
+/// - host ports below 1024 are privileged — refused;
+/// - a host port already bound on the host is refused;
+/// - a host port claimed by another pod's conf conflicts. Pods in the same
+///   stack share one netns+IP and are skipped (stack::parse dedups inside
+///   the stack already).
+fn validate_host_ports(
+    st: &State,
+    self_name: &str,
+    self_stack: &str,
+    ports: &[String],
+) -> Result<(), Status> {
+    for spec in ports {
+        let (hp, proto) = host_port_proto(spec);
+        if hp < 1024 {
+            return Err(Status::invalid_argument(format!(
+                "host port {hp} in '{spec}' is privileged — pick a port ≥1024"
+            )));
+        }
+        for m in st.pods.values() {
+            if m.name == self_name || (!m.stack.is_empty() && m.stack == self_stack) {
+                continue;
+            }
+            for other in &m.ports {
+                let (ohp, oproto) = host_port_proto(other);
+                if ohp == hp && oproto == proto {
+                    return Err(Status::already_exists(format!(
+                        "host port {hp}/{proto} is already published by pod {}",
+                        m.name
+                    )));
+                }
+            }
+        }
+        // "Not in any pod conf" doesn't mean free — something outside
+        // rustypods may hold it. A failed bind = unavailable.
+        let taken = if proto == "udp" {
+            std::net::UdpSocket::bind(("0.0.0.0", hp)).is_err()
+        } else {
+            std::net::TcpListener::bind(("0.0.0.0", hp)).is_err()
+        };
+        if taken {
+            return Err(Status::already_exists(format!(
+                "host port {hp}/{proto} is already in use on the host"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Svc {
     fn save_pod(&self, m: &PodMeta) -> Result<()> {
         state::save_pod(&self.cfg.data_dir, m)
@@ -238,10 +300,17 @@ impl PodControl for Svc {
         if dest.exists() {
             return Err(Status::already_exists(format!("image {name} already exists")));
         }
+        // runuser runs the export as this user — the request may only ever
+        // name the configured import_user, never root or another account.
         let user = if req.import_user.is_empty() {
             self.cfg.import_user.clone()
-        } else {
+        } else if req.import_user == self.cfg.import_user {
             req.import_user.clone()
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "import_user must be '{}' (the daemon's --import-user)",
+                self.cfg.import_user
+            )));
         };
         proto::validate_unix_user(&user).map_err(bad)?;
         self.storage.create_rootfs(&dest).map_err(int)?;
@@ -374,6 +443,10 @@ impl PodControl for Svc {
         }
         for p in &req.ports {
             proto::validate_port(p).map_err(bad)?;
+        }
+        {
+            let st = self.st.lock().await;
+            validate_host_ports(&st, &name, "", &req.ports)?;
         }
         for b in &req.binds {
             proto::validate_bind(b).map_err(bad)?;
@@ -516,13 +589,50 @@ impl PodControl for Svc {
                 if req.snapshot.is_empty() { "s".to_string() } else { format!(" '{}'", req.snapshot) }
             )));
         };
-        let _ = self.engine.stop(&pod).await; // rollback discards live state
+        self.engine.stop(&pod).await.map_err(int)?; // rollback discards live state
         agent::stop_listener(&self.listeners, &pod).await;
         let rootfs = self.pod_rootfs(&pod);
-        self.storage.delete_rootfs(&rootfs).map_err(int)?;
-        self.storage
-            .clone_rootfs(std::path::Path::new(&snap.path), &rootfs)
-            .map_err(int)?;
+        let snap_path = std::path::Path::new(&snap.path);
+        // The snapshot may have been GC'd or deleted since we listed it —
+        // never touch the live rootfs without a source to clone from.
+        if !snap_path.exists() {
+            return Err(Status::not_found(format!(
+                "snapshot {} of pod {pod} no longer exists on disk",
+                snap.id
+            )));
+        }
+        // Clone-then-swap: build the new rootfs next to the live one (same
+        // dir = same btrfs fs → clone is CoW), then atomically exchange the
+        // two with rename(). A failure before the swap leaves the live pod
+        // intact; the previous order (delete, then clone) bricked the pod
+        // on any clone error.
+        let parent = rootfs
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+        let staging = parent.join(format!("{pod}.rollback-new"));
+        let backup = parent.join(format!("{pod}.rollback-old"));
+        // Leftovers from a crashed earlier rollback — clear before staging.
+        for p in [&staging, &backup] {
+            if p.exists() || p.is_symlink() {
+                self.storage.delete_rootfs(p).map_err(int)?;
+            }
+        }
+        self.storage.clone_rootfs(snap_path, &staging).map_err(int)?;
+        if let Err(e) = std::fs::rename(&rootfs, &backup) {
+            let _ = self.storage.delete_rootfs(&staging);
+            return Err(int(e));
+        }
+        if let Err(e) = std::fs::rename(&staging, &rootfs) {
+            // Swap half-done: try to put the original back before reporting.
+            let restore_err = std::fs::rename(&backup, &rootfs).err();
+            let _ = self.storage.delete_rootfs(&staging);
+            return Err(int(match restore_err {
+                Some(r) => anyhow::anyhow!("{e:#}; restore also failed: {r:#}"),
+                None => e.into(),
+            }));
+        }
+        self.storage.delete_rootfs(&backup).map_err(int)?;
         {
             let mut st = self.st.lock().await;
             if let Some(m) = st.pods.get_mut(&pod) {
@@ -584,6 +694,15 @@ impl PodControl for Svc {
             })
             .map_err(bad)?
         };
+        // Host-port policy vs everything OUTSIDE this stack before any
+        // state changes (stack::parse already deduped within the stack).
+        {
+            let st = self.st.lock().await;
+            for (member, sp) in &def.pods {
+                let pname = stack::member_name(&def.name, member);
+                validate_host_ports(&st, &pname, &def.name, &sp.ports)?;
+            }
+        }
         // One index per stack: reuse a live member's, else allocate fresh.
         let idx = {
             let st = self.st.lock().await;
@@ -682,7 +801,12 @@ impl PodControl for Svc {
             return Err(Status::not_found(format!("stack {name} not found")));
         }
         for pname in &members {
-            let _ = self.engine.stop(pname).await; // may already be down
+            self.engine.stop(pname).await.map_err(int)?;
+            if self.engine.registered(pname).await.map_err(int)? {
+                return Err(Status::failed_precondition(format!(
+                    "pod {pname} is still registered with machined — refusing to destroy stack"
+                )));
+            }
             agent::stop_listener(&self.listeners, pname).await;
             self.storage.delete_rootfs(&self.pod_rootfs(pname)).map_err(int)?;
             state::remove_pod(&self.cfg.data_dir, pname);
@@ -786,7 +910,23 @@ impl PodControl for Svc {
         let run_dir = proto::run_dir(&self.cfg.data_dir, &name);
         let shm_host = proto::shm_host_dir(&name);
         std::fs::create_dir_all(&run_dir).map_err(int)?;
-        std::fs::create_dir_all(&shm_host).map_err(int)?;
+        // The per-pod shm dir lives under a root-owned 0700 parent (see
+        // serve()), but be paranoid anyway: it must be a REAL directory —
+        // a planted symlink would make this chown and later segment files
+        // follow it outside /dev/shm.
+        match std::fs::symlink_metadata(&shm_host) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => {
+                return Err(Status::failed_precondition(format!(
+                    "shm dir {} exists but is not a real directory — refusing to start",
+                    shm_host.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&shm_host).map_err(int)?;
+            }
+            Err(e) => return Err(int(e)),
+        }
         let _ = std::os::unix::fs::chown(
             &shm_host,
             Some(self.cfg.allowed_uid),
@@ -948,7 +1088,14 @@ impl PodControl for Svc {
                 return Err(Status::not_found(format!("pod {name} not found")));
             }
         }
-        let _ = self.engine.stop(&name).await; // may already be down
+        self.engine.stop(&name).await.map_err(int)?;
+        // Never delete the rootfs of a pod machined still knows about —
+        // a failed/busy bus must not look like "pod is gone".
+        if self.engine.registered(&name).await.map_err(int)? {
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is still registered with machined — refusing to destroy"
+            )));
+        }
         agent::stop_listener(&self.listeners, &name).await;
         self.storage.delete_rootfs(&self.pod_rootfs(&name)).map_err(int)?;
         state::remove_pod(&self.cfg.data_dir, &name);
@@ -992,6 +1139,13 @@ impl PodControl for Svc {
             for spec in &pm.ports {
                 proto::validate_port(spec).map_err(bad)?;
             }
+            let st = self.st.lock().await;
+            let stack = st
+                .pods
+                .get(&name)
+                .map(|m| m.stack.clone())
+                .unwrap_or_default();
+            validate_host_ports(&st, &name, &stack, &pm.ports)?;
         }
         if let Some(bl) = &req.binds {
             for spec in &bl.binds {
@@ -1050,6 +1204,10 @@ impl PodControl for Svc {
             proto::validate_port(spec).map_err(bad)?;
         }
         {
+            let st = self.st.lock().await;
+            validate_host_ports(&st, &name, &meta.stack, &meta.ports)?;
+        }
+        {
             let mut st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
                 return Err(Status::not_found(format!("pod {name} not found")));
@@ -1083,17 +1241,56 @@ impl PodControl for Svc {
             )));
         }
         let dir = proto::shm_host_dir(&pod);
-        std::fs::create_dir_all(&dir).map_err(int)?;
+        // /dev/shm is world-writable; the pod dir must be a real directory,
+        // not a planted symlink, before we create anything inside it.
+        match std::fs::symlink_metadata(&dir) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => {
+                return Err(Status::failed_precondition(format!(
+                    "shm dir {} exists but is not a real directory",
+                    dir.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&dir).map_err(int)?;
+            }
+            Err(e) => return Err(int(e)),
+        }
         let path = dir.join(&name);
-        let f = std::fs::File::create(&path).map_err(int)?;
+        // O_NOFOLLOW + create_new: the segment must not exist yet, and a
+        // symlink raced into place between the dir check and the open is
+        // refused by the kernel (ELOOP). fchmod/fchown act on the open fd —
+        // no path re-resolution, no symlink to follow.
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Status::already_exists(format!("shm segment {name} already exists"))
+                } else {
+                    int(e)
+                }
+            })?;
         f.set_len(req.size_bytes).map_err(int)?;
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).map_err(int)?;
-        let _ = std::os::unix::fs::chown(
-            &path,
-            Some(self.cfg.allowed_uid),
-            Some(self.cfg.allowed_uid),
-        );
+        f.set_permissions(std::fs::Permissions::from_mode(0o660))
+            .map_err(int)?;
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: fchown on a valid open fd.
+            if unsafe { libc::fchown(f.as_raw_fd(), self.cfg.allowed_uid, self.cfg.allowed_uid) }
+                != 0
+            {
+                tracing::warn!(
+                    "fchown {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
         Ok(Response::new(ShmSegment {
             name: name.clone(),
             host_path: path.display().to_string(),
@@ -1108,16 +1305,24 @@ impl PodControl for Svc {
             .to_string();
         let dir = proto::shm_host_dir(&pod);
         let mut segs = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                if let Ok(md) = e.metadata() {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    segs.push(ShmSegment {
-                        pod_path: format!("{}/{name}", proto::POD_SHM_DIR),
-                        host_path: e.path().display().to_string(),
-                        size_bytes: md.len(),
-                        name,
-                    });
+        // Only list a real directory — never enumerate through a symlink.
+        let real_dir = std::fs::symlink_metadata(&dir)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if real_dir {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    // symlink_metadata: report the entry itself, don't stat
+                    // through planted symlinks.
+                    if let Ok(md) = std::fs::symlink_metadata(e.path()) {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        segs.push(ShmSegment {
+                            pod_path: format!("{}/{name}", proto::POD_SHM_DIR),
+                            host_path: e.path().display().to_string(),
+                            size_bytes: md.len(),
+                            name,
+                        });
+                    }
                 }
             }
         }
@@ -1128,7 +1333,25 @@ impl PodControl for Svc {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
-        let path = proto::shm_host_dir(&pod).join(&name);
+        let dir = proto::shm_host_dir(&pod);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => {
+                return Err(Status::failed_precondition(format!(
+                    "shm dir {} exists but is not a real directory",
+                    dir.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Status::not_found(format!(
+                    "shm segment {name} not found"
+                )));
+            }
+            Err(e) => return Err(int(e)),
+        }
+        let path = dir.join(&name);
+        // remove_file unlinks the entry itself — a planted symlink is
+        // unlinked, never followed to its target.
         std::fs::remove_file(&path).map_err(int)?;
         Ok(Response::new(Empty {}))
     }
@@ -1159,6 +1382,13 @@ impl PodControl for Svc {
         let Some(leader) = self.engine.running_pid(&name).await else {
             return Err(Status::failed_precondition(format!("pod {name} is not running")));
         };
+        if leader == 0 {
+            // Registered with machined but no leader yet — nsenter has
+            // nothing to attach to.
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is still booting — no leader pid yet"
+            )));
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         crate::exec::run(start, &self.pod_rootfs(&name), leader, private_users, stream, tx)
             .await
@@ -1306,6 +1536,49 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Generate the REST bearer token (32 bytes from /dev/urandom, hex) and
+/// write it to <socket-dir>/http-token, mode 0400, owned by allowed_uid
+/// when running as root — the same uid that may already drive the unix
+/// socket. Non-root daemon → owned by the daemon's euid.
+fn write_http_token(cfg: &Config) -> Result<(Arc<str>, std::path::PathBuf)> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .context("reading /dev/urandom")?;
+    let mut token = String::with_capacity(64);
+    for b in buf {
+        token.push_str(&format!("{b:02x}"));
+    }
+    let dir = cfg
+        .socket
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/run/rustypods"));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("http-token");
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        f.write_all(token.as_bytes())?;
+    }
+    // Pre-existing file keeps its old mode — force 0400 either way.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))?;
+    if crate::euid() == 0 {
+        std::os::unix::fs::chown(&path, Some(cfg.allowed_uid), Some(cfg.allowed_uid))
+            .with_context(|| format!("chown {}", path.display()))?;
+    }
+    Ok((Arc::from(token.as_str()), path))
 }
 
 /// Snapshot GC predicate: `snaps` is newest-first; a snapshot is collected
@@ -1481,6 +1754,41 @@ pub async fn serve(cfg: Config) -> Result<()> {
     ] {
         std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
     }
+    // /dev/shm is world-writable (1777): the SHM subtree root must be a
+    // real root-owned 0700 dir, or any local user could plant symlinks the
+    // daemon (running as root) would follow during create_shm/start_pod —
+    // a classic world-writable-dir privesc.
+    {
+        let shm_root = Path::new("/dev/shm/rustypods");
+        match std::fs::symlink_metadata(shm_root) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => bail!(
+                "{} exists but is not a real directory — refusing to start",
+                shm_root.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(shm_root)
+                    .with_context(|| format!("mkdir {}", shm_root.display()))?;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("stat {}", shm_root.display()))
+            }
+        }
+        // Lock it down: root-owned, 0700. Skip the calls when already right —
+        // a non-root daemon can't chmod a root-owned dir, but an already-
+        // secured one doesn't need it to.
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::symlink_metadata(shm_root)?;
+        if md.mode() & 0o777 != 0o700 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(shm_root, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 {}", shm_root.display()))?;
+        }
+        if crate::euid() == 0 && md.uid() != 0 {
+            std::os::unix::fs::chown(shm_root, Some(0), Some(0))
+                .with_context(|| format!("chown {}", shm_root.display()))?;
+        }
+    }
     if let Some(p) = cfg.socket.parent() {
         std::fs::create_dir_all(p)?;
     }
@@ -1530,19 +1838,28 @@ pub async fn serve(cfg: Config) -> Result<()> {
         }
     }
 
-    // REST/JSON facade (axum) for automation — NO AUTHENTICATION, so the
-    // default bind is localhost-only. Empty --http-addr disables it.
+    // REST/JSON facade (axum) for automation — bearer-token gated (token
+    // in <socket-dir>/http-token, mode 0400). The default bind is
+    // localhost-only; empty --http-addr disables it. If the token file
+    // can't be written, the listener stays OFF — never serve unauth'd.
     if !cfg.http_addr.is_empty() {
         match tokio::net::TcpListener::bind(&cfg.http_addr).await {
-            Ok(l) => {
-                tracing::info!("http api listening on http://{} (no auth)", cfg.http_addr);
-                let router = crate::http::router(svc.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = axum::serve(l, router).await {
-                        tracing::warn!("http api: {e}");
-                    }
-                });
-            }
+            Ok(l) => match write_http_token(&cfg) {
+                Ok((token, token_path)) => {
+                    tracing::info!(
+                        "http api listening on http://{} — bearer token in {}",
+                        cfg.http_addr,
+                        token_path.display()
+                    );
+                    let router = crate::http::router(svc.clone(), token);
+                    tokio::spawn(async move {
+                        if let Err(e) = axum::serve(l, router).await {
+                            tracing::warn!("http api: {e}");
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!("http api disabled — token setup failed: {e:#}"),
+            },
             Err(e) => tracing::warn!("http api bind {}: {e}", cfg.http_addr),
         }
     }

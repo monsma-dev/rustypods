@@ -23,7 +23,7 @@ pub struct Config {
     /// Host user that owns the rootless podman store (for distrobox import).
     pub import_user: String,
     /// REST/JSON API bind address; "" disables the HTTP listener.
-    /// There is no authentication — localhost only.
+    /// Bearer-token gated; loopback-only unless RUSTYPODS_HTTP_INSECURE=1.
     pub http_addr: String,
     /// Snapshot GC sweep interval.
     pub gc_interval_secs: u64,

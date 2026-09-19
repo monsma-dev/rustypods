@@ -214,9 +214,14 @@ console log instead of the journal.
 
 The same PodControl surface is exposed as REST/JSON for automation and
 agents: `rustypodsd --http-addr 127.0.0.1:9180` (the default; `--http-addr ""`
-disables it). **No authentication** — localhost only, never bind a routable
-address. Request bodies are snake_case; responses are the proto messages in
-camelCase JSON:
+disables it). Every `/v1/*` request needs
+`Authorization: Bearer <token>` — the daemon generates the token at startup
+and writes it to `/run/rustypods/http-token` (mode `0400`, owned by the
+allowed uid). Requests carrying `Origin`/`Sec-Fetch-Site` headers are
+rejected (no browser-driven calls); `/healthz` stays open. The bind is
+loopback-only — a non-loopback `--http-addr` is refused unless
+`RUSTYPODS_HTTP_INSECURE=1` is set. Request bodies are snake_case;
+responses are the proto messages in camelCase JSON:
 
 ```
 GET    /healthz                      GET    /v1/daemon

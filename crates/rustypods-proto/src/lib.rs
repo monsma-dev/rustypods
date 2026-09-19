@@ -164,11 +164,16 @@ fn under(path: &str, prefix: &str) -> bool {
 }
 
 /// Validate "host[:pod][:ro]": both paths absolute, no empty/dot components,
-/// no trailing slash. Host may not be exactly a system root ("/", "/proc",
-/// "/sys", "/dev", "/boot", "/usr", "/etc", "/var", "/var/lib", "/run").
-/// Read-write binds under /run, /var/lib/rustypods, /etc, /usr, /boot,
-/// /proc, /sys, /dev are refused — those are :ro-only (a pod's init system
-/// considers e.g. /run/user/<uid> "theirs" and rm -rf's it; see AGENTS.md).
+/// no trailing slash. The host path is canonicalized — `/var/run` resolves
+/// to `/run`, `/bin` to `/usr/bin`, etc. — and the deny-lists are checked
+/// against BOTH the literal and the resolved path, so symlink aliases can't
+/// slip past. The host path must exist at validation time.
+/// Host may not be exactly a system root ("/", "/proc", "/sys", "/dev",
+/// "/boot", "/usr", "/etc", "/var", "/var/lib", "/run", "/root", "/var/run",
+/// "/var/spool", "/var/cron"). Read-write binds under /run, /root,
+/// /var/lib/rustypods, /etc, /usr, /boot, /proc, /sys, /dev are refused —
+/// those are :ro-only (a pod's init system considers e.g. /run/user/<uid>
+/// "theirs" and rm -rf's it; see AGENTS.md).
 pub fn validate_bind(spec: &str) -> anyhow::Result<BindSpec> {
     let mut parts: Vec<&str> = spec.split(':').collect();
     let ro = parts.last() == Some(&"ro");
@@ -184,22 +189,35 @@ pub fn validate_bind(spec: &str) -> anyhow::Result<BindSpec> {
     if !clean_abs_path(host) || !clean_abs_path(pod) {
         return Err(bad(spec));
     }
+    // Resolve symlink aliases (/var/run → /run, /bin → /usr/bin) so the
+    // deny-lists can't be bypassed by spelling a denied path differently.
+    // Nonexistent host paths are rejected here — pods can't bind paths that
+    // don't exist yet.
+    let resolved = std::fs::canonicalize(host).map_err(|_| {
+        anyhow::anyhow!("invalid bind '{spec}' — host path {host} does not exist")
+    })?;
+    let host_resolved = resolved.to_string_lossy().into_owned();
     const EXACT_DENY: &[&str] = &[
         "/", "/proc", "/sys", "/dev", "/boot", "/usr", "/etc", "/var", "/var/lib", "/run",
+        "/root", "/var/run", "/var/spool", "/var/cron",
     ];
-    if EXACT_DENY.contains(&host) {
+    if EXACT_DENY.contains(&host) || EXACT_DENY.contains(&host_resolved.as_str()) {
         return Err(anyhow::anyhow!("invalid bind '{spec}' — host path {host} may not be bound wholesale"));
     }
     const RW_DENY: &[&str] = &[
         "/run", "/var/lib/rustypods", "/etc", "/usr", "/boot", "/proc", "/sys", "/dev",
+        "/root", "/var/run",
     ];
-    if !ro && RW_DENY.iter().any(|p| under(host, p)) {
+    if !ro
+        && (RW_DENY.iter().any(|p| under(host, p))
+            || RW_DENY.iter().any(|p| under(&host_resolved, p)))
+    {
         return Err(anyhow::anyhow!(
             "invalid bind '{spec}' — {host} is read-only territory, add ':ro'"
         ));
     }
     Ok(BindSpec {
-        host: host.to_string(),
+        host: host_resolved,
         pod: pod.to_string(),
         ro,
     })
@@ -312,9 +330,19 @@ mod tests {
         assert!(validate_bind("/etc").is_err());
         assert!(validate_bind("home/nick").is_err());
         assert!(validate_bind("/a/../b").is_err());
-        assert!(validate_bind("/data:/mnt/data").is_ok());
-        assert!(validate_bind("/data:/mnt/data:ro").unwrap().ro);
+        assert!(validate_bind("/var/tmp:/mnt/data").is_ok());
+        assert!(validate_bind("/var/tmp:/mnt/data:ro").unwrap().ro);
         assert!(validate_bind("/x:rel").is_err());
+        // Host path must exist — no binding not-yet-created paths.
+        assert!(validate_bind("/definitely-not-here-rp").is_err());
+        // Symlink aliases resolve before the deny-lists run:
+        // /var/run → /run, /bin → /usr/bin on any usr-merged system.
+        assert!(validate_bind("/var/run").is_err());
+        assert!(validate_bind("/var/run/user/1000").is_err());
+        assert!(validate_bind("/var/run/user/1000:ro").unwrap().ro);
+        assert!(validate_bind("/bin/bash").is_err());
+        assert!(validate_bind("/bin/bash:ro").unwrap().ro);
+        assert!(validate_bind("/root").is_err());
     }
 
     #[test]

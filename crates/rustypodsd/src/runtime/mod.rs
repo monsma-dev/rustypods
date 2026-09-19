@@ -55,8 +55,14 @@ pub trait RuntimeEngine: Send + Sync {
     async fn start(&self, spec: &StartSpec, limits: &LimitsSpec) -> Result<u32>;
     /// Clean shutdown (SIGRTMIN+3 → terminate fallback for nspawn).
     async fn stop(&self, pod: &str) -> Result<()>;
-    /// Leader pid while running, None otherwise.
+    /// Leader pid while running, None otherwise. A pod registered with
+    /// machined but still booting reports Some(0) — running, but without a
+    /// usable pid yet (nsenter callers must refuse 0).
     async fn running_pid(&self, pod: &str) -> Option<u32>;
+    /// Is the pod registered with the machine manager at all? Unlike
+    /// running_pid this propagates errors — destroy paths must not treat
+    /// "couldn't ask machined" as "pod is gone".
+    async fn registered(&self, pod: &str) -> Result<bool>;
     /// Hot-apply resource limits to the live pod scope.
     async fn apply_limits(&self, pod: &str, limits: &LimitsSpec) -> Result<()>;
     /// Control-plane health (nspawn: machined answers ListMachines).

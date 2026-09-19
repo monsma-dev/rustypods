@@ -480,12 +480,18 @@ async fn run_pipe(
         }
     });
 
+    // Waiter: child exit OR response-channel-closed (client gone) → kill.
+    // Note the trigger is tx.closed(), NOT inbound-stream end — a piped
+    // payload legitimately outlives its stdin (think `exec -- cat` doing
+    // work after EOF), so stdin EOF alone must never kill.
     tokio::spawn(async move {
-        let code = child
-            .wait()
-            .await
-            .map(|s| s.code().unwrap_or(1))
-            .unwrap_or(1);
+        let code = tokio::select! {
+            st = child.wait() => st.map(|s| s.code().unwrap_or(1)).unwrap_or(1),
+            _ = tx.closed() => {
+                let _ = child.kill().await;
+                child.wait().await.map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+            }
+        };
         let _ = out_task.await;
         let _ = err_task.await;
         let _ = tx.send(chunk_exit(code)).await;
