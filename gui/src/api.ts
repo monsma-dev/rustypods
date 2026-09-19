@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  ApplyStackResponse,
   DaemonInfo,
   Image,
   Limits,
@@ -12,7 +13,7 @@ import {
 // The wire contract is crates/rustypods-proto/proto/rustypods.proto — Tauri
 // commands return proto messages as camelCase JSON, decoded here via the
 // generated fromJSON. No hand-maintained mirrors.
-export type { DaemonInfo, Image, Limits, Metric, Pod };
+export type { ApplyStackResponse, DaemonInfo, Image, Limits, Metric, Pod };
 export { PodState };
 
 // Outside the Tauri webview (plain `npm run dev` in a browser) there is no IPC
@@ -166,6 +167,43 @@ export const destroyPod = async (name: string): Promise<void> => {
   await delay();
   const i = MOCK_PODS.findIndex((p) => p.name === name);
   if (i >= 0) MOCK_PODS.splice(i, 1);
+};
+
+// ---- stacks ----
+
+/** Apply a stack.toml: members are created as pods named <stack>-<member>. */
+export const applyStack = async (toml: string): Promise<ApplyStackResponse> => {
+  if (inTauri)
+    return invoke<unknown>("apply_stack", { toml }).then(
+      ApplyStackResponse.fromJSON
+    );
+  await delay();
+  // Mock: scrape the stack name + [pods.<member>] tables out of the TOML.
+  const stack = /^\s*name\s*=\s*"([^"]+)"/m.exec(toml)?.[1] ?? "stack";
+  const created: Pod[] = [];
+  for (const m of toml.matchAll(/^\s*\[pods\.([^\]]+)\]/gm)) {
+    const p = Pod.fromPartial({
+      name: `${stack}-${m[1]}`,
+      stack,
+      image: "arch-base",
+      state: PodState.POD_STATE_CREATED,
+      createdUnix: Math.floor(Date.now() / 1000),
+    });
+    MOCK_PODS.push(p);
+    created.push(p);
+  }
+  return ApplyStackResponse.fromPartial({ name: stack, pods: created });
+};
+
+/** Destroy a stack: every member pod + the shared netns. */
+export const destroyStack = async (name: string): Promise<void> => {
+  if (inTauri) {
+    await invoke("destroy_stack", { name });
+    return;
+  }
+  await delay();
+  for (let i = MOCK_PODS.length - 1; i >= 0; i--)
+    if (MOCK_PODS[i].stack === name) MOCK_PODS.splice(i, 1);
 };
 
 export interface PodConfigUpdate {

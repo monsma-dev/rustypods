@@ -179,6 +179,32 @@ async fn create_pod(
     .await
 }
 
+/// `apply_stack`: raw stack.toml bytes to the daemon — members come back as
+/// pods named <stack>-<member> on one shared netns.
+#[tauri::command]
+async fn apply_stack(rt: State<'_, Rt>, toml: String) -> Result<ApplyStackResponse, String> {
+    call(&rt.0, move |mut c| async move {
+        c.apply_stack(ApplyStackRequest {
+            toml: toml.into_bytes(),
+        })
+        .await
+        .map(|r| r.into_inner())
+        .map_err(|e| e.message().to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn destroy_stack(rt: State<'_, Rt>, name: String) -> Result<(), String> {
+    call(&rt.0, move |mut c| async move {
+        c.destroy_stack(PodRef { name })
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message().to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn get_images(rt: State<'_, Rt>) -> Result<Vec<Image>, String> {
     call(&rt.0, |mut c| async move {
@@ -273,6 +299,8 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
             stop_pod,
             destroy_pod,
             update_pod_config,
+            apply_stack,
+            destroy_stack,
             watch_metrics,
             unwatch_metrics,
             get_images,

@@ -880,6 +880,98 @@ function NewPodDialog({
   );
 }
 
+/* ---------- apply stack dialog ---------- */
+
+const STACK_TOML_EXAMPLE = `# stack.toml — members become pods named <stack>-<member>
+# on one shared netns (they see each other on 127.0.0.1).
+name = "demo"
+
+[pods.web]
+image = "arch-base"
+ports = ["8080:80"]
+
+[pods.db]
+image = "arch-base"
+`;
+
+function ApplyStackDialog({
+  onClose,
+  onApplied,
+}: {
+  onClose: () => void;
+  onApplied: () => void;
+}) {
+  const [toml, setToml] = useState(STACK_TOML_EXAMPLE);
+  const [err, setErr] = useState<string | null>(null);
+  const [applying, setApplying] = useState(false);
+
+  const apply = async () => {
+    if (applying || !toml.trim()) return;
+    setApplying(true);
+    setErr(null);
+    try {
+      await api.applyStack(toml);
+      onApplied();
+      onClose();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-40" onClick={onClose}>
+      <div className="absolute inset-0 bg-black/40" />
+      <div
+        className="absolute left-1/2 top-1/2 flex max-h-[85vh] w-[28rem] -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-white/10 bg-bg2 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <h2 className="text-sm font-bold">Apply Stack</h2>
+          <button
+            onClick={onClose}
+            className="rounded-lg px-2 py-1 text-sm text-muted transition-colors hover:bg-white/5"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="flex-1 space-y-3 overflow-y-auto p-4">
+          <div>
+            <label className="mb-1 block text-xs font-medium">stack.toml</label>
+            <textarea
+              autoFocus
+              spellCheck={false}
+              value={toml}
+              onChange={(e) => setToml(e.target.value)}
+              className="h-48 w-full resize-none rounded-md border border-white/10 bg-bg px-2.5 py-1.5 font-mono text-xs focus:border-accent focus:outline-none"
+            />
+          </div>
+          {err && <p className="text-xs text-err">{err}</p>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
+          <button
+            onClick={onClose}
+            className="rounded-lg px-3 py-1.5 text-xs text-muted transition-colors hover:bg-white/5"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={apply}
+            disabled={!toml.trim() || applying}
+            className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
+          >
+            {applying ? "Applying…" : "Apply"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------- views ---------- */
 
 /** Tiny inline sparkline for datagrid cells (w=72 fixed). */
@@ -1055,44 +1147,113 @@ function PodsView({
 
 function StacksView({
   pods,
+  act,
   onOpen,
+  onNew,
 }: {
   pods: Pod[];
+  act: (f: () => Promise<unknown>) => void;
   onOpen: (p: Pod) => void;
+  onNew: () => void;
 }) {
+  // Which stack group is showing the inline "Destroy? [yes] [no]" confirm.
+  const [confirming, setConfirming] = useState<string | null>(null);
   const groups = new Map<string, Pod[]>();
   for (const p of pods.filter((p) => p.stack)) {
     groups.set(p.stack, [...(groups.get(p.stack) ?? []), p]);
   }
-  if (groups.size === 0) {
-    return (
-      <p className="mt-10 text-center text-sm text-muted">
-        No stacks — apply one with <code>rustypods apply stack.toml</code>
-      </p>
-    );
-  }
   return (
-    <div className="space-y-4">
-      {[...groups.entries()].map(([stack, members]) => (
-        <Group key={stack} title={`${stack} · shared netns`}>
-          {members.map((p) => (
-            <button
-              key={p.name}
-              onClick={() => onOpen(p)}
-              className="flex w-full items-center justify-between px-4 py-2.5 text-left transition-colors hover:bg-white/[0.04]"
+    <>
+      <div className="mb-2 flex items-center justify-end">
+        <button
+          onClick={onNew}
+          className="rounded-md bg-accent px-2 py-1 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+        >
+          + Apply stack.toml
+        </button>
+      </div>
+      {groups.size === 0 ? (
+        <p className="mt-10 text-center text-sm text-muted">
+          No stacks — apply one with <code>rustypods apply stack.toml</code>
+        </p>
+      ) : (
+        <div className="space-y-4">
+          {[...groups.entries()].map(([stack, members]) => (
+            <Group
+              key={stack}
+              title={`${stack} · shared netns rustypods-${stack}`}
             >
-              <span className="text-[13px] font-medium">{p.name}</span>
-              <span className="flex items-center gap-3">
-                <span className="font-mono text-[11px] text-muted">
-                  {p.ports.join(", ")}
-                </span>
-                <StateBadge state={p.state} />
-              </span>
-            </button>
+              {members.map((p) => (
+                <button
+                  key={p.name}
+                  onClick={() => onOpen(p)}
+                  className="flex w-full items-center justify-between px-4 py-2.5 text-left transition-colors hover:bg-white/[0.04]"
+                >
+                  <span className="text-[13px] font-medium">{p.name}</span>
+                  <span className="flex items-center gap-3">
+                    <span className="font-mono text-[11px] text-muted">
+                      {p.ports.join(", ")}
+                    </span>
+                    <StateBadge state={p.state} />
+                  </span>
+                </button>
+              ))}
+              <div className="flex items-center gap-1.5 px-4 py-2">
+                <button
+                  onClick={() =>
+                    act(async () => {
+                      for (const p of members.filter((p) => !isRunning(p)))
+                        await api.startPod(p.name);
+                    })
+                  }
+                  className="rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-white/5 hover:text-fg"
+                >
+                  Start all
+                </button>
+                <button
+                  onClick={() =>
+                    act(async () => {
+                      for (const p of members.filter(isRunning))
+                        await api.stopPod(p.name);
+                    })
+                  }
+                  className="rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-white/5 hover:text-fg"
+                >
+                  Stop all
+                </button>
+                {confirming === stack ? (
+                  <span className="ml-auto flex items-center gap-1.5 text-xs font-medium text-err">
+                    Destroy?
+                    <button
+                      onClick={() => {
+                        setConfirming(null);
+                        act(() => api.destroyStack(stack));
+                      }}
+                      className="rounded-md bg-err/15 px-2 py-1 text-xs font-medium text-err transition-colors hover:bg-err/25"
+                    >
+                      yes
+                    </button>
+                    <button
+                      onClick={() => setConfirming(null)}
+                      className="rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-white/5"
+                    >
+                      no
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => setConfirming(stack)}
+                    className="ml-auto rounded-md px-2 py-1 text-xs font-medium text-err/80 transition-colors hover:bg-err/15 hover:text-err"
+                  >
+                    Destroy
+                  </button>
+                )}
+              </div>
+            </Group>
           ))}
-        </Group>
-      ))}
-    </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1228,6 +1389,9 @@ export default function App() {
   const [newPodOpen, setNewPodOpen] = useState(
     () => new URLSearchParams(location.search).has("newpod")
   );
+  const [applyStackOpen, setApplyStackOpen] = useState(
+    () => new URLSearchParams(location.search).has("newstack")
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -1335,7 +1499,12 @@ export default function App() {
               />
             )}
             {view === "stacks" && (
-              <StacksView pods={pods} onOpen={(p) => setSelected(p.name)} />
+              <StacksView
+                pods={pods}
+                act={act}
+                onOpen={(p) => setSelected(p.name)}
+                onNew={() => setApplyStackOpen(true)}
+              />
             )}
             {view === "images" && <ImagesView images={images} />}
             {view === "settings" && (
@@ -1356,6 +1525,12 @@ export default function App() {
           images={images}
           onClose={() => setNewPodOpen(false)}
           onCreated={refresh}
+        />
+      )}
+      {applyStackOpen && (
+        <ApplyStackDialog
+          onClose={() => setApplyStackOpen(false)}
+          onApplied={refresh}
         />
       )}
       {selectedPod && (

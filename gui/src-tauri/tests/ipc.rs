@@ -154,3 +154,37 @@ fn create_wizard_cycle_via_ipc() {
         "wiztest still listed: {pods:?}"
     );
 }
+
+/// Stack round-trip: apply_stack wires the shared netns + veth as root and
+/// clones the member rootfs; destroy_stack tears both down again.
+/// Requires the daemon + an `arch-base` image.
+#[test]
+fn stack_apply_destroy_via_ipc() {
+    let wv = webview();
+
+    let toml = r#"
+name = "ipcstack"
+
+[pods.a]
+image = "arch-base"
+"#;
+    let res =
+        invoke(&wv, "apply_stack", json!({ "toml": toml })).expect("apply_stack failed");
+    assert_eq!(res["name"], "ipcstack");
+    let pods = res["pods"].as_array().unwrap();
+    assert_eq!(pods.len(), 1, "expected 1 member: {res:?}");
+    assert_eq!(pods[0]["name"], "ipcstack-a");
+    assert_eq!(pods[0]["stack"], "ipcstack");
+
+    invoke(&wv, "destroy_stack", json!({ "name": "ipcstack" }))
+        .expect("destroy_stack failed");
+    let pods = invoke(&wv, "get_pods", json!({})).unwrap();
+    assert!(
+        !pods
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "ipcstack-a"),
+        "ipcstack-a still listed: {pods:?}"
+    );
+}
