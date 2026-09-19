@@ -12,9 +12,16 @@ use rustypods_proto::{fmt_bytes, parse_bytes, SOCKET_PATH};
 #[derive(Parser)]
 #[command(name = "rustypods", version, about = "nspawn pods on Btrfs — podman/distrobox-light")]
 struct Cli {
-    /// Path to the daemon socket.
+    /// Path to the daemon socket (remote path when --remote is used).
     #[arg(long, global = true, default_value = SOCKET_PATH)]
     socket: PathBuf,
+
+    /// Manage a remote daemon over SSH: `rustypods --remote user@host ps`.
+    /// Spawns `ssh <dest> socat - UNIX-CONNECT:<socket>` as the transport —
+    /// no extra ports, full SSH auth/encryption. Requires socat (or nc-openbsd
+    /// with -U) on the remote host.
+    #[arg(long, global = true)]
+    remote: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -80,6 +87,8 @@ enum Cmd {
     Ps,
     /// Stop and remove a pod (Btrfs snapshot gone).
     Destroy { name: String },
+    /// Instant CoW clone: snapshot a pod's rootfs + conf under a new name.
+    Clone { source: String, dest: String },
     /// Adjust limits live (writes the conf + applies to the running scope).
     Config {
         name: String,
@@ -132,14 +141,103 @@ enum ShmCmd {
     Rm { pod: String, name: String },
 }
 
-async fn connect(path: PathBuf) -> Result<PodControlClient<Channel>> {
+/// Transport: local Unix socket, or an SSH subprocess whose stdio is
+/// bridged to the remote daemon socket via socat (the podman approach).
+#[allow(dead_code)] // the Child field is kept for kill_on_drop teardown
+enum Conn {
+    Unix(UnixStream),
+    Ssh(tokio::process::ChildStdout, tokio::process::ChildStdin, tokio::process::Child),
+}
+
+impl tokio::io::AsyncRead for Conn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Conn::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Conn::Ssh(o, _, _) => std::pin::Pin::new(o).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Conn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Conn::Unix(s) => std::pin::Pin::new(s).poll_write(cx, data),
+            Conn::Ssh(_, i, _) => std::pin::Pin::new(i).poll_write(cx, data),
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Conn::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Conn::Ssh(_, i, _) => std::pin::Pin::new(i).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Conn::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Conn::Ssh(_, i, _) => std::pin::Pin::new(i).poll_shutdown(cx),
+        }
+    }
+}
+
+fn ssh_pipe(dest: &str, sock: &PathBuf) -> std::io::Result<Conn> {
+    // socat bridges ssh stdio to the remote UDS. -T: no pty (pure channel),
+    // BatchMode: fail fast instead of an interactive password prompt.
+    let mut child = tokio::process::Command::new("ssh")
+        .args([
+            "-q",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            dest,
+            "socat",
+            "-",
+            &format!("UNIX-CONNECT:{}", sock.display()),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit()) // ssh errors surface directly
+        .kill_on_drop(true)
+        .spawn()?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    Ok(Conn::Ssh(stdout, stdin, child))
+}
+
+async fn connect(path: PathBuf, remote: Option<String>) -> Result<PodControlClient<Channel>> {
+    let err_hint = match &remote {
+        Some(d) => format!("connecting to rustypodsd via {d} — ssh up? socat installed remotely?"),
+        None => "connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)".into(),
+    };
     let ch = Endpoint::try_from("http://[::]:0")?
         .connect_with_connector(service_fn(move |_: http::Uri| {
             let p = path.clone();
-            async move { UnixStream::connect(p).await.map(hyper_util::rt::TokioIo::new) }
+            let remote = remote.clone();
+            async move {
+                let conn = match &remote {
+                    Some(dest) => ssh_pipe(dest, &p)?,
+                    None => Conn::Unix(UnixStream::connect(&p).await?),
+                };
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(conn))
+            }
         }))
         .await
-        .context("connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)")?;
+        .context(err_hint)?;
     Ok(PodControlClient::new(ch))
 }
 
@@ -157,6 +255,7 @@ fn limits_proto(high: Option<&str>, max: Option<&str>, cpu: Option<u32>) -> Resu
 /// exactly. Raw mode + SIGWINCH forwarding on this side.
 async fn shell_exec(
     sock: PathBuf,
+    remote: Option<String>,
     name: String,
     user: Option<String>,
     cmd: Vec<String>,
@@ -188,7 +287,7 @@ async fn shell_exec(
         })),
     })
     .await?;
-    let mut c = connect(sock).await?;
+    let mut c = connect(sock, remote).await?;
     let mut inbound = c.exec(ReceiverStream::new(rx)).await?.into_inner();
 
     // Raw mode so the remote pty gets every keystroke unprocessed.
@@ -342,17 +441,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Shell { name, user, cmd } => {
-            shell_exec(cli.socket, name, user, cmd).await?;
+            shell_exec(cli.socket, cli.remote, name, user, cmd).await?;
         }
         Cmd::Ping => {
-            let i = connect(cli.socket).await?.ping(PingRequest {}).await?.into_inner();
+            let i = connect(cli.socket.clone(), cli.remote.clone()).await?.ping(PingRequest {}).await?.into_inner();
             println!("rustypodsd v{}", i.version);
             println!("socket:   {}", i.socket_path);
             println!("data:     {}", i.data_dir);
             println!("machined: {}   btrfs: {}", i.machined, i.btrfs);
         }
         Cmd::Images => {
-            let l = connect(cli.socket).await?.list_images(ListImagesRequest {}).await?.into_inner();
+            let l = connect(cli.socket.clone(), cli.remote.clone()).await?.list_images(ListImagesRequest {}).await?.into_inner();
             for i in &l.images {
                 println!("{:<20} {:<20} {}", i.name, i.source, i.path);
             }
@@ -364,7 +463,7 @@ async fn main() -> Result<()> {
             let name = name.unwrap_or_else(|| format!("{from_distrobox}-base"));
             let user = user.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "nick".into()));
             println!("exporting: {from_distrobox} → {name} (this can take a while)...");
-            let img = connect(cli.socket)
+            let img = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .import_image(ImportImageRequest {
                     name: name.clone(),
@@ -376,7 +475,7 @@ async fn main() -> Result<()> {
             println!("image {} → {}", img.name, img.path);
         }
         Cmd::Rmi { name } => {
-            connect(cli.socket).await?.remove_image(ImageRef { name: name.clone() }).await?;
+            connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
             println!("image {name} removed");
         }
         Cmd::Create { name, image, storage_max, port } => {
@@ -384,7 +483,7 @@ async fn main() -> Result<()> {
             if !port.is_empty() {
                 eprintln!("note: --port implies a private netns (--network-veth); the pod no longer shares host networking");
             }
-            let p = connect(cli.socket)
+            let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port })
                 .await?
@@ -392,7 +491,7 @@ async fn main() -> Result<()> {
             print_pod(&p);
         }
         Cmd::Start { name, memory_high, memory_max, cpu, ephemeral, private_users } => {
-            let p = connect(cli.socket)
+            let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .start_pod(StartPodRequest {
                     name: name.clone(),
@@ -406,11 +505,11 @@ async fn main() -> Result<()> {
             println!("shell: rustypods shell {name}");
         }
         Cmd::Stop { name } => {
-            let p = connect(cli.socket).await?.stop_pod(PodRef { name }).await?.into_inner();
+            let p = connect(cli.socket.clone(), cli.remote.clone()).await?.stop_pod(PodRef { name }).await?.into_inner();
             print_pod(&p);
         }
         Cmd::Restart { name } => {
-            let mut c = connect(cli.socket).await?;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             c.stop_pod(PodRef { name: name.clone() }).await?;
             let p = c
                 .start_pod(StartPodRequest {
@@ -424,7 +523,7 @@ async fn main() -> Result<()> {
             print_pod(&p);
         }
         Cmd::Ps => {
-            let l = connect(cli.socket).await?.list_pods(ListPodsRequest {}).await?.into_inner();
+            let l = connect(cli.socket.clone(), cli.remote.clone()).await?.list_pods(ListPodsRequest {}).await?.into_inner();
             for p in &l.pods {
                 print_pod(p);
             }
@@ -433,12 +532,26 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Destroy { name } => {
-            connect(cli.socket).await?.destroy_pod(PodRef { name: name.clone() }).await?;
+            connect(cli.socket.clone(), cli.remote.clone()).await?.destroy_pod(PodRef { name: name.clone() }).await?;
             println!("pod {name} destroyed");
+        }
+        Cmd::Clone { source, dest } => {
+            let p = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .clone_pod(ClonePodRequest {
+                    source: source.clone(),
+                    dest,
+                })
+                .await?
+                .into_inner();
+            print_pod(&p);
+            if !p.ports.is_empty() {
+                eprintln!("note: ports copied — running both pods needs distinct host ports (edit conf/pods/{}.conf + reload)", p.name);
+            }
         }
         Cmd::Config { name, memory_high, memory_max, cpu, storage_max } => {
             // Missing flags = keep current values → fetch them first.
-            let mut c = connect(cli.socket).await?;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
                 .list_pods(ListPodsRequest {})
                 .await?
@@ -477,7 +590,7 @@ async fn main() -> Result<()> {
             print_pod(&p);
         }
         Cmd::Reload { name } => {
-            let p = connect(cli.socket)
+            let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .reload_pod_config(PodRef { name })
                 .await?
@@ -485,7 +598,7 @@ async fn main() -> Result<()> {
             print_pod(&p);
         }
         Cmd::Metrics { name } => {
-            let mut c = connect(cli.socket).await?;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let mut s = c.pod_metrics(PodRef { name }).await?.into_inner();
             while let Some(m) = s.message().await? {
                 let high = if m.mem_high_bytes > 0 {
@@ -505,7 +618,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Shm { sub } => {
-            let mut c = connect(cli.socket).await?;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             match sub {
                 ShmCmd::Create { pod, name, size } => {
                     let seg = c

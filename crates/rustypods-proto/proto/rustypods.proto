@@ -13,6 +13,9 @@ service PodControl {
   rpc RemoveImage(ImageRef) returns (Empty);
 
   rpc CreatePod(CreatePodRequest) returns (Pod);
+  // Instant CoW clone: btrfs snapshot of the rootfs + copied conf with a
+  // fresh name/net_index. Source may be running (snapshot is atomic).
+  rpc ClonePod(ClonePodRequest) returns (Pod);
   rpc StartPod(StartPodRequest) returns (Pod);
   rpc StopPod(PodRef) returns (Pod);
   rpc ListPods(ListPodsRequest) returns (PodList);
@@ -143,6 +146,11 @@ message CreatePodRequest {
   string image = 2;
   uint64 storage_max_bytes = 3;
   repeated string ports = 4;
+}
+
+message ClonePodRequest {
+  string source = 1;
+  string dest = 2;
 }
 
 message UpdatePodConfigRequest {

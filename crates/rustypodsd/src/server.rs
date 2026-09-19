@@ -240,6 +240,45 @@ impl PodControl for Svc {
         Ok(Response::new(to_pod(&meta, &dest, None)))
     }
 
+    /// `rustypods clone <src> <dest>`: instant btrfs snapshot of the pod
+    /// rootfs + a copied conf with fresh identity. Cloning a running pod is
+    /// allowed (subvolume snapshot is atomic) but the runtime state is
+    /// reset — the clone starts stopped.
+    async fn clone_pod(&self, req: Request<ClonePodRequest>) -> Result<Response<Pod>, Status> {
+        let req = req.into_inner();
+        let src = proto::validate_name(&req.source).map_err(bad)?.to_string();
+        let dest = proto::validate_name(&req.dest).map_err(bad)?.to_string();
+        let meta = {
+            let st = self.st.lock().await;
+            let Some(m) = st.pods.get(&src) else {
+                return Err(Status::not_found(format!("pod {src} not found")));
+            };
+            m.clone()
+        };
+        if dbus::leader_pid(&self.dbus, &src).await.is_some() {
+            tracing::warn!("cloning running pod {src} — snapshot is atomic but mid-write state is live");
+        }
+        let dst_root = self.pod_rootfs(&dest);
+        if dst_root.exists() {
+            return Err(Status::already_exists(format!("pod {dest} already exists")));
+        }
+        btrfs::snapshot(&self.pod_rootfs(&src), &dst_root).map_err(int)?;
+        let meta = PodMeta {
+            name: dest.clone(),
+            created_unix: state::now_unix(),
+            started: false,
+            // Fresh identity: net_index is reallocated on first start so two
+            // clones can run side by side. Ports are kept — running BOTH
+            // clones with identical host ports is a user-visible conflict.
+            net_index: 0,
+            ..meta
+        };
+        let mut st = self.st.lock().await;
+        st.pods.insert(dest.clone(), meta.clone());
+        self.save_pod(&meta).map_err(int)?;
+        Ok(Response::new(to_pod(&meta, &dst_root, None)))
+    }
+
     async fn start_pod(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
