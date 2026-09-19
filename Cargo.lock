@@ -976,6 +976,7 @@ dependencies = [
  "http",
  "hyper-util",
  "libc",
+ "rustypods-client",
  "rustypods-proto",
  "tokio",
  "tokio-stream",
@@ -999,6 +1000,19 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rustypods-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "http",
+ "hyper-util",
+ "rustypods-proto",
+ "tokio",
+ "tonic",
+ "tower",
 ]
 
 [[package]]

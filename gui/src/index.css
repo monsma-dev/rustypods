@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-bg text-fg antialiased;
+  font-family: "Cantarell", "Inter", system-ui, sans-serif;
+}
+
+/* Lean (RPi) mode: kill every animation/transition. */
+.lean * {
+  transition: none !important;
+  animation: none !important;
+}

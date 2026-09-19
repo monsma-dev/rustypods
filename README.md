@@ -193,3 +193,28 @@ Files are owned by uid 1000 so host and pod processes can map them as `nick`.
   starts cleanly.
 - **Remaining phase-2 items**: computer-oom worker subgroups/freeze,
   ringbuffer protocol on top of the SHM segments.
+
+## Desktop GUI (`gui/`)
+
+Tauri v2 + React + TypeScript + Tailwind (dark, Adwaita-flavoured). The
+Rust side is a thin bridge: Tauri commands call the same gRPC socket via
+the shared `rustypods-client` crate — zero duplicated daemon logic.
+
+```bash
+cd gui
+npm install
+npm run tauri dev     # vite + native window, needs the daemon running
+npm run build         # frontend only → gui/dist
+```
+
+Commands: `get_pods`, `start_pod`, `stop_pod`, `get_images`,
+`get_daemon_info`. Views: Pods (cards + start/stop), Stacks (grouped by
+shared netns), Images, Settings (daemon info + **lean mode** — 5 s
+polling, all animations off, for Pi-class hardware).
+
+End-to-end IPC test against a live daemon (uses `tauri::test`
+MockRuntime — no webview needed):
+
+```bash
+cd gui/src-tauri && cargo test   # stops + starts the `dev` pod for real
+```

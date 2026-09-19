@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 rustypods-proto.workspace = true
+rustypods-client.workspace = true
 http.workspace = true
 hyper-util.workspace = true
 libc.workspace = true

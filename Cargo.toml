@@ -2,10 +2,14 @@
 resolver = "2"
 members = [
     "crates/rustypods",
+    "crates/rustypods-client",
     "crates/rustypodsd",
     "crates/rustypods-agent",
     "crates/rustypods-proto",
 ]
+# gui/src-tauri is deliberately NOT a member — the tauri dep tree is heavy
+# and would slow every workspace build/test. It has its own lockfile.
+exclude = ["gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,3 +40,4 @@ libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 rustypods-proto = { path = "crates/rustypods-proto" }
+rustypods-client = { path = "crates/rustypods-client" }
