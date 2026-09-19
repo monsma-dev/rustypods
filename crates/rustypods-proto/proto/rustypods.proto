@@ -79,6 +79,10 @@ message DaemonInfo {
   string data_dir = 3;
   bool machined = 4;
   bool btrfs = 5;
+  // Active drivers, e.g. "btrfs" / "reflink-copy", "systemd-nspawn" —
+  // lets clients (and a future GUI) show which capabilities are live.
+  string storage_driver = 6;
+  string runtime_engine = 7;
 }
 
 message Image {

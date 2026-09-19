@@ -470,6 +470,7 @@ async fn main() -> Result<()> {
             println!("socket:   {}", i.socket_path);
             println!("data:     {}", i.data_dir);
             println!("machined: {}   btrfs: {}", i.machined, i.btrfs);
+            println!("storage:  {}   engine: {}", i.storage_driver, i.runtime_engine);
         }
         Cmd::Images => {
             let l = connect(cli.socket.clone(), cli.remote.clone()).await?.list_images(ListImagesRequest {}).await?.into_inner();
