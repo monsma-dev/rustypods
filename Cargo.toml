@@ -32,5 +32,6 @@ tower = "0.5"
 http = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 rustypods-proto = { path = "crates/rustypods-proto" }

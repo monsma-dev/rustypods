@@ -10,8 +10,8 @@ rustypods (CLI) ──UDS+gRPC──> rustypodsd (root)
                                   │
                                   ├─ btrfs subvolume snapshot   (images → pods, instant CoW)
                                   ├─ systemd-nspawn --boot      (payload op de host-kernel)
-                                  ├─ machined                   (machine-<pod>.scope, gratis tooling)
-                                  ├─ systemctl set-property     (MemoryHigh/MemoryMax/CPUQuota guardrails)
+                                  ├─ machined via zbus          (machine-<pod>.scope, leader-lookup, poweroff)
+                                  ├─ systemd1 via zbus          (SetUnitProperties: MemoryHigh/Max/CPUQuota)
                                   └─ <──UDS── rustypods-agent   (in-pod telemetrie: cgroup v2 + PSI)
 
 dataplane: /dev/shm/rustypods/<pod>/  ──bind──>  /run/rustypods/shm/  (mmap = echte gedeelde pages)
@@ -85,12 +85,18 @@ Geschreven door uid 1000 zodat host- en pod-processen als `nick` kunnen mappen.
 
 - **Guardrails via machined-scope**: nspawn registreert zelf bij machined; de
   payload belandt in `machine-<pod>.scope`. Limits gaan daar op via
-  `systemctl set-property` — een `systemd-run`-wrapper zou alleen de supervisor
-  cappen. Pod die niet te cappen is, wordt gestopt.
+  `SetUnitProperties` op de system-bus (CPUQuota heet daar
+  `CPUQuotaPerSecUSec`, 100% = 1_000_000µs) — een `systemd-run`-wrapper zou
+  alleen de supervisor cappen. Pod die niet te cappen is, wordt gestopt.
+- **D-Bus via zbus**: machined-calls (`GetMachine`/`KillMachine`/
+  `TerminateMachine`/`ListMachines`) en systemd (`SetUnitProperties`,
+  `StartUnit`) gaan native over één gedeelde `Connection` — geen
+  `machinectl`/`systemctl`-subprocessen meer in de daemon.
+- **Stop-semantiek**: `stop` = `KillMachine(name, "leader", SIGRTMIN+3)`
+  (clean poweroff, empirisch geverifieerd) → `TerminateMachine` als fallback.
 - **UID's**: identity mapping (geen `--private-users` default) zodat container-`nick`
   = host-uid 1000 en `/home/nick` writes direct kloppen — distrobox-pariteit.
 - **Sanitize bij import**: distrobox-restjes (`/etc/hostname`, `machine-id`,
   entrypoint-bins, profile.d-hooks) worden gewist zodat `--boot` schoon start.
-- **Fase 2 restant**: `zbus` machined-API i.p.v. subprocessen (leader-lookup
-  en `set-property` gaan nu nog via `machinectl`/`systemctl`), computer-oom
-  worker-subgroups/freeze, ringbuffer-protocol bovenop de SHM-segmenten.
+- **Fase 2 restant**: computer-oom worker-subgroups/freeze,
+  ringbuffer-protocol bovenop de SHM-segmenten.

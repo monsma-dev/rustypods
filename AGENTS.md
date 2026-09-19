@@ -35,6 +35,23 @@ relogin). The bind is `--bind-ro=` now; socket connects work fine on ro
 mounts. Same class of caution applies to any host dir another init system
 considers "theirs" (`/run`, `/var/lib`, `/etc`).
 
+## machined/systemd via zbus (geen subprocessen)
+
+De daemon praat machined+systemd via `dbus.rs` proxies op één gedeelde
+`zbus::Connection::system()`:
+
+- `KillMachine(name, "leader", SIGRTMIN+3)` = `machinectl poweroff`
+  (SIGRTMIN=34 op glibc → signo 37; empirisch geverifieerd op systemd 257).
+- `TerminateMachine(name)` = `machinectl terminate` (hard kill).
+- `Machine.leader`/`.unit` properties geven leader-pid + authoritative
+  scope-naam — nooit `machine-<name>.scope` zelf formatteren.
+- `SetUnitProperties(unit, runtime=true, a(sv))` = `systemctl
+  set-property --runtime`. `CPUQuota` heet op de bus `CPUQuotaPerSecUSec`
+  in µs (400% = 4_000_000 = `4s` in `systemctl show`).
+- `busctl monitor` als non-root faalt (BecomeMonitor denied); onder root
+  buffered stdout bij timeout-kill — nutteloos voor tracen. Liever
+  direct `busctl introspect` + signaal-experiment.
+
 ## Hard-won: nsenter exec + cgroup-lidmaatschap
 
 - `nsenter -p` **fork't altijd**: de gespawnde pid is een wachter; de echte

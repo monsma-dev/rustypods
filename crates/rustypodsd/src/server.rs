@@ -19,13 +19,15 @@ use rustypods_proto::{self as proto};
 
 use crate::agent::{self, ListenerMap, MetricsMap};
 use crate::state::{self, ImageMeta, LimitsSpec, PodMeta, State};
-use crate::{btrfs, nspawn, Config};
+use crate::{btrfs, dbus, nspawn, Config};
 
 pub struct Svc {
     cfg: Config,
     st: Arc<Mutex<State>>,
     metrics: MetricsMap,
     listeners: ListenerMap,
+    /// Gedeelde system-bus connectie (zbus multiplext alle calls erover).
+    dbus: zbus::Connection,
 }
 
 fn bad(e: impl Into<anyhow::Error>) -> Status {
@@ -93,7 +95,7 @@ impl PodControl for Svc {
             version: env!("CARGO_PKG_VERSION").into(),
             socket_path: self.cfg.socket.display().to_string(),
             data_dir: self.cfg.data_dir.display().to_string(),
-            machined: Path::new("/usr/bin/machinectl").exists(),
+            machined: dbus::machined_up(&self.dbus).await,
             btrfs: btrfs::is_btrfs(&self.cfg.data_dir),
         }))
     }
@@ -230,7 +232,7 @@ impl PodControl for Svc {
             self.save(&st).map_err(int)?;
             m
         };
-        if nspawn::leader_pid(&name).await.is_some() {
+        if dbus::leader_pid(&self.dbus, &name).await.is_some() {
             return Err(Status::failed_precondition(format!("pod {name} draait al")));
         }
         let rootfs = self.pod_rootfs(&name);
@@ -265,18 +267,18 @@ impl PodControl for Svc {
             agent::stop_listener(&self.listeners, &name).await;
             return Err(int(e));
         }
-        if let Err(e) = nspawn::wait_registered(&name, Duration::from_secs(15)).await {
+        if let Err(e) = dbus::wait_registered(&self.dbus, &name, Duration::from_secs(15)).await {
             agent::stop_listener(&self.listeners, &name).await;
-            let _ = nspawn::stop(&name).await;
+            let _ = dbus::stop(&self.dbus, &name).await;
             return Err(int(e.context(format!("boot mislukt — zie {}", log.display()))));
         }
         // Guardrails are the point: a pod that can't be capped gets stopped.
-        if let Err(e) = nspawn::apply_limits(&name, &meta.limits).await {
+        if let Err(e) = dbus::apply_limits(&self.dbus, &name, &meta.limits).await {
             agent::stop_listener(&self.listeners, &name).await;
-            let _ = nspawn::stop(&name).await;
+            let _ = dbus::stop(&self.dbus, &name).await;
             return Err(int(e.context("limits zetten mislukt")));
         }
-        let leader = nspawn::leader_pid(&name).await;
+        let leader = dbus::leader_pid(&self.dbus, &name).await;
         let mut st = self.st.lock().await;
         if let Some(m) = st.pods.get_mut(&name) {
             m.started = true;
@@ -290,7 +292,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
-        nspawn::stop(&name).await.map_err(int)?;
+        dbus::stop(&self.dbus, &name).await.map_err(int)?;
         agent::stop_listener(&self.listeners, &name).await;
         let st = self.st.lock().await;
         let Some(m) = st.pods.get(&name) else {
@@ -303,7 +305,11 @@ impl PodControl for Svc {
         let st = self.st.lock().await;
         let mut out = Vec::new();
         for m in st.pods.values() {
-            out.push(to_pod(m, &self.pod_rootfs(&m.name), nspawn::leader_pid(&m.name).await));
+            out.push(to_pod(
+                m,
+                &self.pod_rootfs(&m.name),
+                dbus::leader_pid(&self.dbus, &m.name).await,
+            ));
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Response::new(PodList { pods: out }))
@@ -313,7 +319,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
-        nspawn::stop(&name).await.map_err(int)?;
+        dbus::stop(&self.dbus, &name).await.map_err(int)?;
         agent::stop_listener(&self.listeners, &name).await;
         btrfs::delete(&self.pod_rootfs(&name)).map_err(int)?;
         agent::cleanup_pod_dirs(
@@ -412,7 +418,7 @@ impl PodControl for Svc {
                 return Err(Status::not_found(format!("pod {name} niet gevonden")));
             }
         }
-        let Some(leader) = nspawn::leader_pid(&name).await else {
+        let Some(leader) = dbus::leader_pid(&self.dbus, &name).await else {
             return Err(Status::failed_precondition(format!("pod {name} draait niet")));
         };
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -580,10 +586,14 @@ pub async fn serve(cfg: Config) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o666))?;
 
-    // Wake machined if present (it is socket-activated anyway; best effort).
-    let _ = SyncCommand::new("systemctl")
-        .args(["start", "systemd-machined"])
-        .output();
+    // System-bus connectie — machined/systemd gaan voortaan via zbus,
+    // geen subprocessen meer.
+    let dbus_conn = zbus::Connection::system()
+        .await
+        .context("verbinden met system D-Bus")?;
+
+    // Wake machined (socket-activated; best effort).
+    let _ = dbus::wake_machined(&dbus_conn).await;
 
     let st = Arc::new(Mutex::new(state::load(&cfg.state_file())));
     let metrics: MetricsMap = Default::default();
@@ -593,6 +603,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         st: st.clone(),
         metrics: metrics.clone(),
         listeners: listeners.clone(),
+        dbus: dbus_conn.clone(),
     };
 
     // Daemon restarted while pods kept running → rebind their agent channels.
@@ -602,7 +613,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     };
     for name in running {
         let run_dir = proto::run_dir(&cfg.data_dir, &name);
-        if nspawn::leader_pid(&name).await.is_some() {
+        if dbus::leader_pid(&dbus_conn, &name).await.is_some() {
             if let Err(e) =
                 agent::spawn_listener(&run_dir, &name, metrics.clone(), listeners.clone()).await
             {

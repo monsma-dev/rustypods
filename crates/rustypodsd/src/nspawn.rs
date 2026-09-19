@@ -2,14 +2,10 @@
 //! registers the machine itself (CreateMachine moves the payload into
 //! `machine-<name>.scope`), then we bolt resource limits onto that scope.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::path::Path;
-use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::{sleep, timeout};
-
-use crate::state::LimitsSpec;
 
 /// Pure argv builder — unit-testable.
 pub fn start_argv(
@@ -82,94 +78,6 @@ pub async fn spawn(argv: &[OsString], log: &Path) -> Result<u32> {
         }
     });
     Ok(pid)
-}
-
-pub async fn leader_pid(name: &str) -> Option<u32> {
-    let out = Command::new("machinectl")
-        .args(["show", name, "-p", "Leader", "--value"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|p| *p > 0)
-}
-
-/// Wait for machined registration (nspawn does this itself during --boot).
-pub async fn wait_registered(name: &str, dur: Duration) -> Result<u32> {
-    timeout(dur, async {
-        loop {
-            if let Some(pid) = leader_pid(name).await {
-                return pid;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .with_context(|| format!("machined registratie timeout voor {name}"))
-}
-
-/// Resource guardrails on the machined-managed scope — *this* is the cgroup
-/// that holds the payload, not any wrapper we might have spawned around it.
-pub async fn apply_limits(name: &str, lim: &LimitsSpec) -> Result<()> {
-    let unit = format!("machine-{name}.scope");
-    let mut args: Vec<String> = vec!["set-property".into(), unit];
-    if lim.memory_high_bytes > 0 {
-        args.push(format!("MemoryHigh={}", lim.memory_high_bytes));
-    }
-    if lim.memory_max_bytes > 0 {
-        args.push(format!("MemoryMax={}", lim.memory_max_bytes));
-    }
-    if lim.cpu_quota_percent > 0 {
-        args.push(format!("CPUQuota={}%", lim.cpu_quota_percent));
-    }
-    if args.len() <= 2 {
-        return Ok(());
-    }
-    let out = Command::new("systemctl").args(&args).output().await?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        bail!(
-            "systemctl {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-    }
-}
-
-/// Clean shutdown → terminate → give up loudly.
-pub async fn stop(name: &str) -> Result<()> {
-    if leader_pid(name).await.is_none() {
-        return Ok(());
-    }
-    let _ = Command::new("machinectl")
-        .args(["poweroff", name])
-        .output()
-        .await;
-    for _ in 0..75 {
-        if leader_pid(name).await.is_none() {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    tracing::warn!("{name}: poweroff timeout — terminate");
-    let _ = Command::new("machinectl")
-        .args(["terminate", name])
-        .output()
-        .await;
-    for _ in 0..25 {
-        if leader_pid(name).await.is_none() {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    bail!("pod {name} weigert te stoppen")
 }
 
 #[cfg(test)]
