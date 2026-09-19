@@ -66,6 +66,83 @@ pub fn validate_name(name: &str) -> anyhow::Result<&str> {
     }
 }
 
+/// Snapshot ids are "<unix_ts>[-slug]" — digits, then optionally "-" + [a-z0-9-]{1,40}.
+pub fn validate_snapshot_id(id: &str) -> anyhow::Result<&str> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && !id.contains('/')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '-')
+        && id
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+    if ok {
+        Ok(id)
+    } else {
+        anyhow::bail!("invalid snapshot id '{id}' — expected <unix_ts>[-slug]")
+    }
+}
+
+/// A distrobox/podman container reference — the podman name charset
+/// ([A-Za-z0-9][A-Za-z0-9_.-]*), so a leading '-' (option injection) is out.
+pub fn validate_container_ref(s: &str) -> anyhow::Result<&str> {
+    let ok = !s.is_empty()
+        && s.len() <= 64
+        && s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        && s
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false);
+    if ok {
+        Ok(s)
+    } else {
+        anyhow::bail!("invalid container ref '{s}' — use [A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}")
+    }
+}
+
+/// A Unix login name: ^[a-z_][a-z0-9_-]{0,31}$.
+pub fn validate_unix_user(u: &str) -> anyhow::Result<&str> {
+    let ok = !u.is_empty()
+        && u.len() <= 32
+        && u
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_lowercase() || c == '_')
+            .unwrap_or(false)
+        && u
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if ok {
+        Ok(u)
+    } else {
+        anyhow::bail!("invalid unix user '{u}' — use [a-z_][a-z0-9_-]{{0,31}}")
+    }
+}
+
+/// Validate "hostPort:podPort[/proto]" — both ports must be 1..=65535.
+pub fn validate_port(spec: &str) -> anyhow::Result<()> {
+    let (ports, proto) = match spec.split_once('/') {
+        Some((p, pr)) => (p, Some(pr)),
+        None => (spec, None),
+    };
+    let ok = matches!(proto, None | Some("tcp") | Some("udp"))
+        && ports.split(':').count() == 2
+        && ports
+            .split(':')
+            .all(|s| s.parse::<u16>().map(|n| n > 0).unwrap_or(false));
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid port mapping '{spec}' — expected hostPort:podPort[/tcp|/udp]")
+    }
+}
+
 /// Parse "10G", "512M", "1024" (bytes) into a byte count.
 pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
@@ -103,6 +180,37 @@ mod tests {
         assert!(validate_name("Bad").is_err());
         assert!(validate_name("bad name").is_err());
         assert!(validate_name(&"x".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn snapshot_id_validation() {
+        assert!(validate_snapshot_id("1789836285").is_ok());
+        assert!(validate_snapshot_id("1789836285-before-experiment").is_ok());
+        assert!(validate_snapshot_id("").is_err());
+        assert!(validate_snapshot_id("../x").is_err());
+        assert!(validate_snapshot_id("a/b").is_err());
+        assert!(validate_snapshot_id("1789836285/../../pods").is_err());
+        assert!(validate_snapshot_id("-x").is_err());
+        assert!(validate_snapshot_id("Bad").is_err());
+    }
+
+    #[test]
+    fn container_ref_and_unix_user() {
+        assert!(validate_container_ref("arch").is_ok());
+        assert!(validate_container_ref("-o/tmp/x").is_err());
+        assert!(validate_container_ref("a b").is_err());
+        assert!(validate_unix_user("nick").is_ok());
+        assert!(validate_unix_user("root").is_ok());
+        assert!(validate_unix_user("-u").is_err());
+    }
+
+    #[test]
+    fn port_validation() {
+        assert!(validate_port("2222:22").is_ok());
+        assert!(validate_port("53:53/udp").is_ok());
+        assert!(validate_port("0:80").is_err());
+        assert!(validate_port("8080").is_err());
+        assert!(validate_port("1:2/sctp").is_err());
     }
 
     #[test]

@@ -89,6 +89,21 @@ pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<Os
     a.push(format!("USER={}", if start.user.is_empty() { "root" } else { &start.user }).into());
     a.push(format!("LOGNAME={}", if start.user.is_empty() { "root" } else { &start.user }).into());
     for kv in &start.env {
+        // Must be KEY=VALUE with a POSIX-ish key — anything else (a bare
+        // word, or "-i"/"-S x") is an `env` option/command injection.
+        let Some((key, _)) = kv.split_once('=') else {
+            anyhow::bail!("invalid env entry '{kv}'");
+        };
+        let key_ok = !key.is_empty()
+            && key
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !key_ok {
+            anyhow::bail!("invalid env entry '{kv}'");
+        }
         a.push(kv.clone().into());
     }
     if start.argv.is_empty() {
@@ -356,6 +371,19 @@ mod tests {
         assert!(!s.iter().any(|x| *x == "setpriv"), "root gets no setpriv");
         assert!(s.iter().any(|x| *x == "HOME=/root"));
         assert!(s.ends_with(&["echo", "hi"]));
+    }
+
+    #[test]
+    fn env_option_injection_rejected() {
+        let mut s = start("root", &["true"]);
+        s.env = vec!["TERM=xterm".into(), "-i".into()];
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_err());
+        s.env = vec!["-S x".into()];
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_err());
+        s.env = vec!["FOO".into()];
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_err());
+        s.env = vec!["A_1=b=c".into()];
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_ok());
     }
 
     #[test]

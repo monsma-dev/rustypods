@@ -87,7 +87,12 @@ pub async fn spawn_listener(
             pod: pod_name.clone(),
             metrics,
         };
+        // Reachable by untrusted in-pod code: cap concurrency. No
+        // `timeout` — it's per-request in tonic and would kill the
+        // long-lived StreamMetrics stream.
         let _ = Server::builder()
+            .concurrency_limit_per_connection(8)
+            .max_concurrent_streams(8)
             .add_service(AgentServer::new(svc))
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
                 let _ = rx.await;

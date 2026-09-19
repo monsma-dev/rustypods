@@ -66,6 +66,13 @@ impl tokio::io::AsyncWrite for Conn {
 }
 
 fn ssh_pipe(dest: &str, sock: &PathBuf) -> std::io::Result<Conn> {
+    // A dest starting with '-' would be read by ssh as an option.
+    if dest.starts_with('-') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid ssh destination",
+        ));
+    }
     // socat bridges ssh stdio to the remote UDS. -T: no pty (pure channel),
     // BatchMode: fail fast instead of an interactive password prompt.
     let mut child = tokio::process::Command::new("ssh")

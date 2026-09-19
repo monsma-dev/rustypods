@@ -218,6 +218,10 @@ fn scan<T: for<'de> Deserialize<'de>>(dir: &Path, out: &mut BTreeMap<String, T>,
             .and_then(|s| toml::from_str::<T>(&s).ok())
         {
             Some(m) => {
+                if rustypods_proto::validate_name(name_of(&m)).is_err() {
+                    tracing::warn!("conf {} skipped (invalid name)", p.display());
+                    continue;
+                }
                 out.insert(name_of(&m).to_string(), m);
             }
             None => tracing::warn!("conf {} skipped (parse error)", p.display()),

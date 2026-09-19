@@ -35,6 +35,10 @@ pub struct Svc {
     storage: Arc<dyn StorageDriver>,
 }
 
+/// Hard cap on a single SHM segment — the file lives on /dev/shm (tmpfs),
+/// so an unbounded set_len is a RAM DoS.
+const SHM_MAX_BYTES: u64 = 4 << 30;
+
 fn bad(e: impl Into<anyhow::Error>) -> Status {
     Status::invalid_argument(format!("{:#}", e.into()))
 }
@@ -163,6 +167,7 @@ impl PodControl for Svc {
     ) -> Result<Response<Image>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        proto::validate_container_ref(&req.distrobox).map_err(bad)?;
         let dest = self.cfg.images_dir().join(&name);
         if dest.exists() {
             return Err(Status::already_exists(format!("image {name} already exists")));
@@ -172,6 +177,7 @@ impl PodControl for Svc {
         } else {
             req.import_user.clone()
         };
+        proto::validate_unix_user(&user).map_err(bad)?;
         self.storage.create_rootfs(&dest).map_err(int)?;
         let d = dest.clone();
         let cont = req.distrobox.clone();
@@ -258,7 +264,7 @@ impl PodControl for Svc {
             return Err(Status::already_exists(format!("pod {name} already exists")));
         }
         for p in &req.ports {
-            validate_port(p).map_err(bad)?;
+            proto::validate_port(p).map_err(bad)?;
         }
         self.storage.clone_rootfs(&img_dir, &dest).map_err(int)?;
         let meta = PodMeta {
@@ -363,6 +369,9 @@ impl PodControl for Svc {
     async fn rollback_pod(&self, req: Request<RollbackPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        if !req.snapshot.is_empty() {
+            proto::validate_snapshot_id(&req.snapshot).map_err(bad)?;
+        }
         let meta = {
             let st = self.st.lock().await;
             st.pods.get(&pod).cloned()
@@ -422,6 +431,7 @@ impl PodControl for Svc {
     async fn delete_snapshot(&self, req: Request<SnapshotRef>) -> Result<Response<Empty>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        proto::validate_snapshot_id(&req.id).map_err(bad)?;
         // Guard: the id may only ever resolve inside this pod's snap dir.
         let path = self.snaps_dir(&pod).join(&req.id);
         if !path.starts_with(self.snaps_dir(&pod)) || !path.exists() {
@@ -555,6 +565,17 @@ impl PodControl for Svc {
     async fn start_pod(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            }
+        }
+        if self.engine.running_pid(&name).await.is_some() {
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is already running"
+            )));
+        }
         let meta = {
             let mut st = self.st.lock().await;
             let next_idx = net::alloc_index(&st.pods);
@@ -574,9 +595,6 @@ impl PodControl for Svc {
             self.save_pod(&m).map_err(int)?;
             m
         };
-        if self.engine.running_pid(&name).await.is_some() {
-            return Err(Status::failed_precondition(format!("pod {name} is already running")));
-        }
         let rootfs = self.pod_rootfs(&name);
         let run_dir = proto::run_dir(&self.cfg.data_dir, &name);
         let shm_host = proto::shm_host_dir(&name);
@@ -697,6 +715,12 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            }
+        }
         self.engine.stop(&name).await.map_err(int)?;
         agent::stop_listener(&self.listeners, &name).await;
         let st = self.st.lock().await;
@@ -727,6 +751,12 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            }
+        }
         let _ = self.engine.stop(&name).await; // may already be down
         agent::stop_listener(&self.listeners, &name).await;
         self.storage.delete_rootfs(&self.pod_rootfs(&name)).map_err(int)?;
@@ -769,7 +799,7 @@ impl PodControl for Svc {
         let lim = limits_from(req.limits);
         if let Some(pm) = &req.ports {
             for spec in &pm.ports {
-                validate_port(spec).map_err(bad)?;
+                proto::validate_port(spec).map_err(bad)?;
             }
         }
         let ports_changed = req.ports.is_some();
@@ -808,6 +838,9 @@ impl PodControl for Svc {
             .map_err(bad)?
             .to_string();
         let meta = state::load_pod(&self.cfg.data_dir, &name).map_err(int)?;
+        for spec in &meta.ports {
+            proto::validate_port(spec).map_err(bad)?;
+        }
         {
             let mut st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
@@ -835,6 +868,11 @@ impl PodControl for Svc {
             if !st.pods.contains_key(&pod) {
                 return Err(Status::not_found(format!("pod {pod} not found")));
             }
+        }
+        if req.size_bytes == 0 || req.size_bytes > SHM_MAX_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "shm size must be 1..={SHM_MAX_BYTES} bytes"
+            )));
         }
         let dir = proto::shm_host_dir(&pod);
         std::fs::create_dir_all(&dir).map_err(int)?;
@@ -1008,24 +1046,6 @@ fn slugify(s: &str) -> String {
         }
     }
     out.trim_end_matches('-').chars().take(40).collect()
-}
-
-/// Validate "hostPort:podPort[/proto]" — both ports must be 1..=65535.
-fn validate_port(spec: &str) -> Result<()> {
-    let (ports, proto) = match spec.split_once('/') {
-        Some((p, pr)) => (p, Some(pr)),
-        None => (spec, None),
-    };
-    let ok = matches!(proto, None | Some("tcp") | Some("udp"))
-        && ports.split(':').count() == 2
-        && ports
-            .split(':')
-            .all(|s| s.parse::<u16>().map(|n| n > 0).unwrap_or(false));
-    if ok {
-        Ok(())
-    } else {
-        bail!("invalid port mapping '{spec}' — expected hostPort:podPort[/tcp|/udp]")
-    }
 }
 
 /// Apply/clear the pod's storage cap through the active driver. Best-effort

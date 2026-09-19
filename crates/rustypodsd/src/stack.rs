@@ -74,7 +74,7 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
             bail!("pods.{member}: image '{}' not found", p.image);
         }
         for spec in &p.ports {
-            validate_port(spec).with_context(|| format!("pods.{member}"))?;
+            rustypods_proto::validate_port(spec).with_context(|| format!("pods.{member}"))?;
             let (hp, proto) = host_port_key(spec);
             if !host_ports.insert((hp, proto)) {
                 bail!("pods.{member}: host port {hp}/{proto} is already used by another member");
@@ -92,23 +92,6 @@ fn host_port_key(spec: &str) -> (u16, &'static str) {
     };
     let hp = ports.split(':').next().and_then(|s| s.parse().ok()).unwrap_or(0);
     (hp, proto)
-}
-
-fn validate_port(spec: &str) -> Result<()> {
-    let (ports, proto) = match spec.split_once('/') {
-        Some((p, pr)) => (p, Some(pr)),
-        None => (spec, None),
-    };
-    let ok = matches!(proto, None | Some("tcp") | Some("udp"))
-        && ports.split(':').count() == 2
-        && ports
-            .split(':')
-            .all(|s| s.parse::<u16>().map(|n| n > 0).unwrap_or(false));
-    if ok {
-        Ok(())
-    } else {
-        bail!("invalid port mapping '{spec}' — expected hostPort:podPort[/tcp|/udp]")
-    }
 }
 
 #[cfg(test)]

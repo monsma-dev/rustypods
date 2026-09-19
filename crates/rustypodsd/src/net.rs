@@ -190,7 +190,6 @@ pub fn ensure_ip_forward() -> Result<()> {
     if std::fs::read_to_string(fwd).ok().as_deref() != Some("1\n") {
         std::fs::write(fwd, "1").context("enable net.ipv4.ip_forward")?;
     }
-    let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/route_localnet", "1");
     Ok(())
 }
 
@@ -224,8 +223,11 @@ pub fn rebuild_nat<'a>(
                 continue;
             };
             let dst = format!("{}:{}", pod_ip(m.net_index), pp);
+            // `fib daddr type local` scopes DNAT to traffic addressed to
+            // THIS host — without it, outbound connections to another
+            // machine on a mapped port would be redirected into the pod.
             dnat.push_str(&format!(
-                "    {proto} dport {hp} dnat ip to {dst}\n"
+                "    fib daddr type local {proto} dport {hp} dnat ip to {dst}\n"
             ));
         }
     }
