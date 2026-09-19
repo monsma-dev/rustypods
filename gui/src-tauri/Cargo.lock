@@ -2897,6 +2897,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 

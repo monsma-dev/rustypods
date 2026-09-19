@@ -8,13 +8,16 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{Emitter, State};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
 use rustypods_client::connect;
+use rustypods_proto::rpc::exec_chunk::Kind;
 use rustypods_proto::rpc::pod_control_client::PodControlClient;
 use rustypods_proto::rpc::*;
 use rustypods_proto::SOCKET_PATH;
@@ -25,6 +28,16 @@ struct Rt(tokio::runtime::Runtime);
 /// Active PodMetrics subscriptions — pod name → stream task abort handle.
 #[derive(Default)]
 struct WatchMap(Mutex<HashMap<String, tokio::task::AbortHandle>>);
+
+/// One live exec session: `stdin` feeds the bidi stream, `abort` kills the
+/// task that owns the outbound stream (and with it the gRPC call).
+struct PtySession {
+    stdin: mpsc::Sender<ExecChunk>,
+    abort: tokio::task::AbortHandle,
+}
+
+/// Active exec/PTY sessions keyed by pod name.
+type PtyMap = Arc<Mutex<HashMap<String, PtySession>>>;
 
 async fn call<T, F, Fut>(rt: &tokio::runtime::Runtime, f: F) -> Result<T, String>
 where
@@ -275,6 +288,145 @@ async fn unwatch_metrics(watches: State<'_, WatchMap>, name: String) -> Result<(
     Ok(())
 }
 
+/* ---------- embedded exec terminal (bidi Exec RPC → pty-* events) ---------- */
+
+/// Open a login-shell exec session for `pod` on a real PTY. Stdout/stderr
+/// chunks arrive as `pty-out-<pod>` events (Vec<u8> → JSON int array); the
+/// remote exit code lands on `pty-exit-<pod>`. Re-opening replaces any
+/// existing session for the pod.
+#[tauri::command]
+async fn open_pty<R: tauri::Runtime>(
+    rt: State<'_, Rt>,
+    map: State<'_, PtyMap>,
+    app: tauri::AppHandle<R>,
+    pod: String,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
+    if let Some(old) = map.lock().unwrap().remove(&pod) {
+        old.abort.abort();
+    }
+    let (tx, rx) = mpsc::channel::<ExecChunk>(32);
+    // Protocol: the first chunk is always ExecStart — empty argv asks the
+    // daemon for a login shell, empty user = pod root.
+    tx.send(ExecChunk {
+        kind: Some(Kind::Start(ExecStart {
+            pod: pod.clone(),
+            user: String::new(),
+            argv: vec![],
+            tty: true,
+            rows,
+            cols,
+            env: vec!["TERM=xterm-256color".into(), "COLORTERM=truecolor".into()],
+        })),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Connect + exec inside the spawned task: the response stream must be
+    // polled on the same tokio runtime that owns the connection (cross-
+    // runtime polling of an IO resource panics). Setup errors come back on a
+    // oneshot so open_pty still reports "pod not running" to the frontend.
+    let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let out_ev = format!("pty-out-{pod}");
+    let exit_ev = format!("pty-exit-{pod}");
+    let map2 = map.inner().clone();
+    let pod2 = pod.clone();
+    let task = rt.0.spawn(async move {
+        let setup = async {
+            let mut c = connect(PathBuf::from(SOCKET_PATH), None)
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            c.exec(ReceiverStream::new(rx))
+                .await
+                .map_err(|e| e.message().to_string())
+                .map(|r| r.into_inner())
+        };
+        let mut stream = match setup.await {
+            Ok(s) => {
+                let _ = setup_tx.send(Ok(()));
+                s
+            }
+            Err(e) => {
+                let _ = setup_tx.send(Err(e));
+                return;
+            }
+        };
+        loop {
+            match stream.message().await {
+                Ok(Some(ExecChunk {
+                    kind: Some(Kind::Stdout(b) | Kind::Stderr(b)),
+                })) => {
+                    let _ = app.emit(&out_ev, b);
+                }
+                Ok(Some(ExecChunk {
+                    kind: Some(Kind::Exit(e)),
+                })) => {
+                    let _ = app.emit(&exit_ev, e.code);
+                    break;
+                }
+                // Stream ended or errored without an exit chunk — tell the
+                // frontend so the pane doesn't look alive-but-dead.
+                Ok(None) | Err(_) => {
+                    let _ = app.emit(&exit_ev, -1);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        map2.lock().unwrap().remove(&pod2);
+    });
+    match setup_rx.await {
+        Ok(Ok(())) => {
+            map.lock()
+                .unwrap()
+                .insert(pod, PtySession { stdin: tx, abort: task.abort_handle() });
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("pty task died during setup".into()),
+    }
+}
+
+/// Keystrokes from xterm.js → the pod's PTY stdin. A dead session swallows
+/// writes silently — the UI tears itself down on `pty-exit-*` anyway.
+#[tauri::command]
+async fn write_pty(map: State<'_, PtyMap>, pod: String, data: Vec<u8>) -> Result<(), String> {
+    let tx = map.lock().unwrap().get(&pod).map(|s| s.stdin.clone());
+    if let Some(tx) = tx {
+        let _ = tx
+            .send(ExecChunk {
+                kind: Some(Kind::Stdin(data)),
+            })
+            .await;
+    }
+    Ok(())
+}
+
+/// xterm.js resize → TIOCSWINSZ on the pod-side PTY.
+#[tauri::command]
+async fn resize_pty(map: State<'_, PtyMap>, pod: String, cols: u32, rows: u32) -> Result<(), String> {
+    let tx = map.lock().unwrap().get(&pod).map(|s| s.stdin.clone());
+    if let Some(tx) = tx {
+        let _ = tx
+            .send(ExecChunk {
+                kind: Some(Kind::Winsize(WinSize { rows, cols })),
+            })
+            .await;
+    }
+    Ok(())
+}
+
+/// Kill the session task (drops the gRPC stream) and remove it. Dropping the
+/// last stdin sender also closes the daemon-side child stdin.
+#[tauri::command]
+async fn close_pty(map: State<'_, PtyMap>, pod: String) -> Result<(), String> {
+    if let Some(s) = map.lock().unwrap().remove(&pod) {
+        s.abort.abort();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_daemon_info(rt: State<'_, Rt>) -> Result<DaemonInfo, String> {
     call(&rt.0, |mut c| async move {
@@ -292,6 +444,7 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
     builder
         .manage(Rt(rt))
         .manage(WatchMap::default())
+        .manage(PtyMap::default())
         .invoke_handler(tauri::generate_handler![
             get_pods,
             create_pod,
@@ -303,6 +456,10 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
             destroy_stack,
             watch_metrics,
             unwatch_metrics,
+            open_pty,
+            write_pty,
+            resize_pty,
+            close_pty,
             get_images,
             get_daemon_info,
         ])

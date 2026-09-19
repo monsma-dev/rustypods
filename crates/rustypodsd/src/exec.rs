@@ -18,6 +18,28 @@ use tonic::Streaming;
 
 type Tx = mpsc::Sender<Result<ExecChunk, tonic::Status>>;
 
+/// Workaround for a util-linux ≤2.42 nsenter bug: `open_cgroup_procs()` (for
+/// --join-cgroup) declares `int cgroup_fd = 0` instead of -1, so
+/// open_target_fd() close()s fd 0 and the /proc/<pid>/cgroup open() lands on
+/// it — every exec'd payload then sees a bogus stdin (/proc/pid/cgroup →
+/// instant EOF) while stdout/stderr survive. Fixed upstream to `= -1`, but
+/// the hosts we run on are buggy. pre_exec() dup2(0 → STDIN_DUP_FD) preserves
+/// real stdin across nsenter's clobber, and the payload wrapper re-dups it
+/// back: `exec 0<&200 200<&-; …`.
+const STDIN_DUP_FD: i32 = 200;
+
+/// pre_exec hook: stash the real stdin on a high fd that survives nsenter's
+/// fd-0 clobber (dup2 clears CLOEXEC, so it propagates through the
+/// nsenter→setpriv→env→sh exec chain).
+fn preserve_stdin() -> std::io::Result<()> {
+    // SAFETY: dup2 only touches fds; called in pre_exec where fd 0 is the
+    // child's real stdin and fd 200 is free in a fresh exec'd process.
+    if unsafe { libc::dup2(0, STDIN_DUP_FD) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn chunk_stdout(b: Vec<u8>) -> Result<ExecChunk, tonic::Status> {
     Ok(ExecChunk {
         kind: Some(Kind::Stdout(b)),
@@ -155,14 +177,22 @@ pub fn exec_argv(
         }
         a.push(kv.clone().into());
     }
+    // Restore the real stdin (see STDIN_DUP_FD), then run the payload.
+    // `sh -c '…' name args…` puts name in $0 and the rest in $@.
     if start.argv.is_empty() {
         // cd $HOME first (machinectl behavior), then exec login shell.
         a.push("/bin/sh".into());
         a.push("-c".into());
-        a.push("cd \"$HOME\" && exec \"$0\" \"$@\"".into());
+        a.push(
+            format!("exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; cd \"$HOME\" && exec \"$0\" \"$@\"")
+                .into(),
+        );
         a.push(shell.into());
         a.push("-l".into());
     } else {
+        a.push("/bin/sh".into());
+        a.push("-c".into());
+        a.push(format!("exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; exec \"$0\" \"$@\"").into());
         a.extend(start.argv.iter().map(OsString::from));
     }
     Ok(a)
@@ -249,6 +279,7 @@ async fn run_tty(
         .stderr(Stdio::from(slave_err));
     unsafe {
         scmd.pre_exec(|| {
+            preserve_stdin()?;
             libc::setsid();
             libc::ioctl(0, libc::TIOCSCTTY, 0);
             Ok(())
@@ -334,6 +365,9 @@ async fn run_pipe(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    unsafe {
+        scmd.pre_exec(preserve_stdin);
+    }
     let mut cmd = tokio::process::Command::from(scmd);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("nsenter spawn")?;

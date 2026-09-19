@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
+import TermPane from "./TermPane";
 import type { DaemonInfo, Image, Limits, Metric, Pod } from "./api";
 import { PodState, podStateToJSON } from "./proto/rustypods";
 
@@ -82,7 +83,7 @@ function HeaderBar({ title }: { title: string }) {
   return (
     <header
       data-tauri-drag-region
-      className="flex h-9 shrink-0 items-center justify-between border-b border-white/10 bg-bg2 select-none"
+      className="flex h-10 shrink-0 items-center justify-between border-b border-white/[0.08] bg-bg2 select-none"
     >
       <div
         data-tauri-drag-region
@@ -109,9 +110,14 @@ function StateBadge({ state }: { state: PodState }) {
       ? "bg-ok/15 text-ok"
       : state === PodState.POD_STATE_FAILED
         ? "bg-err/15 text-err"
-        : "bg-white/5 text-muted";
+        : state === PodState.POD_STATE_CREATED
+          ? "bg-warn/15 text-warn"
+          : "bg-white/5 text-muted";
   return (
-    <span className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${cls}`}>
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-medium ${cls}`}
+    >
+      <span className="h-1.5 w-1.5 rounded-full bg-current" />
       {podStateToJSON(state).replace("POD_STATE_", "").toLowerCase()}
     </span>
   );
@@ -132,29 +138,66 @@ function Group({
           {title}
         </h3>
       )}
-      <div className="divide-y divide-white/5 rounded-xl border border-white/10 bg-card">
+      <div className="divide-y divide-white/5 rounded-xl border border-white/[0.08] bg-white/[0.05]">
         {children}
       </div>
     </section>
   );
 }
 
+/** GNOME-Settings row: medium title (+ optional muted subtitle) left,
+ *  value right. */
 function Row({
   label,
+  sub,
   value,
   mono = true,
 }: {
   label: string;
+  sub?: string;
   value: React.ReactNode;
   mono?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 px-4 py-2.5">
-      <span className="text-xs text-muted">{label}</span>
-      <span className={`truncate text-xs ${mono ? "font-mono" : ""}`}>
+    <div className="flex items-center justify-between gap-4 px-4 py-3">
+      <div className="min-w-0">
+        <div className="text-[13px] font-medium">{label}</div>
+        {sub && <div className="mt-0.5 text-[11px] text-muted">{sub}</div>}
+      </div>
+      <span className={`shrink-0 truncate text-xs text-muted ${mono ? "font-mono" : ""}`}>
         {value}
       </span>
     </div>
+  );
+}
+
+/** Adwaita pill switch — replaces native checkboxes for booleans. */
+function Switch({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      onClick={() => onChange(!checked)}
+      className={`relative h-6 w-10 shrink-0 rounded-full transition-colors ${
+        checked ? "bg-accent" : "bg-white/10"
+      }`}
+    >
+      <span
+        className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-all ${
+          checked ? "left-5" : "left-1"
+        }`}
+      />
+    </button>
   );
 }
 
@@ -421,17 +464,24 @@ const parsePort = (spec: string): PortRow => {
 const serializePort = (r: PortRow) =>
   `${r.host}:${r.pod}${r.proto === "udp" ? "/udp" : ""}`;
 
+type PodAct = (names: string[], f: () => Promise<unknown>) => void;
+
 function PodDetail({
   pod,
   lean,
   onClose,
   act,
+  busy,
+  initialTab,
 }: {
   pod: Pod;
   lean: boolean;
   onClose: () => void;
-  act: (f: () => Promise<unknown>) => void;
+  act: PodAct;
+  busy: boolean;
+  initialTab: "settings" | "terminal";
 }) {
+  const [tab, setTab] = useState<"settings" | "terminal">(initialTab);
   const lim = limitsOf(pod);
   const [memHigh, setMemHigh] = useState(lim.memoryHighBytes);
   const [memMax, setMemMax] = useState(lim.memoryMaxBytes);
@@ -450,7 +500,7 @@ function PodDetail({
   const running = isRunning(pod);
 
   const apply = () =>
-    act(() =>
+    act([pod.name], () =>
       api.updatePodConfig({
         name: pod.name,
         limits: {
@@ -494,17 +544,19 @@ function PodDetail({
           <div className="flex items-center gap-1.5">
             {running ? (
               <button
-                onClick={() => act(() => api.stopPod(pod.name))}
-                className="rounded-lg bg-err/15 px-3 py-1.5 text-xs font-medium text-err transition-colors hover:bg-err/25"
+                onClick={() => act([pod.name], () => api.stopPod(pod.name))}
+                disabled={busy}
+                className="rounded-lg bg-err/15 px-3 py-1.5 text-xs font-medium text-err transition-colors hover:bg-err/25 disabled:opacity-50"
               >
-                Stop
+                {busy ? "Stopping…" : "Stop"}
               </button>
             ) : (
               <button
-                onClick={() => act(() => api.startPod(pod.name))}
-                className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+                onClick={() => act([pod.name], () => api.startPod(pod.name))}
+                disabled={busy}
+                className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
               >
-                Start
+                {busy ? "Starting…" : "Start"}
               </button>
             )}
             <button
@@ -517,7 +569,31 @@ function PodDetail({
           </div>
         </div>
 
+        {/* tab switcher — same segmented style as the wizard's Isolation */}
+        <div className="px-4 pt-3">
+          <div className="grid grid-cols-2 gap-1 rounded-lg border border-white/[0.08] bg-bg p-1">
+            {(["settings", "terminal"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                  tab === t
+                    ? "bg-accent/15 text-accent"
+                    : "text-fg/80 hover:bg-white/5"
+                }`}
+              >
+                {t === "settings" ? "Settings" : "Terminal"}
+              </button>
+            ))}
+          </div>
+        </div>
+
         {/* body */}
+        {tab === "terminal" ? (
+          <div className="min-h-0 flex-1 p-4 pt-3">
+            <TermPane pod={pod.name} running={running} />
+          </div>
+        ) : (
         <div className="flex-1 space-y-5 overflow-y-auto p-4">
           <MetricsSection pod={pod} lean={lean} />
           <Group title="Resources">
@@ -573,12 +649,12 @@ function PodDetail({
           <Group title="Sandbox">
             <Row
               label="User namespace"
-              value={
-                pod.privateUsers ? "on (uid 0 ≠ host root)" : "off (shares host uids)"
-              }
+              sub="root in the pod is not root on the host"
+              value={pod.privateUsers ? "on" : "off"}
             />
             <Row
               label="Bind mounts"
+              sub="host paths visible inside the pod"
               value={pod.binds.length ? pod.binds.join(", ") : "none"}
             />
           </Group>
@@ -640,8 +716,10 @@ function PodDetail({
             </div>
           </Group>
         </div>
+        )}
 
-        {/* footer */}
+        {/* footer — config actions only make sense on the Settings tab */}
+        {tab === "settings" && (
         <div className="flex items-center justify-between border-t border-white/10 px-4 py-3">
           <span className="text-[11px] text-muted">
             {dirty ? "Unsaved changes" : "Applied live — no restart needed"}
@@ -669,6 +747,7 @@ function PodDetail({
             </button>
           </div>
         </div>
+        )}
       </aside>
     </div>
   );
@@ -777,7 +856,7 @@ function NewPodDialog({
             </select>
           </div>
 
-          <div className="divide-y divide-white/5 rounded-xl border border-white/10 bg-card">
+          <div className="divide-y divide-white/5 rounded-xl border border-white/[0.08] bg-white/[0.05]">
             <LimitSlider
               label="Memory high"
               hint="throttle above this"
@@ -995,10 +1074,12 @@ function MiniSpark({ data, max }: { data: number[]; max: number }) {
 function PodRow({
   pod,
   act,
+  busy,
   onOpen,
 }: {
   pod: Pod;
-  act: (f: () => Promise<unknown>) => void;
+  act: PodAct;
+  busy: boolean;
   onOpen: (p: Pod) => void;
 }) {
   const running = isRunning(pod);
@@ -1074,21 +1155,23 @@ function PodRow({
           <button
             onClick={(e) => {
               e.stopPropagation();
-              act(() => api.stopPod(pod.name));
+              act([pod.name], () => api.stopPod(pod.name));
             }}
-            className="rounded-md bg-err/15 px-2 py-0.5 text-[11px] font-medium text-err transition-colors hover:bg-err/25"
+            disabled={busy}
+            className="rounded-md bg-err/15 px-2 py-0.5 text-[11px] font-medium text-err transition-colors hover:bg-err/25 disabled:opacity-50"
           >
-            Stop
+            {busy ? "Stopping…" : "Stop"}
           </button>
         ) : (
           <button
             onClick={(e) => {
               e.stopPropagation();
-              act(() => api.startPod(pod.name));
+              act([pod.name], () => api.startPod(pod.name));
             }}
-            className="rounded-md bg-accent px-2 py-0.5 text-[11px] font-medium text-white transition-colors hover:bg-accent-hover"
+            disabled={busy}
+            className="rounded-md bg-accent px-2 py-0.5 text-[11px] font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
-            Start
+            {busy ? "Starting…" : "Start"}
           </button>
         )}
       </td>
@@ -1099,11 +1182,13 @@ function PodRow({
 function PodsView({
   pods,
   act,
+  busy,
   onOpen,
   onNew,
 }: {
   pods: Pod[];
-  act: (f: () => Promise<unknown>) => void;
+  act: PodAct;
+  busy: Set<string>;
   onOpen: (p: Pod) => void;
   onNew: () => void;
 }) {
@@ -1136,7 +1221,13 @@ function PodsView({
           </thead>
           <tbody>
             {pods.map((p) => (
-              <PodRow key={p.name} pod={p} act={act} onOpen={onOpen} />
+              <PodRow
+                key={p.name}
+                pod={p}
+                act={act}
+                busy={busy.has(p.name)}
+                onOpen={onOpen}
+              />
             ))}
           </tbody>
         </table>
@@ -1152,7 +1243,7 @@ function StacksView({
   onNew,
 }: {
   pods: Pod[];
-  act: (f: () => Promise<unknown>) => void;
+  act: PodAct;
   onOpen: (p: Pod) => void;
   onNew: () => void;
 }) {
@@ -1201,10 +1292,13 @@ function StacksView({
               <div className="flex items-center gap-1.5 px-4 py-2">
                 <button
                   onClick={() =>
-                    act(async () => {
-                      for (const p of members.filter((p) => !isRunning(p)))
-                        await api.startPod(p.name);
-                    })
+                    act(
+                      members.filter((p) => !isRunning(p)).map((p) => p.name),
+                      async () => {
+                        for (const p of members.filter((p) => !isRunning(p)))
+                          await api.startPod(p.name);
+                      }
+                    )
                   }
                   className="rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-white/5 hover:text-fg"
                 >
@@ -1212,10 +1306,13 @@ function StacksView({
                 </button>
                 <button
                   onClick={() =>
-                    act(async () => {
-                      for (const p of members.filter(isRunning))
-                        await api.stopPod(p.name);
-                    })
+                    act(
+                      members.filter(isRunning).map((p) => p.name),
+                      async () => {
+                        for (const p of members.filter(isRunning))
+                          await api.stopPod(p.name);
+                      }
+                    )
                   }
                   className="rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-white/5 hover:text-fg"
                 >
@@ -1227,7 +1324,10 @@ function StacksView({
                     <button
                       onClick={() => {
                         setConfirming(null);
-                        act(() => api.destroyStack(stack));
+                        act(
+                          members.map((p) => p.name),
+                          () => api.destroyStack(stack)
+                        );
                       }}
                       className="rounded-md bg-err/15 px-2 py-1 text-xs font-medium text-err transition-colors hover:bg-err/25"
                     >
@@ -1298,11 +1398,23 @@ function SettingsView({
       <Group title="Daemon">
         {info ? (
           <>
-            <Row label="Version" value={info.version} />
-            <Row label="Socket" value={info.socketPath} />
-            <Row label="Data dir" value={info.dataDir} />
-            <Row label="Runtime engine" value={info.runtimeEngine} />
-            <Row label="machined" value={String(info.machined)} />
+            <Row label="Version" sub="rustypodsd" value={info.version} />
+            <Row label="Socket" sub="IPC endpoint" value={info.socketPath} />
+            <Row
+              label="Data dir"
+              sub="images, pod rootfs, conf"
+              value={info.dataDir}
+            />
+            <Row
+              label="Runtime engine"
+              sub="container launcher"
+              value={info.runtimeEngine}
+            />
+            <Row
+              label="machined"
+              sub="systemd machine registration"
+              value={String(info.machined)}
+            />
           </>
         ) : (
           <p className="px-4 py-3 text-xs text-muted">daemon unreachable</p>
@@ -1328,26 +1440,30 @@ function SettingsView({
             <option value={10000}>10 s</option>
           </select>
         </div>
-        <label className="flex cursor-pointer items-center justify-between px-4 py-3">
+        <div className="flex items-center justify-between px-4 py-3">
           <div>
             <div className="text-[13px] font-medium">Reduce motion</div>
             <div className="text-[11px] text-muted">
               Disable animations — recommended on Raspberry Pi.
             </div>
           </div>
-          <input
-            type="checkbox"
+          <Switch
             checked={reduceMotion}
-            onChange={(e) => setReduceMotion(e.target.checked)}
-            className="h-5 w-9 cursor-pointer accent-accent"
+            onChange={setReduceMotion}
+            label="Reduce motion"
           />
-        </label>
+        </div>
       </Group>
 
       <Group title="Storage">
-        <Row label="Driver" value={info?.storageDriver ?? "—"} />
+        <Row
+          label="Driver"
+          sub="filesystem backend for pod rootfs"
+          value={info?.storageDriver ?? "—"}
+        />
         <Row
           label="Quotas"
+          sub="per-pod disk usage limits"
           value={
             info?.btrfs
               ? "btrfs qgroups — hot-applied"
@@ -1357,6 +1473,7 @@ function SettingsView({
         />
         <Row
           label="Snapshots"
+          sub="pod state commit / rollback"
           value={
             info?.btrfs
               ? "instant CoW (commit / rollback)"
@@ -1383,8 +1500,16 @@ export default function App() {
   const [intervalMs, setIntervalMs] = useState(2000);
   const [reduceMotion, setReduceMotion] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Per-pod in-flight actions — buttons show "Starting…/Stopping…" until the
+  // invoke + refresh settle (optimistic UX; polling confirms the real state).
+  const [busyPods, setBusyPods] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(
     () => new URLSearchParams(location.search).get("detail")
+  );
+  const [detailTab] = useState<"settings" | "terminal">(() =>
+    new URLSearchParams(location.search).get("tab") === "terminal"
+      ? "terminal"
+      : "settings"
   );
   const [newPodOpen, setNewPodOpen] = useState(
     () => new URLSearchParams(location.search).has("newpod")
@@ -1430,6 +1555,21 @@ export default function App() {
     [refresh]
   );
 
+  /** act() plus per-pod busy marking — cleared once invoke+refresh settle. */
+  const podAct: PodAct = useCallback(
+    (names, f) => {
+      setBusyPods((s) => new Set([...s, ...names]));
+      void act(f).finally(() =>
+        setBusyPods((s) => {
+          const n = new Set(s);
+          for (const name of names) n.delete(name);
+          return n;
+        })
+      );
+    },
+    [act]
+  );
+
   const selectedPod = useMemo(
     () => pods.find((p) => p.name === selected) ?? null,
     [pods, selected]
@@ -1450,13 +1590,13 @@ export default function App() {
         title={`${titles[view]}${busy ? " · working…" : ""}${info && !info.machined ? " · machined degraded" : ""}`}
       />
       <div className="flex min-h-0 flex-1">
-        <aside className="flex w-48 shrink-0 flex-col border-r border-white/10 bg-bg2">
-          <nav className="flex-1 space-y-px overflow-y-auto p-1.5">
+        <aside className="flex w-48 shrink-0 flex-col border-r border-white/[0.08] bg-bg2">
+          <nav className="flex-1 space-y-0.5 overflow-y-auto p-2">
             {NAV.map((n) => (
               <button
                 key={n.id}
                 onClick={() => setView(n.id)}
-                className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] transition-colors ${
+                className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${
                   view === n.id
                     ? "bg-accent/15 font-medium text-accent"
                     : "text-fg/80 hover:bg-white/5"
@@ -1493,7 +1633,8 @@ export default function App() {
             {view === "pods" && (
               <PodsView
                 pods={pods}
-                act={act}
+                act={podAct}
+                busy={busyPods}
                 onOpen={(p) => setSelected(p.name)}
                 onNew={() => setNewPodOpen(true)}
               />
@@ -1501,7 +1642,7 @@ export default function App() {
             {view === "stacks" && (
               <StacksView
                 pods={pods}
-                act={act}
+                act={podAct}
                 onOpen={(p) => setSelected(p.name)}
                 onNew={() => setApplyStackOpen(true)}
               />
@@ -1539,7 +1680,9 @@ export default function App() {
           pod={selectedPod}
           lean={reduceMotion || intervalMs >= 5000}
           onClose={() => setSelected(null)}
-          act={act}
+          act={podAct}
+          busy={busyPods.has(selectedPod.name)}
+          initialTab={detailTab}
         />
       )}
     </div>

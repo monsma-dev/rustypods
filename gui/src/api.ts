@@ -318,3 +318,83 @@ function mockUnwatch(pod: string) {
     mockTimer = null;
   }
 }
+
+// ---- exec terminal (bidi Exec RPC → "pty-out-<pod>" / "pty-exit-<pod>") ----
+
+/** Open a login-shell PTY in the pod. Stdout arrives via onPtyOut. */
+export const openPty = async (
+  pod: string,
+  cols: number,
+  rows: number
+): Promise<void> => {
+  if (inTauri) {
+    await invoke("open_pty", { pod, cols, rows });
+    return;
+  }
+  void cols;
+  void rows;
+  // Mock: announce a fake shell once listeners are in place.
+  setTimeout(() => {
+    const banner = new TextEncoder().encode(
+      "\r\nrustypods exec — mock terminal, no daemon attached\r\n\r\n$ "
+    );
+    mockPtySubs.get(pod)?.forEach((cb) => cb(banner));
+  }, 60);
+};
+
+/** Feed keystrokes into the pod's PTY stdin. */
+export const writePty = async (pod: string, data: Uint8Array): Promise<void> => {
+  if (inTauri) {
+    await invoke("write_pty", { pod, data: Array.from(data) });
+    return;
+  }
+  // Mock: local echo, plus a fresh prompt on Enter.
+  const cbs = mockPtySubs.get(pod);
+  if (!cbs) return;
+  cbs.forEach((cb) => cb(data));
+  if (data.includes(0x0d)) {
+    const prompt = new TextEncoder().encode("\r\n$ ");
+    setTimeout(() => cbs.forEach((cb) => cb(prompt)), 60);
+  }
+};
+
+export const resizePty = async (
+  pod: string,
+  cols: number,
+  rows: number
+): Promise<void> => {
+  if (inTauri) await invoke("resize_pty", { pod, cols, rows });
+};
+
+export const closePty = async (pod: string): Promise<void> => {
+  if (inTauri) await invoke("close_pty", { pod });
+};
+
+/** Raw PTY output for one pod. Returns an unsubscribe fn. */
+export const onPtyOut = async (
+  pod: string,
+  cb: (bytes: Uint8Array) => void
+): Promise<() => void> => {
+  if (inTauri)
+    return listen<number[]>(`pty-out-${pod}`, (e) =>
+      cb(new Uint8Array(e.payload))
+    );
+  let set = mockPtySubs.get(pod);
+  if (!set) mockPtySubs.set(pod, (set = new Set()));
+  set.add(cb);
+  return () => {
+    set.delete(cb);
+  };
+};
+
+/** Fires once when the exec'd process exits (payload = exit code). */
+export const onPtyExit = async (
+  pod: string,
+  cb: (code: number) => void
+): Promise<() => void> => {
+  if (inTauri) return listen<number>(`pty-exit-${pod}`, (e) => cb(e.payload));
+  return () => {};
+};
+
+// --- mock pty for browser dev ---
+const mockPtySubs = new Map<string, Set<(b: Uint8Array) => void>>();

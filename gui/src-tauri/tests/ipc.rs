@@ -2,11 +2,14 @@
 //! real commands against a running rustypodsd on /run/rustypods/daemon.sock.
 //! Requires the daemon to be up and a pod named `dev` to exist.
 
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 use tauri::ipc::{CallbackFn, InvokeResponseBody};
 use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
-use tauri::WebviewWindow;
+use tauri::{Listener, Manager, WebviewWindow};
 
 fn webview() -> WebviewWindow<tauri::test::MockRuntime> {
     let app = rustypods_gui_lib::app_builder(mock_builder())
@@ -186,5 +189,88 @@ image = "arch-base"
             .iter()
             .any(|p| p["name"] == "ipcstack-a"),
         "ipcstack-a still listed: {pods:?}"
+    );
+}
+
+/// PTY bridge round-trip: open_pty spawns a login shell in the `dev` pod,
+/// stdout chunks arrive as `pty-out-dev` events, write_pty feeds stdin, and
+/// the shell's echo output comes back through the same event. Requires the
+/// daemon + a running `dev` pod.
+#[test]
+fn pty_session_via_ipc() {
+    let wv = webview();
+
+    // Make sure dev is running (the lifecycle test may run concurrently).
+    let _ = invoke(&wv, "start_pod", json!({"name": "dev"}));
+
+    // (Verified during dev: app.emit reaches listen_any handlers on the
+    // MockRuntime — pod-metrics events via watch_metrics arrive fine.)
+
+    // pty-out-<pod> payloads are Vec<u8> serialized as JSON int arrays —
+    // accumulate them here from the mock runtime's event dispatch.
+    let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let out2 = Arc::clone(&out);
+    wv.app_handle().listen_any("pty-out-dev", move |ev| {
+        if let Ok(bytes) = serde_json::from_str::<Vec<u8>>(ev.payload()) {
+            out2.lock().unwrap().extend(bytes);
+        }
+    });
+    let exits = Arc::new(Mutex::new(Vec::<i32>::new()));
+    let exits2 = Arc::clone(&exits);
+    wv.app_handle().listen_any("pty-exit-dev", move |ev| {
+        exits2
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str::<i32>(ev.payload()).unwrap_or(-999));
+    });
+
+    // pods_lifecycle_via_ipc may concurrently stop/start dev — retry open_pty
+    // while it settles. Re-opening replaces the previous session, so retries
+    // are safe.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut opened = false;
+    while Instant::now() < deadline {
+        if invoke(&wv, "open_pty", json!({"pod": "dev", "cols": 80, "rows": 24})).is_ok() {
+            opened = true;
+            break;
+        }
+        let _ = invoke(&wv, "start_pod", json!({"name": "dev"}));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(opened, "open_pty never succeeded — is dev running?");
+
+    // The login shell should emit a prompt within a few seconds.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline && out.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !out.lock().unwrap().is_empty(),
+        "no pty-out-dev events — shell never wrote to the pty (exit codes seen: {:?})",
+        exits.lock().unwrap()
+    );
+
+    invoke(
+        &wv,
+        "write_pty",
+        json!({"pod": "dev", "data": b"echo RP_OK\n".to_vec()}),
+    )
+    .expect("write_pty failed");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let buf = out.lock().unwrap().clone();
+        if buf.windows(5).any(|w| w == b"RP_OK") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    invoke(&wv, "close_pty", json!({"pod": "dev"})).expect("close_pty failed");
+
+    let buf = out.lock().unwrap().clone();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        text.contains("RP_OK"),
+        "echo output never arrived over pty-out-dev: {text:?}"
     );
 }

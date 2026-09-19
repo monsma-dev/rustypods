@@ -73,6 +73,12 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
 - PTY: `openpty` via libc (`posix_openpt`+`grantpt`+`unlockpt`+`ptsname`),
   slave as stdio + `setsid`/`TIOCSCTTY` in `pre_exec`. `tty(1)` fails on
   path lookup (host devpts), fd semantics work fully.
+- util-linux ≤2.42 `nsenter --join-cgroup` **closes fd 0**: its
+  `open_cgroup_procs()` declares `int cgroup_fd = 0` (not -1), so
+  `open_target_fd` close()s stdin and /proc/<pid>/cgroup lands on it —
+  every exec'd payload reads instant EOF and exits 0 with no output.
+  exec.rs works around it: `pre_exec` dup2(0→200) + payload wrapper
+  `exec 0<&200 200<&-`. Fixed upstream (`= -1`), not yet released.
 
 ## Port forwarding (net.rs)
 

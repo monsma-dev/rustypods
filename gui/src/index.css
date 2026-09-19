@@ -1,12 +1,13 @@
 @import "tailwindcss";
 
-/* Deep Adwaita-dark palette — near-black chrome, tinted panels. */
+/* Adwaita-dark palette — GNOME Settings tones: soft content area,
+ * slightly lifted sidebar, translucent inset groups. */
 @theme {
-  --color-bg: #111114;
-  --color-bg2: #17171c;
-  --color-card: #1c1c23;
-  --color-card-hover: #23232b;
-  --color-border: #2a2a32;
+  --color-bg: #1e1e1e;
+  --color-bg2: #232326;
+  --color-card: #26262c;
+  --color-card-hover: #2b2b32;
+  --color-border: #2e2e36;
   --color-fg: #eeeeee;
   --color-muted: #9a9aa5;
   --color-accent: #3584e4; /* GNOME blue */
