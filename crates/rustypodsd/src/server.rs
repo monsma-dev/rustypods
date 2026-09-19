@@ -98,6 +98,35 @@ impl Svc {
         self.cfg.pods_dir().join(name)
     }
 
+    /// <data>/snapshots/<pod>/ — one subvolume per commit.
+    fn snaps_dir(&self, pod: &str) -> std::path::PathBuf {
+        self.cfg.data_dir.join("snapshots").join(pod)
+    }
+
+    /// Scan a pod's snapshot dir, newest first.
+    fn snapshots(&self, pod: &str) -> Vec<Snapshot> {
+        let dir = self.snaps_dir(pod);
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let id = e.file_name().to_string_lossy().into_owned();
+                let (ts, label) = match id.split_once('-') {
+                    Some((t, l)) => (t.parse().unwrap_or(0), l.to_string()),
+                    None => (id.parse().unwrap_or(0), String::new()),
+                };
+                out.push(Snapshot {
+                    id,
+                    pod: pod.to_string(),
+                    created_unix: ts,
+                    path: e.path().display().to_string(),
+                    label,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.created_unix.cmp(&a.created_unix));
+        out
+    }
+
     /// Rebuild the nftables DNAT table from current state (running pods only).
     async fn sync_nat(&self) {
         let pods: Vec<PodMeta> = {
@@ -293,6 +322,113 @@ impl PodControl for Svc {
         st.pods.insert(dest.clone(), meta.clone());
         self.save_pod(&meta).map_err(int)?;
         Ok(Response::new(to_pod(&meta, &dst_root, None)))
+    }
+
+    /// `rustypods commit <pod> [label]`: atomic CoW snapshot of the live
+    /// rootfs into snapshots/<pod>/<ts>[-label]. The live pod keeps running.
+    async fn commit_pod(&self, req: Request<CommitPodRequest>) -> Result<Response<Snapshot>, Status> {
+        let req = req.into_inner();
+        let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&pod) {
+                return Err(Status::not_found(format!("pod {pod} not found")));
+            }
+        }
+        if self.engine.running_pid(&pod).await.is_some() {
+            tracing::warn!("commit on running pod {pod} — snapshot is atomic but mid-write state is live");
+        }
+        let slug = slugify(&req.label);
+        let ts = state::now_unix();
+        let id = if slug.is_empty() {
+            ts.to_string()
+        } else {
+            format!("{ts}-{slug}")
+        };
+        let dst = self.snaps_dir(&pod).join(&id);
+        std::fs::create_dir_all(dst.parent().unwrap()).map_err(int)?;
+        self.storage.clone_rootfs(&self.pod_rootfs(&pod), &dst).map_err(int)?;
+        Ok(Response::new(Snapshot {
+            id,
+            pod,
+            created_unix: ts,
+            path: dst.display().to_string(),
+            label: slug,
+        }))
+    }
+
+    /// `rustypods rollback <pod> [--to <id>]`: swap the live rootfs for a
+    /// commit. The pod is stopped first — rollback discards current state.
+    /// The snapshot itself survives (it becomes the new live rootfs' source).
+    async fn rollback_pod(&self, req: Request<RollbackPodRequest>) -> Result<Response<Pod>, Status> {
+        let req = req.into_inner();
+        let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        let meta = {
+            let st = self.st.lock().await;
+            st.pods.get(&pod).cloned()
+        };
+        let Some(meta) = meta else {
+            return Err(Status::not_found(format!("pod {pod} not found")));
+        };
+        let snaps = self.snapshots(&pod);
+        let snap = if req.snapshot.is_empty() {
+            snaps.first().cloned()
+        } else {
+            snaps.iter().find(|s| s.id == req.snapshot).cloned()
+        };
+        let Some(snap) = snap else {
+            return Err(Status::not_found(format!(
+                "no snapshot{} for pod {pod}",
+                if req.snapshot.is_empty() { "s".to_string() } else { format!(" '{}'", req.snapshot) }
+            )));
+        };
+        let _ = self.engine.stop(&pod).await; // rollback discards live state
+        agent::stop_listener(&self.listeners, &pod).await;
+        let rootfs = self.pod_rootfs(&pod);
+        self.storage.delete_rootfs(&rootfs).map_err(int)?;
+        self.storage
+            .clone_rootfs(std::path::Path::new(&snap.path), &rootfs)
+            .map_err(int)?;
+        {
+            let mut st = self.st.lock().await;
+            if let Some(m) = st.pods.get_mut(&pod) {
+                m.started = false;
+                let m = m.clone();
+                let _ = self.save_pod(&m);
+            }
+        }
+        tracing::info!("rollback {pod} → snapshot {}", snap.id);
+        Ok(Response::new(to_pod(&meta, &rootfs, None)))
+    }
+
+    async fn list_snapshots(
+        &self,
+        req: Request<PodRef>,
+    ) -> Result<Response<SnapshotList>, Status> {
+        let pod = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&pod) {
+                return Err(Status::not_found(format!("pod {pod} not found")));
+            }
+        }
+        Ok(Response::new(SnapshotList {
+            snapshots: self.snapshots(&pod),
+        }))
+    }
+
+    async fn delete_snapshot(&self, req: Request<SnapshotRef>) -> Result<Response<Empty>, Status> {
+        let req = req.into_inner();
+        let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        // Guard: the id may only ever resolve inside this pod's snap dir.
+        let path = self.snaps_dir(&pod).join(&req.id);
+        if !path.starts_with(self.snaps_dir(&pod)) || !path.exists() {
+            return Err(Status::not_found(format!("snapshot '{}' not found", req.id)));
+        }
+        self.storage.delete_rootfs(&path).map_err(int)?;
+        Ok(Response::new(Empty {}))
     }
 
     /// `rustypods apply stack.toml`: one shared netns for all members
@@ -608,6 +744,14 @@ impl PodControl for Svc {
             .filter(|s| !s.is_empty())
             .filter(|s| !st.pods.values().any(|m| &m.stack == s));
         drop(st);
+        // Its time machine dies with the pod — each snapshot is a subvol.
+        let snaps = self.snaps_dir(&name);
+        if let Ok(rd) = std::fs::read_dir(&snaps) {
+            for e in rd.flatten() {
+                let _ = self.storage.delete_rootfs(&e.path());
+            }
+            let _ = std::fs::remove_dir(&snaps);
+        }
         if let Some(stack) = orphan_netns {
             net::teardown_stack_net(&stack);
         }
@@ -839,6 +983,19 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         bail!("tar extract into {} failed", dest.display());
     }
     Ok(())
+}
+
+/// "Pre-upgrade v2!" → "pre-upgrade-v2" — snapshot labels become dir names.
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().flat_map(|c| c.to_lowercase()) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').chars().take(40).collect()
 }
 
 /// Validate "hostPort:podPort[/proto]" — both ports must be 1..=65535.

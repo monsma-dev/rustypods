@@ -89,6 +89,23 @@ enum Cmd {
     Destroy { name: String },
     /// Instant CoW clone: snapshot a pod's rootfs + conf under a new name.
     Clone { source: String, dest: String },
+    /// Snapshot a pod's rootfs instantly (the "commit" — Git for servers).
+    Commit {
+        pod: String,
+        /// Optional tag, e.g. "pre-upgrade".
+        label: Option<String>,
+    },
+    /// Restore a pod to a snapshot: swaps the rootfs (pod ends stopped).
+    Rollback {
+        pod: String,
+        /// Snapshot id (see `rustypods snapshots`); default = latest.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// List a pod's snapshots.
+    Snapshots { pod: String },
+    /// Delete one snapshot.
+    Rmsnap { pod: String, id: String },
     /// Apply a stack.toml: create/update grouped pods sharing one netns
     /// (K8s-pod model — members reach each other on 127.0.0.1).
     Apply { file: PathBuf },
@@ -570,6 +587,49 @@ async fn main() -> Result<()> {
             if !p.ports.is_empty() {
                 eprintln!("note: ports copied — running both pods needs distinct host ports (edit conf/pods/{}.conf + reload)", p.name);
             }
+        }
+        Cmd::Commit { pod, label } => {
+            let s = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .commit_pod(CommitPodRequest {
+                    pod: pod.clone(),
+                    label: label.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!("snapshot {} — instant CoW ({})", s.id, s.path);
+        }
+        Cmd::Rollback { pod, to } => {
+            let p = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .rollback_pod(RollbackPodRequest {
+                    pod: pod.clone(),
+                    snapshot: to.clone().unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!("{} rolled back{}", p.name, to.map(|t| format!(" to {t}")).unwrap_or_else(|| " to latest".into()));
+            print_pod(&p);
+        }
+        Cmd::Snapshots { pod } => {
+            let l = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .list_snapshots(PodRef { name: pod })
+                .await?
+                .into_inner();
+            for s in &l.snapshots {
+                println!("{:<44} {}", s.id, s.label);
+            }
+            if l.snapshots.is_empty() {
+                println!("no snapshots — `rustypods commit <pod> [label]`");
+            }
+        }
+        Cmd::Rmsnap { pod, id } => {
+            connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .delete_snapshot(SnapshotRef { pod, id: id.clone() })
+                .await?;
+            println!("snapshot {id} deleted");
         }
         Cmd::Apply { file } => {
             let toml = std::fs::read(&file)

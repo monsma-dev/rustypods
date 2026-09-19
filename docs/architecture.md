@@ -42,6 +42,13 @@ At startup the daemon probes the filesystem under `/var/lib/rustypods/pods`:
   Per-pod storage caps are native qgroup limits (`btrfs qgroup limit`):
   writes beyond the cap return ENOSPC inside the pod. Quota accounting does
   not survive a remount, so limits are re-applied at every pod start.
+
+  The same snapshot primitive powers the **time machine**: `rustypods
+  commit <pod> [label]` writes an atomic CoW snapshot to
+  `snapshots/<pod>/<ts>-<label>` (milliseconds, ~0 bytes), and
+  `rustypods rollback <pod>` stops the pod, deletes the live rootfs and
+  re-clones the snapshot into place. Git for server state — a failed
+  upgrade is a sub-second `rollback` away, not a backup restore.
 - **Anything else** → `FallbackDriver`: plain directories cloned with
   `cp -a --reflink=auto`. On XFS and modern ext4 this is still copy-on-write;
   on other filesystems it is a full copy — correct, just not instant.

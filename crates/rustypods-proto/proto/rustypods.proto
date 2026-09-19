@@ -25,6 +25,13 @@ service PodControl {
   // Reread a hand-edited conf from disk and apply it.
   rpc ReloadPodConfig(PodRef) returns (Pod);
 
+  // Time machine: instant rootfs snapshots of a pod. commit is atomic
+  // (CoW); rollback stops the pod, swaps the rootfs, and leaves it stopped.
+  rpc CommitPod(CommitPodRequest) returns (Snapshot);
+  rpc RollbackPod(RollbackPodRequest) returns (Pod);
+  rpc ListSnapshots(PodRef) returns (SnapshotList);
+  rpc DeleteSnapshot(SnapshotRef) returns (Empty);
+
   // Stacks (Compose/K8s-pod model): the CLI sends the stack.toml contents;
   // members run as pods named <stack>-<member> inside one shared netns.
   rpc ApplyStack(ApplyStackRequest) returns (ApplyStackResponse);
@@ -164,6 +171,35 @@ message CreatePodRequest {
 message ClonePodRequest {
   string source = 1;
   string dest = 2;
+}
+
+message CommitPodRequest {
+  string pod = 1;
+  // Optional human tag, e.g. "pre-upgrade". Slugified into the snapshot id.
+  string label = 2;
+}
+
+message RollbackPodRequest {
+  string pod = 1;
+  // Snapshot id; "" = latest.
+  string snapshot = 2;
+}
+
+message Snapshot {
+  string id = 1; // "<unix_ts>[-label]"
+  string pod = 2;
+  uint64 created_unix = 3;
+  string path = 4;
+  string label = 5;
+}
+
+message SnapshotList {
+  repeated Snapshot snapshots = 1;
+}
+
+message SnapshotRef {
+  string pod = 1;
+  string id = 2;
 }
 
 message ApplyStackRequest {

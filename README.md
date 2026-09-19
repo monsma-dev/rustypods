@@ -58,7 +58,10 @@ rustypods shell dev -- cargo build          # or run a command (exit code comes 
 echo hi | rustypods shell dev cat           # pipes work too
 rustypods stop dev
 rustypods clone dev dev-test              # instant CoW clone (snapshot + fresh net identity)
-rustypods destroy dev
+rustypods commit dev "pre-upgrade"        # instant rootfs snapshot — the time machine
+rustypods snapshots dev
+rustypods rollback dev                    # or: --to <id>; swaps rootfs, pod ends stopped
+rustypods destroy dev                     # also removes its snapshots
 rustypods --remote user@server ps         # manage a remote daemon over SSH (needs socat there)
 ```
 
