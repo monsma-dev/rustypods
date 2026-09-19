@@ -34,6 +34,8 @@ const MOCK_PODS: Pod[] = [
     },
     storageMaxBytes: 20 * 2 ** 30,
     ports: ["2222:22/tcp"],
+    snapKeepLast: 5,
+    snapMaxAgeSecs: 7 * 24 * 3600,
   }),
   Pod.fromPartial({
     name: "dev-clone",
@@ -211,6 +213,9 @@ export interface PodConfigUpdate {
   limits: Limits;
   storageMaxBytes: number;
   ports?: string[];
+  // proto `optional` fields: undefined = keep current, 0 = clear the rule.
+  snapKeepLast?: number;
+  snapMaxAgeSecs?: number;
 }
 
 export const updatePodConfig = async (u: PodConfigUpdate): Promise<Pod> => {
@@ -222,12 +227,16 @@ export const updatePodConfig = async (u: PodConfigUpdate): Promise<Pod> => {
       cpuQuotaPercent: u.limits.cpuQuotaPercent,
       storageMaxBytes: u.storageMaxBytes,
       ports: u.ports,
+      snapKeepLast: u.snapKeepLast,
+      snapMaxAgeSecs: u.snapMaxAgeSecs,
     }).then(Pod.fromJSON);
   await delay();
   const p = MOCK_PODS.find((p) => p.name === u.name)!;
   p.limits = { ...u.limits };
   p.storageMaxBytes = u.storageMaxBytes;
   if (u.ports) p.ports = u.ports;
+  if (u.snapKeepLast !== undefined) p.snapKeepLast = u.snapKeepLast;
+  if (u.snapMaxAgeSecs !== undefined) p.snapMaxAgeSecs = u.snapMaxAgeSecs;
   return p;
 };
 
@@ -317,6 +326,62 @@ function mockUnwatch(pod: string) {
     clearInterval(mockTimer);
     mockTimer = null;
   }
+}
+
+// ---- pod logs (StreamLogs → "log-<pod>" Tauri event) ----
+
+export const watchLogs = async (name: string): Promise<void> => {
+  if (inTauri) {
+    await invoke("watch_logs", { name });
+    return;
+  }
+  mockLogWatch(name);
+};
+
+export const unwatchLogs = async (name: string): Promise<void> => {
+  if (inTauri) {
+    await invoke("unwatch_logs", { name });
+    return;
+  }
+  mockLogSubs.delete(name);
+};
+
+/** Subscribe to log lines for one pod. Returns an unsubscribe fn. */
+export const onLog = async (
+  pod: string,
+  cb: (line: string) => void
+): Promise<() => void> => {
+  if (inTauri) return listen<string>(`log-${pod}`, (e) => cb(e.payload));
+  let set = mockLogSubs.get(pod);
+  if (!set) mockLogSubs.set(pod, (set = new Set()));
+  set.add(cb);
+  return () => {
+    set.delete(cb);
+  };
+};
+
+// --- mock logs for browser dev ---
+const mockLogSubs = new Map<string, Set<(l: string) => void>>();
+
+function mockLogWatch(pod: string) {
+  const p = MOCK_PODS.find((p) => p.name === pod);
+  if (!p || p.state !== PodState.POD_STATE_RUNNING) return;
+  const lines = [
+    `systemd[1]: Starting ${pod}.service — rustypods pod boot`,
+    `systemd[1]: Reached target basic.target`,
+    `systemd-networkd[42]: host0: Gained carrier`,
+    `rustypods-agent[77]: telemetry online — cgroup v2, PSI`,
+    `systemd[1]: Reached target multi-user.target`,
+    `sshd[90]: Server listening on 0.0.0.0 port 22`,
+    `sudo[112]:     nick : TTY=pts/0 ; PWD=/home/nick ; COMMAND=/bin/true`,
+    `systemd[1]: ${pod}: boot finished, idle`,
+  ];
+  lines.forEach((l, i) =>
+    setTimeout(
+      () => mockLogSubs.get(pod)?.forEach((cb) => cb(l)),
+      120 + i * 220
+    )
+  );
 }
 
 // ---- exec terminal (bidi Exec RPC → "pty-out-<pod>" / "pty-exit-<pod>") ----

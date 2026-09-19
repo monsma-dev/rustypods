@@ -192,6 +192,39 @@ image = "arch-base"
     );
 }
 
+/// Log stream bridge: watch_logs opens StreamLogs on the `dev` pod and each
+/// LogLine is re-emitted as a `log-dev` event (String payload). A booted pod
+/// has a journal backlog, so ≥1 line should arrive within seconds.
+/// Requires the daemon + a running `dev` pod.
+#[test]
+fn logs_via_ipc() {
+    let wv = webview();
+
+    let _ = invoke(&wv, "start_pod", json!({"name": "dev"}));
+
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let lines2 = Arc::clone(&lines);
+    wv.app_handle().listen_any("log-dev", move |ev| {
+        if let Ok(l) = serde_json::from_str::<String>(ev.payload()) {
+            lines2.lock().unwrap().push(l);
+        }
+    });
+
+    invoke(&wv, "watch_logs", json!({"name": "dev"})).expect("watch_logs failed");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && lines.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    invoke(&wv, "unwatch_logs", json!({"name": "dev"})).expect("unwatch_logs failed");
+
+    let got = lines.lock().unwrap().clone();
+    assert!(
+        !got.is_empty(),
+        "no log-dev events — StreamLogs produced nothing (is dev booted?)"
+    );
+}
+
 /// PTY bridge round-trip: open_pty spawns a login shell in the `dev` pod,
 /// stdout chunks arrive as `pty-out-dev` events, write_pty feeds stdin, and
 /// the shell's echo output comes back through the same event. Requires the

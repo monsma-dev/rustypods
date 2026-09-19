@@ -29,6 +29,12 @@ struct Rt(tokio::runtime::Runtime);
 #[derive(Default)]
 struct WatchMap(Mutex<HashMap<String, tokio::task::AbortHandle>>);
 
+/// Active StreamLogs subscriptions — same shape as WatchMap, kept as a
+/// separate managed state so a metrics watch and a log tail for the same
+/// pod don't fight over one slot.
+#[derive(Default)]
+struct LogWatchMap(Mutex<HashMap<String, tokio::task::AbortHandle>>);
+
 /// One live exec session: `stdin` feeds the bidi stream, `abort` kills the
 /// task that owns the outbound stream (and with it the gRPC call).
 struct PtySession {
@@ -128,6 +134,8 @@ async fn update_pod_config(
     cpu_quota_percent: u32,
     storage_max_bytes: u64,
     ports: Option<Vec<String>>,
+    snap_keep_last: Option<u32>,
+    snap_max_age_secs: Option<u64>,
 ) -> Result<Pod, String> {
     call(&rt.0, move |mut c| async move {
         let p = c
@@ -141,6 +149,10 @@ async fn update_pod_config(
                 storage_max_bytes,
                 ports: ports.map(|ports| PortMappings { ports }),
                 binds: None,
+                // proto `optional`: absent param (None) = keep current; a
+                // real 0 = clear the retention rule.
+                snap_keep_last,
+                snap_max_age_secs,
             })
             .await
             .map_err(|e| e.message().to_string())?
@@ -282,6 +294,53 @@ async fn watch_metrics<R: tauri::Runtime>(
 
 #[tauri::command]
 async fn unwatch_metrics(watches: State<'_, WatchMap>, name: String) -> Result<(), String> {
+    if let Some(h) = watches.0.lock().unwrap().remove(&name) {
+        h.abort();
+    }
+    Ok(())
+}
+
+/* ---------- log tail (StreamLogs → log-<pod> events) ---------- */
+
+/// Subscribe to a pod's log stream (journal for booted pods, console log
+/// otherwise); each LogLine is emitted to the frontend as a `log-<pod>`
+/// event with a lossy-UTF8 String payload. Re-subscribing replaces the old
+/// task.
+#[tauri::command]
+async fn watch_logs<R: tauri::Runtime>(
+    rt: State<'_, Rt>,
+    watches: State<'_, LogWatchMap>,
+    app: tauri::AppHandle<R>,
+    name: String,
+) -> Result<(), String> {
+    let pod = name.clone();
+    let ev = format!("log-{pod}");
+    let task = rt.0.spawn(async move {
+        let Ok(mut c) = connect(PathBuf::from(SOCKET_PATH), None).await else {
+            return;
+        };
+        let Ok(mut s) = c
+            .stream_logs(PodRef { name: pod })
+            .await
+            .map(|r| r.into_inner())
+        else {
+            return;
+        };
+        while let Ok(Some(l)) = s.message().await {
+            if app.emit(&ev, String::from_utf8_lossy(&l.data)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut w = watches.0.lock().unwrap();
+    if let Some(old) = w.insert(name, task.abort_handle()) {
+        old.abort();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn unwatch_logs(watches: State<'_, LogWatchMap>, name: String) -> Result<(), String> {
     if let Some(h) = watches.0.lock().unwrap().remove(&name) {
         h.abort();
     }
@@ -444,6 +503,7 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
     builder
         .manage(Rt(rt))
         .manage(WatchMap::default())
+        .manage(LogWatchMap::default())
         .manage(PtyMap::default())
         .invoke_handler(tauri::generate_handler![
             get_pods,
@@ -456,6 +516,8 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
             destroy_stack,
             watch_metrics,
             unwatch_metrics,
+            watch_logs,
+            unwatch_logs,
             open_pty,
             write_pty,
             resize_pty,

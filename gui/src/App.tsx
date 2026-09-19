@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import TermPane from "./TermPane";
+import LogPane from "./LogPane";
 import type { DaemonInfo, Image, Limits, Metric, Pod } from "./api";
 import { PodState, podStateToJSON } from "./proto/rustypods";
 
@@ -164,7 +165,7 @@ function Row({
         <div className="text-[13px] font-medium">{label}</div>
         {sub && <div className="mt-0.5 text-[11px] text-muted">{sub}</div>}
       </div>
-      <span className={`shrink-0 truncate text-xs text-muted ${mono ? "font-mono" : ""}`}>
+      <span className={`shrink-0 truncate text-[13px] text-muted ${mono ? "font-mono" : ""}`}>
         {value}
       </span>
     </div>
@@ -228,8 +229,8 @@ function LimitSlider({
     <div className="px-4 py-3">
       <div className="mb-2 flex items-baseline justify-between">
         <div>
-          <span className="text-xs font-medium">{label}</span>
-          {hint && <span className="ml-2 text-[10px] text-muted">{hint}</span>}
+          <span className="text-[13px] font-medium">{label}</span>
+          {hint && <span className="ml-2 text-[11px] text-muted">{hint}</span>}
         </div>
         <div className="flex items-center gap-1.5">
           <input
@@ -243,9 +244,9 @@ function LimitSlider({
                 Math.min(max, Math.max(0, Number(e.target.value) * scale))
               )
             }
-            className="w-16 rounded-md border border-white/10 bg-bg px-1.5 py-0.5 text-right font-mono text-xs focus:border-accent focus:outline-none"
+            className="w-20 rounded-lg border border-white/10 bg-bg px-2 py-1 text-right font-mono text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
           />
-          <span className="w-16 text-[10px] text-muted">
+          <span className="w-16 text-[11px] text-muted">
             {value === 0 ? "unlimited" : unit}
           </span>
         </div>
@@ -356,7 +357,7 @@ function MetricsSection({ pod, lean }: { pod: Pod; lean: boolean }) {
   return (
     <Group title="Live metrics">
       {noData ? (
-        <p className="px-4 py-3 text-xs text-muted">
+        <p className="px-4 py-3 text-[13px] text-muted">
           No agent telemetry — the rustypods-agent reports only while the pod
           runs.
         </p>
@@ -464,7 +465,29 @@ const parsePort = (spec: string): PortRow => {
 const serializePort = (r: PortRow) =>
   `${r.host}:${r.pod}${r.proto === "udp" ? "/udp" : ""}`;
 
+type DetailTab = "settings" | "logs" | "terminal";
+
 type PodAct = (names: string[], f: () => Promise<unknown>) => void;
+
+/** "7d"/"24h"/"30m"/"60s" or bare seconds → seconds; null = empty/invalid. */
+const parseAgeSecs = (s: string): number | null => {
+  const m = /^(\d+)([smhd]?)$/.exec(s.trim());
+  if (!m) return null;
+  const mult = { "": 1, s: 1, m: 60, h: 3600, d: 86400 }[m[2]]!;
+  return Number(m[1]) * mult;
+};
+
+/** Seconds → the shortest unit string ("7d", "24h", "90s"); 0 → "". */
+const fmtAgeSecs = (secs: number): string => {
+  if (secs === 0) return "";
+  for (const [u, n] of [
+    ["d", 86400],
+    ["h", 3600],
+    ["m", 60],
+  ] as const)
+    if (secs % n === 0) return `${secs / n}${u}`;
+  return `${secs}s`;
+};
 
 function PodDetail({
   pod,
@@ -479,9 +502,9 @@ function PodDetail({
   onClose: () => void;
   act: PodAct;
   busy: boolean;
-  initialTab: "settings" | "terminal";
+  initialTab: DetailTab;
 }) {
-  const [tab, setTab] = useState<"settings" | "terminal">(initialTab);
+  const [tab, setTab] = useState<DetailTab>(initialTab);
   const lim = limitsOf(pod);
   const [memHigh, setMemHigh] = useState(lim.memoryHighBytes);
   const [memMax, setMemMax] = useState(lim.memoryMaxBytes);
@@ -489,13 +512,25 @@ function PodDetail({
   const [disk, setDisk] = useState(pod.storageMaxBytes);
   const [ports, setPorts] = useState<PortRow[]>(pod.ports.map(parsePort));
   const [newPort, setNewPort] = useState<PortRow>({ host: "", pod: "", proto: "tcp" });
+  // Snapshot retention — Max age stays a raw string so "7d" can be typed.
+  const [snapKeep, setSnapKeep] = useState(pod.snapKeepLast);
+  const [snapAge, setSnapAge] = useState(fmtAgeSecs(pod.snapMaxAgeSecs));
+
+  // Empty age field = keep current; a parsed value that differs = change;
+  // "0" clears the rule.
+  const snapAgeSecs = parseAgeSecs(snapAge);
+  const snapAgeValid = snapAge.trim() === "" || snapAgeSecs !== null;
+  const snapKeepDirty = snapKeep !== pod.snapKeepLast;
+  const snapAgeDirty = snapAgeSecs !== null && snapAgeSecs !== pod.snapMaxAgeSecs;
 
   const dirty =
     memHigh !== lim.memoryHighBytes ||
     memMax !== lim.memoryMaxBytes ||
     cpu !== lim.cpuQuotaPercent ||
     disk !== pod.storageMaxBytes ||
-    ports.map(serializePort).join(",") !== pod.ports.join(",");
+    ports.map(serializePort).join(",") !== pod.ports.join(",") ||
+    snapKeepDirty ||
+    snapAgeDirty;
 
   const running = isRunning(pod);
 
@@ -510,6 +545,9 @@ function PodDetail({
         },
         storageMaxBytes: disk,
         ports: ports.map(serializePort),
+        // Unchanged fields stay absent (None → daemon keeps the conf value).
+        snapKeepLast: snapKeepDirty ? snapKeep : undefined,
+        snapMaxAgeSecs: snapAgeDirty ? snapAgeSecs! : undefined,
       })
     );
 
@@ -525,7 +563,7 @@ function PodDetail({
     <div className="fixed inset-0 z-40" onClick={onClose}>
       <div className="absolute inset-0 bg-black/40" />
       <aside
-        className="absolute right-0 top-0 flex h-full w-[400px] flex-col border-l border-white/10 bg-bg2 shadow-2xl"
+        className="absolute right-0 top-0 flex h-full w-[440px] flex-col border-l border-white/10 bg-bg2 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* header */}
@@ -546,7 +584,7 @@ function PodDetail({
               <button
                 onClick={() => act([pod.name], () => api.stopPod(pod.name))}
                 disabled={busy}
-                className="rounded-lg bg-err/15 px-3 py-1.5 text-xs font-medium text-err transition-colors hover:bg-err/25 disabled:opacity-50"
+                className="rounded-lg bg-err/15 px-3 py-2 text-[13px] font-medium text-err transition-colors hover:bg-err/25 disabled:opacity-50"
               >
                 {busy ? "Stopping…" : "Stop"}
               </button>
@@ -554,7 +592,7 @@ function PodDetail({
               <button
                 onClick={() => act([pod.name], () => api.startPod(pod.name))}
                 disabled={busy}
-                className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+                className="rounded-lg bg-accent px-4 py-2 text-[13px] font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
               >
                 {busy ? "Starting…" : "Start"}
               </button>
@@ -571,18 +609,18 @@ function PodDetail({
 
         {/* tab switcher — same segmented style as the wizard's Isolation */}
         <div className="px-4 pt-3">
-          <div className="grid grid-cols-2 gap-1 rounded-lg border border-white/[0.08] bg-bg p-1">
-            {(["settings", "terminal"] as const).map((t) => (
+          <div className="grid grid-cols-3 gap-1 rounded-lg border border-white/[0.08] bg-bg p-1">
+            {(["settings", "logs", "terminal"] as const).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                className={`rounded-md px-2.5 py-1.5 text-[13px] font-medium capitalize transition-colors ${
                   tab === t
                     ? "bg-accent/15 text-accent"
                     : "text-fg/80 hover:bg-white/5"
                 }`}
               >
-                {t === "settings" ? "Settings" : "Terminal"}
+                {t}
               </button>
             ))}
           </div>
@@ -592,6 +630,10 @@ function PodDetail({
         {tab === "terminal" ? (
           <div className="min-h-0 flex-1 p-4 pt-3">
             <TermPane pod={pod.name} running={running} />
+          </div>
+        ) : tab === "logs" ? (
+          <div className="min-h-0 flex-1 p-4 pt-3">
+            <LogPane pod={pod.name} running={running} />
           </div>
         ) : (
         <div className="flex-1 space-y-5 overflow-y-auto p-4">
@@ -646,6 +688,44 @@ function PodDetail({
             />
           </Group>
 
+          <Group title="Snapshots">
+            <div className="flex items-center justify-between gap-4 px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-[13px] font-medium">Keep last</div>
+                <div className="mt-0.5 text-[11px] text-muted">
+                  commits kept per pod — 0 keeps all
+                </div>
+              </div>
+              <input
+                type="number"
+                min={0}
+                value={snapKeep}
+                onChange={(e) =>
+                  setSnapKeep(Math.max(0, Number(e.target.value)))
+                }
+                className="w-24 rounded-lg border border-white/10 bg-bg px-3 py-2 text-right font-mono text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-4 px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-[13px] font-medium">Max age</div>
+                <div className="mt-0.5 text-[11px] text-muted">
+                  7d / 24h / 30m / 60s — 0 clears, empty keeps
+                </div>
+              </div>
+              <input
+                value={snapAge}
+                placeholder="7d"
+                onChange={(e) => setSnapAge(e.target.value)}
+                className={`w-24 rounded-lg border bg-bg px-3 py-2 text-right font-mono text-sm focus:outline-none focus:ring-1 ${
+                  snapAgeValid
+                    ? "border-white/10 focus:border-accent focus:ring-accent/40"
+                    : "border-err focus:border-err focus:ring-err/40"
+                }`}
+              />
+            </div>
+          </Group>
+
           <Group title="Sandbox">
             <Row
               label="User namespace"
@@ -661,13 +741,13 @@ function PodDetail({
 
           <Group title="Port forwarding">
             {ports.length === 0 && (
-              <p className="px-4 py-3 text-xs text-muted">
+              <p className="px-4 py-3 text-[13px] text-muted">
                 No published ports — traffic stays on the pod's own network.
               </p>
             )}
             {ports.map((r, i) => (
               <div key={i} className="flex items-center gap-2 px-4 py-2">
-                <code className="flex-1 text-xs">
+                <code className="flex-1 text-[13px]">
                   host :{r.host} → pod :{r.pod}
                   <span className="text-muted">/{r.proto}</span>
                 </code>
@@ -679,26 +759,26 @@ function PodDetail({
                 </button>
               </div>
             ))}
-            <div className="flex items-center gap-1.5 px-4 py-2.5">
+            <div className="flex items-center gap-2 px-4 py-2.5">
               <input
                 placeholder="host"
                 value={newPort.host}
                 onChange={(e) => setNewPort({ ...newPort, host: e.target.value })}
-                className="w-16 rounded-md border border-white/10 bg-bg px-1.5 py-1 font-mono text-xs focus:border-accent focus:outline-none"
+                className="w-20 rounded-lg border border-white/10 bg-bg px-3 py-2 font-mono text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
               />
-              <span className="text-xs text-muted">→</span>
+              <span className="text-[13px] text-muted">→</span>
               <input
                 placeholder="pod"
                 value={newPort.pod}
                 onChange={(e) => setNewPort({ ...newPort, pod: e.target.value })}
-                className="w-16 rounded-md border border-white/10 bg-bg px-1.5 py-1 font-mono text-xs focus:border-accent focus:outline-none"
+                className="w-20 rounded-lg border border-white/10 bg-bg px-3 py-2 font-mono text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
               />
               <select
                 value={newPort.proto}
                 onChange={(e) =>
                   setNewPort({ ...newPort, proto: e.target.value as "tcp" | "udp" })
                 }
-                className="rounded-md border border-white/10 bg-bg px-1.5 py-1 text-xs focus:border-accent focus:outline-none"
+                className="rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
               >
                 <option value="tcp">tcp</option>
                 <option value="udp">udp</option>
@@ -709,7 +789,7 @@ function PodDetail({
                   setPorts([...ports, newPort]);
                   setNewPort({ host: "", pod: "", proto: "tcp" });
                 }}
-                className="ml-auto rounded-lg bg-white/10 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-white/15 disabled:opacity-40"
+                className="ml-auto rounded-lg bg-white/[0.06] px-3 py-2 text-[13px] font-medium transition-colors hover:bg-white/10 disabled:opacity-40"
               >
                 Add
               </button>
@@ -732,16 +812,18 @@ function PodDetail({
                 setCpu(lim.cpuQuotaPercent);
                 setDisk(pod.storageMaxBytes);
                 setPorts(pod.ports.map(parsePort));
+                setSnapKeep(pod.snapKeepLast);
+                setSnapAge(fmtAgeSecs(pod.snapMaxAgeSecs));
               }}
               disabled={!dirty}
-              className="rounded-lg px-3 py-1.5 text-xs text-muted transition-colors hover:bg-white/5 disabled:opacity-40"
+              className="rounded-lg bg-white/[0.06] px-3 py-2 text-[13px] font-medium text-fg/80 transition-colors hover:bg-white/10 disabled:opacity-40"
             >
               Reset
             </button>
             <button
               onClick={apply}
-              disabled={!dirty}
-              className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
+              disabled={!dirty || !snapAgeValid}
+              className="rounded-lg bg-accent px-4 py-2 text-[13px] font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
             >
               Apply
             </button>
@@ -831,21 +913,21 @@ function NewPodDialog({
 
         <div className="flex-1 space-y-5 overflow-y-auto p-4">
           <div>
-            <label className="mb-1 block text-xs font-medium">Name</label>
+            <label className="mb-1 block text-[13px] font-medium">Name</label>
             <input
               autoFocus
               placeholder="my-pod"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="w-full rounded-md border border-white/10 bg-bg px-2.5 py-1.5 font-mono text-xs focus:border-accent focus:outline-none"
+              className="w-full rounded-lg border border-white/10 bg-bg px-3 py-2 font-mono text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
             />
           </div>
           <div>
-            <label className="mb-1 block text-xs font-medium">Image</label>
+            <label className="mb-1 block text-[13px] font-medium">Image</label>
             <select
               value={image}
               onChange={(e) => setImage(e.target.value)}
-              className="w-full rounded-md border border-white/10 bg-bg px-2 py-1.5 text-xs focus:border-accent focus:outline-none"
+              className="w-full rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
             >
               {images.length === 0 && <option value="">(no images)</option>}
               {images.map((i) => (
@@ -904,7 +986,7 @@ function NewPodDialog({
           </div>
 
           <div>
-            <span className="text-xs font-medium">Isolation</span>
+            <span className="text-[13px] font-medium">Isolation</span>
             <div className="mt-1.5 grid grid-cols-2 gap-1 rounded-lg border border-white/10 bg-bg p-1">
               {[
                 {
@@ -927,8 +1009,8 @@ function NewPodDialog({
                       : "text-fg/80 hover:bg-white/5"
                   }`}
                 >
-                  <div className="text-xs font-medium">{o.title}</div>
-                  <div className="mt-0.5 text-[10px] leading-tight text-muted">
+                  <div className="text-[13px] font-medium">{o.title}</div>
+                  <div className="mt-0.5 text-[11px] leading-tight text-muted">
                     {o.desc}
                   </div>
                 </button>
@@ -936,20 +1018,20 @@ function NewPodDialog({
             </div>
           </div>
 
-          {err && <p className="text-xs text-err">{err}</p>}
+          {err && <p className="text-[13px] text-err">{err}</p>}
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
           <button
             onClick={onClose}
-            className="rounded-lg px-3 py-1.5 text-xs text-muted transition-colors hover:bg-white/5"
+            className="rounded-lg bg-white/[0.06] px-3 py-2 text-[13px] font-medium transition-colors hover:bg-white/10"
           >
             Cancel
           </button>
           <button
             onClick={deploy}
             disabled={!valid || deploying}
-            className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
+            className="rounded-lg bg-accent px-4 py-2 text-[13px] font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
           >
             {deploying ? "Deploying…" : "Deploy"}
           </button>
@@ -1019,29 +1101,29 @@ function ApplyStackDialog({
 
         <div className="flex-1 space-y-3 overflow-y-auto p-4">
           <div>
-            <label className="mb-1 block text-xs font-medium">stack.toml</label>
+            <label className="mb-1 block text-[13px] font-medium">stack.toml</label>
             <textarea
               autoFocus
               spellCheck={false}
               value={toml}
               onChange={(e) => setToml(e.target.value)}
-              className="h-48 w-full resize-none rounded-md border border-white/10 bg-bg px-2.5 py-1.5 font-mono text-xs focus:border-accent focus:outline-none"
+              className="h-48 w-full resize-none rounded-lg border border-white/10 bg-bg px-3 py-2 font-mono text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
             />
           </div>
-          {err && <p className="text-xs text-err">{err}</p>}
+          {err && <p className="text-[13px] text-err">{err}</p>}
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
           <button
             onClick={onClose}
-            className="rounded-lg px-3 py-1.5 text-xs text-muted transition-colors hover:bg-white/5"
+            className="rounded-lg bg-white/[0.06] px-3 py-2 text-[13px] font-medium transition-colors hover:bg-white/10"
           >
             Cancel
           </button>
           <button
             onClick={apply}
             disabled={!toml.trim() || applying}
-            className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
+            className="rounded-lg bg-accent px-4 py-2 text-[13px] font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
           >
             {applying ? "Applying…" : "Apply"}
           </button>
@@ -1197,13 +1279,13 @@ function PodsView({
       <div className="mb-2 flex items-center justify-end">
         <button
           onClick={onNew}
-          className="rounded-md bg-accent px-2 py-1 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+          className="rounded-lg bg-accent px-4 py-2 text-[13px] font-medium text-white transition-colors hover:bg-accent-hover"
         >
           + New Pod
         </button>
       </div>
       {pods.length === 0 ? (
-        <p className="mt-10 text-center text-xs text-muted">
+        <p className="mt-10 text-center text-[13px] text-muted">
           No pods — create one above or with <code>rustypods create …</code>
         </p>
       ) : (
@@ -1258,7 +1340,7 @@ function StacksView({
       <div className="mb-2 flex items-center justify-end">
         <button
           onClick={onNew}
-          className="rounded-md bg-accent px-2 py-1 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+          className="rounded-lg bg-accent px-4 py-2 text-[13px] font-medium text-white transition-colors hover:bg-accent-hover"
         >
           + Apply stack.toml
         </button>
@@ -1300,7 +1382,7 @@ function StacksView({
                       }
                     )
                   }
-                  className="rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-white/5 hover:text-fg"
+                  className="rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-white/10"
                 >
                   Start all
                 </button>
@@ -1314,12 +1396,12 @@ function StacksView({
                       }
                     )
                   }
-                  className="rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-white/5 hover:text-fg"
+                  className="rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-white/10"
                 >
                   Stop all
                 </button>
                 {confirming === stack ? (
-                  <span className="ml-auto flex items-center gap-1.5 text-xs font-medium text-err">
+                  <span className="ml-auto flex items-center gap-1.5 text-[13px] font-medium text-err">
                     Destroy?
                     <button
                       onClick={() => {
@@ -1329,13 +1411,13 @@ function StacksView({
                           () => api.destroyStack(stack)
                         );
                       }}
-                      className="rounded-md bg-err/15 px-2 py-1 text-xs font-medium text-err transition-colors hover:bg-err/25"
+                      className="rounded-lg bg-err/15 px-3 py-1.5 text-xs font-medium text-err transition-colors hover:bg-err/25"
                     >
                       yes
                     </button>
                     <button
                       onClick={() => setConfirming(null)}
-                      className="rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-white/5"
+                      className="rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-white/10"
                     >
                       no
                     </button>
@@ -1343,7 +1425,7 @@ function StacksView({
                 ) : (
                   <button
                     onClick={() => setConfirming(stack)}
-                    className="ml-auto rounded-md px-2 py-1 text-xs font-medium text-err/80 transition-colors hover:bg-err/15 hover:text-err"
+                    className="ml-auto rounded-lg px-3 py-1.5 text-xs font-medium text-err/80 transition-colors hover:bg-err/15 hover:text-err"
                   >
                     Destroy
                   </button>
@@ -1417,7 +1499,7 @@ function SettingsView({
             />
           </>
         ) : (
-          <p className="px-4 py-3 text-xs text-muted">daemon unreachable</p>
+          <p className="px-4 py-3 text-[13px] text-muted">daemon unreachable</p>
         )}
       </Group>
 
@@ -1432,7 +1514,7 @@ function SettingsView({
           <select
             value={intervalMs}
             onChange={(e) => setIntervalMs(Number(e.target.value))}
-            className="rounded-lg border border-white/10 bg-bg px-2 py-1 text-xs focus:border-accent focus:outline-none"
+            className="rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
           >
             <option value={1000}>1 s</option>
             <option value={2000}>2 s</option>
@@ -1506,11 +1588,10 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(
     () => new URLSearchParams(location.search).get("detail")
   );
-  const [detailTab] = useState<"settings" | "terminal">(() =>
-    new URLSearchParams(location.search).get("tab") === "terminal"
-      ? "terminal"
-      : "settings"
-  );
+  const [detailTab] = useState<DetailTab>(() => {
+    const t = new URLSearchParams(location.search).get("tab");
+    return t === "terminal" || t === "logs" ? t : "settings";
+  });
   const [newPodOpen, setNewPodOpen] = useState(
     () => new URLSearchParams(location.search).has("newpod")
   );
@@ -1626,7 +1707,7 @@ export default function App() {
         <main className="flex-1 overflow-y-auto">
           <div className="p-3">
             {error && (
-              <div className="mb-3 rounded-lg border border-err/40 bg-err/10 px-3 py-1.5 text-xs text-err">
+              <div className="mb-3 rounded-lg border border-err/40 bg-err/10 px-3 py-2 text-[13px] text-err">
                 {error}
               </div>
             )}

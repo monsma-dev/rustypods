@@ -196,6 +196,37 @@ Host side: `/dev/shm/rustypods/<pod>/<name>`; pod side: `/run/rustypods/shm/<nam
 Same tmpfs pages — an `mmap` on both sides is literally zero-copy.
 Files are owned by uid 1000 so host and pod processes can map them as `nick`.
 
+## OCI pulls, logs & snapshot GC
+
+```bash
+rustypods pull busybox:latest        # native OCI pull — no podman/docker needed
+rustypods pull ghcr.io/org/tool:v1 --name tool
+rustypods logs dev                   # journal backlog; non-boot pods → console log
+rustypods logs dev -f                # keep following
+rustypods config dev --snap-keep 5 --snap-max-age 7d   # snapshot GC; 0 = keep all
+```
+
+Pulled images carry their OCI entrypoint/cmd — pods on them run non-boot
+(the payload replaces systemd), which is also why their `logs` come from the
+console log instead of the journal.
+
+### REST API
+
+The same PodControl surface is exposed as REST/JSON for automation and
+agents: `rustypodsd --http-addr 127.0.0.1:9180` (the default; `--http-addr ""`
+disables it). **No authentication** — localhost only, never bind a routable
+address. Request bodies are snake_case; responses are the proto messages in
+camelCase JSON:
+
+```
+GET    /healthz                      GET    /v1/daemon
+GET    /v1/pods                      POST   /v1/pods          {"name","image",…}
+PATCH  /v1/pods/:name                {"memory_high_bytes","ports","snap_keep_last",…}
+POST   /v1/pods/:name/start|stop     DELETE /v1/pods/:name
+GET    /v1/images                    GET    /v1/pods/:name/metrics
+POST   /v1/stacks   (raw stack.toml) DELETE /v1/stacks/:name
+```
+
 ## Design notes
 
 - **Guardrails via the machined scope**: nspawn registers itself with
@@ -244,9 +275,13 @@ npm run build         # frontend only → gui/dist
 ```
 
 Commands: `get_pods`, `start_pod`, `stop_pod`, `update_pod_config`,
-`get_images`, `get_daemon_info`. Views: Pods (dense table, click a row
-for the detail panel), Stacks (grouped by shared netns), Images,
-Settings (daemon info, refresh interval, reduce-motion).
+`get_images`, `get_daemon_info`, `watch_logs`. Views: Pods (dense table,
+click a row for the detail panel), Stacks (grouped by shared netns),
+Images, Settings (daemon info, refresh interval, reduce-motion).
+The detail panel has a segmented tab strip: Settings | Logs | Terminal —
+Logs renders `StreamLogs` in a read-only xterm, Terminal is a live exec
+shell. Snapshot retention (keep-last / max-age) is editable under
+Settings → Snapshots.
 
 The pod detail panel edits cgroup limits (memory high/max, CPU quota),
 the btrfs disk quota and port forwards via `UpdatePodConfig` — applied

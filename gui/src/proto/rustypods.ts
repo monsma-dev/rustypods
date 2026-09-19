@@ -115,6 +115,12 @@ export interface Image {
   path: string;
   source: string;
   createdUnix: number;
+  /**
+   * OCI config (empty for distrobox imports). Pods on images with an
+   * entrypoint/cmd start in non-boot mode — they carry no systemd.
+   */
+  entrypoint: string[];
+  cmd: string[];
 }
 
 export interface ImageList {
@@ -134,6 +140,13 @@ export interface ImportImageRequest {
   distrobox: string;
   /** Host user owning the rootless podman store (root podman cannot see it). */
   importUser: string;
+}
+
+export interface PullImageRequest {
+  /** OCI reference, e.g. "busybox:latest" or "ghcr.io/org/tool:v1". */
+  reference: string;
+  /** Optional image name; default = "<repo-basename>-<tag>" slug. */
+  name: string;
 }
 
 export interface Limits {
@@ -168,6 +181,10 @@ export interface Pod {
   binds: string[];
   /** nspawn --private-users=pick: pod root is not host root. */
   privateUsers: boolean;
+  /** Snapshot GC: keep at most this many commits (0 = unlimited). */
+  snapKeepLast: number;
+  /** Snapshot GC: drop commits older than this many seconds (0 = unlimited). */
+  snapMaxAgeSecs: number;
 }
 
 export interface PodList {
@@ -273,7 +290,15 @@ export interface UpdatePodConfigRequest {
    * Absent = keep current binds; present (even empty) = replace.
    * Takes effect on the next pod start.
    */
-  binds?: BindList | undefined;
+  binds?:
+    | BindList
+    | undefined;
+  /** Absent = keep; 0 = clear (no count-based snapshot GC). */
+  snapKeepLast?:
+    | number
+    | undefined;
+  /** Absent = keep; 0 = clear (no age-based snapshot GC). */
+  snapMaxAgeSecs?: number | undefined;
 }
 
 export interface StartPodRequest {
@@ -1089,7 +1114,7 @@ export const DaemonInfo: MessageFns<DaemonInfo> = {
 };
 
 function createBaseImage(): Image {
-  return { name: "", path: "", source: "", createdUnix: 0 };
+  return { name: "", path: "", source: "", createdUnix: 0, entrypoint: [], cmd: [] };
 }
 
 export const Image: MessageFns<Image> = {
@@ -1105,6 +1130,12 @@ export const Image: MessageFns<Image> = {
     }
     if (message.createdUnix !== 0) {
       writer.uint32(32).uint64(message.createdUnix);
+    }
+    for (const v of message.entrypoint) {
+      writer.uint32(42).string(v!);
+    }
+    for (const v of message.cmd) {
+      writer.uint32(50).string(v!);
     }
     return writer;
   },
@@ -1154,6 +1185,22 @@ export const Image: MessageFns<Image> = {
             message.createdUnix = longToNumber(reader.uint64());
             continue;
           }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.entrypoint.push(reader.string());
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.cmd.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1176,6 +1223,10 @@ export const Image: MessageFns<Image> = {
         : isSet(object.created_unix)
         ? globalThis.Number(object.created_unix)
         : 0,
+      entrypoint: globalThis.Array.isArray(object?.entrypoint)
+        ? object.entrypoint.map((e: any) => globalThis.String(e))
+        : [],
+      cmd: globalThis.Array.isArray(object?.cmd) ? object.cmd.map((e: any) => globalThis.String(e)) : [],
     };
   },
 
@@ -1193,6 +1244,12 @@ export const Image: MessageFns<Image> = {
     if (message.createdUnix !== 0) {
       obj.createdUnix = Math.round(message.createdUnix);
     }
+    if (message.entrypoint?.length) {
+      obj.entrypoint = message.entrypoint;
+    }
+    if (message.cmd?.length) {
+      obj.cmd = message.cmd;
+    }
     return obj;
   },
 
@@ -1205,6 +1262,8 @@ export const Image: MessageFns<Image> = {
     message.path = object.path ?? "";
     message.source = object.source ?? "";
     message.createdUnix = object.createdUnix ?? 0;
+    message.entrypoint = object.entrypoint?.map((e) => e) || [];
+    message.cmd = object.cmd?.map((e) => e) || [];
     return message;
   },
 };
@@ -1500,6 +1559,91 @@ export const ImportImageRequest: MessageFns<ImportImageRequest> = {
   },
 };
 
+function createBasePullImageRequest(): PullImageRequest {
+  return { reference: "", name: "" };
+}
+
+export const PullImageRequest: MessageFns<PullImageRequest> = {
+  encode(message: PullImageRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.reference !== "") {
+      writer.uint32(10).string(message.reference);
+    }
+    if (message.name !== "") {
+      writer.uint32(18).string(message.name);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PullImageRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePullImageRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.reference = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): PullImageRequest {
+    return {
+      reference: isSet(object.reference) ? globalThis.String(object.reference) : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+    };
+  },
+
+  toJSON(message: PullImageRequest): unknown {
+    const obj: any = {};
+    if (message.reference !== "") {
+      obj.reference = message.reference;
+    }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<PullImageRequest>, I>>(base?: I): PullImageRequest {
+    return PullImageRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PullImageRequest>, I>>(object: I): PullImageRequest {
+    const message = createBasePullImageRequest();
+    message.reference = object.reference ?? "";
+    message.name = object.name ?? "";
+    return message;
+  },
+};
+
 function createBaseLimits(): Limits {
   return { memoryHighBytes: 0, memoryMaxBytes: 0, cpuQuotaPercent: 0 };
 }
@@ -1628,6 +1772,8 @@ function createBasePod(): Pod {
     stack: "",
     binds: [],
     privateUsers: false,
+    snapKeepLast: 0,
+    snapMaxAgeSecs: 0,
   };
 }
 
@@ -1671,6 +1817,12 @@ export const Pod: MessageFns<Pod> = {
     }
     if (message.privateUsers !== false) {
       writer.uint32(104).bool(message.privateUsers);
+    }
+    if (message.snapKeepLast !== 0) {
+      writer.uint32(112).uint32(message.snapKeepLast);
+    }
+    if (message.snapMaxAgeSecs !== 0) {
+      writer.uint32(120).uint64(message.snapMaxAgeSecs);
     }
     return writer;
   },
@@ -1792,6 +1944,22 @@ export const Pod: MessageFns<Pod> = {
             message.privateUsers = reader.bool();
             continue;
           }
+          case 14: {
+            if (tag !== 112) {
+              break;
+            }
+
+            message.snapKeepLast = reader.uint32();
+            continue;
+          }
+          case 15: {
+            if (tag !== 120) {
+              break;
+            }
+
+            message.snapMaxAgeSecs = longToNumber(reader.uint64());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1835,6 +2003,16 @@ export const Pod: MessageFns<Pod> = {
         : isSet(object.private_users)
         ? globalThis.Boolean(object.private_users)
         : false,
+      snapKeepLast: isSet(object.snapKeepLast)
+        ? globalThis.Number(object.snapKeepLast)
+        : isSet(object.snap_keep_last)
+        ? globalThis.Number(object.snap_keep_last)
+        : 0,
+      snapMaxAgeSecs: isSet(object.snapMaxAgeSecs)
+        ? globalThis.Number(object.snapMaxAgeSecs)
+        : isSet(object.snap_max_age_secs)
+        ? globalThis.Number(object.snap_max_age_secs)
+        : 0,
     };
   },
 
@@ -1879,6 +2057,12 @@ export const Pod: MessageFns<Pod> = {
     if (message.privateUsers !== false) {
       obj.privateUsers = message.privateUsers;
     }
+    if (message.snapKeepLast !== 0) {
+      obj.snapKeepLast = Math.round(message.snapKeepLast);
+    }
+    if (message.snapMaxAgeSecs !== 0) {
+      obj.snapMaxAgeSecs = Math.round(message.snapMaxAgeSecs);
+    }
     return obj;
   },
 
@@ -1902,6 +2086,8 @@ export const Pod: MessageFns<Pod> = {
     message.stack = object.stack ?? "";
     message.binds = object.binds?.map((e) => e) || [];
     message.privateUsers = object.privateUsers ?? false;
+    message.snapKeepLast = object.snapKeepLast ?? 0;
+    message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? 0;
     return message;
   },
 };
@@ -3098,7 +3284,15 @@ export const BindList: MessageFns<BindList> = {
 };
 
 function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
-  return { name: "", limits: undefined, storageMaxBytes: 0, ports: undefined, binds: undefined };
+  return {
+    name: "",
+    limits: undefined,
+    storageMaxBytes: 0,
+    ports: undefined,
+    binds: undefined,
+    snapKeepLast: undefined,
+    snapMaxAgeSecs: undefined,
+  };
 }
 
 export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
@@ -3117,6 +3311,12 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     }
     if (message.binds !== undefined) {
       BindList.encode(message.binds, writer.uint32(42).fork()).join();
+    }
+    if (message.snapKeepLast !== undefined) {
+      writer.uint32(48).uint32(message.snapKeepLast);
+    }
+    if (message.snapMaxAgeSecs !== undefined) {
+      writer.uint32(56).uint64(message.snapMaxAgeSecs);
     }
     return writer;
   },
@@ -3174,6 +3374,22 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
             message.binds = BindList.decode(reader, reader.uint32());
             continue;
           }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.snapKeepLast = reader.uint32();
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.snapMaxAgeSecs = longToNumber(reader.uint64());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3197,6 +3413,16 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
         : 0,
       ports: isSet(object.ports) ? PortMappings.fromJSON(object.ports) : undefined,
       binds: isSet(object.binds) ? BindList.fromJSON(object.binds) : undefined,
+      snapKeepLast: isSet(object.snapKeepLast)
+        ? globalThis.Number(object.snapKeepLast)
+        : isSet(object.snap_keep_last)
+        ? globalThis.Number(object.snap_keep_last)
+        : undefined,
+      snapMaxAgeSecs: isSet(object.snapMaxAgeSecs)
+        ? globalThis.Number(object.snapMaxAgeSecs)
+        : isSet(object.snap_max_age_secs)
+        ? globalThis.Number(object.snap_max_age_secs)
+        : undefined,
     };
   },
 
@@ -3217,6 +3443,12 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     if (message.binds !== undefined) {
       obj.binds = BindList.toJSON(message.binds);
     }
+    if (message.snapKeepLast !== undefined) {
+      obj.snapKeepLast = Math.round(message.snapKeepLast);
+    }
+    if (message.snapMaxAgeSecs !== undefined) {
+      obj.snapMaxAgeSecs = Math.round(message.snapMaxAgeSecs);
+    }
     return obj;
   },
 
@@ -3236,6 +3468,8 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     message.binds = (object.binds !== undefined && object.binds !== null)
       ? BindList.fromPartial(object.binds)
       : undefined;
+    message.snapKeepLast = object.snapKeepLast ?? undefined;
+    message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? undefined;
     return message;
   },
 };
@@ -4168,6 +4402,18 @@ export const PodControlDefinition = {
     importImage: {
       name: "ImportImage",
       requestType: ImportImageRequest as typeof ImportImageRequest,
+      requestStream: false,
+      responseType: Image as typeof Image,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Pull an OCI image straight from a registry (docker.io, ghcr.io, …) —
+     * anonymous auth, native OS/arch, no external tools.
+     */
+    pullImage: {
+      name: "PullImage",
+      requestType: PullImageRequest as typeof PullImageRequest,
       requestStream: false,
       responseType: Image as typeof Image,
       responseStream: false,
