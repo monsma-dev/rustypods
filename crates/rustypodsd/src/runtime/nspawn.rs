@@ -22,15 +22,14 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
         format!("--machine={}", spec.name).into(),
         "--directory".into(),
         spec.rootfs.as_os_str().into(),
-        // distrobox-parity binds: home + tmp. /run/user/1000 is READ-ONLY:
-        // container-logind runs user-runtime-dir@1000 whose session cleanup
-        // rm -rf's it — a rw bind wiped the host's user bus once already.
-        "--bind=/home/nick".into(),
-        "--bind=/tmp".into(),
-        "--bind-ro=/run/user/1000".into(),
     ];
-    if Path::new("/dev/dri").is_dir() {
-        a.push("--bind-ro=/dev/dri".into());
+    // User binds come from the pod conf (validated by validate_bind at write
+    // time). rw under /run is refused there: container-logind runs
+    // user-runtime-dir@<uid> whose session cleanup rm -rf's it — a rw bind
+    // wiped the host's user bus once already.
+    for b in &spec.binds {
+        let flag = if b.ro { "--bind-ro" } else { "--bind" };
+        a.push(format!("{flag}={}:{}", b.host, b.pod).into());
     }
     if spec.agent_bin.is_dir() {
         a.push(format!("--bind-ro={}:/run/rustypods/bin", spec.agent_bin.display()).into());
@@ -45,7 +44,10 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
         a.push("-x".into()); // nspawn btrfs-snapshots the dir and discards on exit
     }
     if spec.private_users {
-        // Breaks shared-home writes (mapped uids); opt-in isolation.
+        // Default for new pods: pod root is not host root. --private-users-
+        // chown makes the FIRST start shift the rootfs ownership to the
+        // picked range (metadata-level CoW on btrfs, one-time cost). It
+        // breaks shared-home writes as host uids — desktop pods opt out.
         a.push("--private-users=pick".into());
         a.push("--private-users-chown".into());
     }
@@ -156,6 +158,7 @@ mod tests {
             run_dir: PathBuf::from("/bin"),             // exists → run bind
             shm_dir: PathBuf::from("/definitely-missing"), // skipped
             ports: vec![],
+            binds: vec![],
             netns: None,
             log: PathBuf::from("/tmp/x.log"),
         }
@@ -173,8 +176,23 @@ mod tests {
         let a = argv(&spec(false, false));
         assert!(a.contains(&"--boot".to_string()));
         assert!(a.contains(&"--machine=dev".to_string()));
-        assert!(a.contains(&"--bind=/home/nick".to_string()));
+        assert!(
+            !a.iter().any(|s| s.contains(":/home/")),
+            "no user binds in spec (daemon binds to /run/rustypods remain)"
+        );
         assert!(!a.contains(&"-x".to_string()));
+    }
+
+    #[test]
+    fn argv_binds() {
+        let mut s = spec(false, false);
+        s.binds = vec![
+            rustypods_proto::validate_bind("/home/nick").unwrap(),
+            rustypods_proto::validate_bind("/run/user/1000:ro").unwrap(),
+        ];
+        let a = argv(&s);
+        assert!(a.contains(&"--bind=/home/nick:/home/nick".to_string()));
+        assert!(a.contains(&"--bind-ro=/run/user/1000:/run/user/1000".to_string()));
     }
 
     #[test]

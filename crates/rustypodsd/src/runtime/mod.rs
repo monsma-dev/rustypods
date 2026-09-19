@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 pub use nspawn::SystemdNspawn;
 use crate::state::LimitsSpec;
+use rustypods_proto::BindSpec;
 
 /// Everything an engine needs to boot one pod.
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct StartSpec {
     pub shm_dir: PathBuf,
     /// "hostPort:podPort" — engine decides the netns strategy.
     pub ports: Vec<String>,
+    /// User-configured bind mounts (validated BindSpec).
+    pub binds: Vec<BindSpec>,
     /// Stack members join this pre-made netns instead of getting a veth.
     pub netns: Option<PathBuf>,
     /// Console output is appended here.

@@ -155,6 +155,9 @@ pub struct PodMeta {
     /// rustypods-<stack>, joined via nspawn --network-namespace-path.
     #[serde(default)]
     pub stack: String,
+    /// "host[:pod][:ro]" bind mounts, applied at start.
+    #[serde(default)]
+    pub binds: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -313,6 +316,7 @@ fn migrate_json(data_dir: &Path) {
             ports: vec![],
             net_index: 0,
             stack: String::new(),
+            binds: vec![],
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");

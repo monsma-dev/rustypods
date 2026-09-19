@@ -78,6 +78,8 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         storage_max_bytes: m.storage_max_bytes,
         ports: m.ports.clone(),
         stack: m.stack.clone(),
+        binds: m.binds.clone(),
+        private_users: m.private_users,
     }
 }
 
@@ -100,6 +102,27 @@ impl Svc {
 
     fn pod_rootfs(&self, name: &str) -> std::path::PathBuf {
         self.cfg.pods_dir().join(name)
+    }
+
+    /// The `create --desktop` preset: the user's home + /tmp rw, the runtime
+    /// dir and GPU ro. Home/uid come from /etc/passwd for cfg.allowed_uid.
+    fn desktop_binds(&self) -> Result<Vec<String>, Status> {
+        let uid = self.cfg.allowed_uid;
+        let passwd = std::fs::read_to_string("/etc/passwd").map_err(int)?;
+        let home = passwd.lines().find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 6 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[5].to_string())
+        });
+        let Some(home) = home else {
+            return Err(Status::failed_precondition(format!(
+                "no /etc/passwd entry for uid {uid}"
+            )));
+        };
+        let mut v = vec![home, "/tmp".into(), format!("/run/user/{uid}:ro")];
+        if Path::new("/dev/dri").exists() {
+            v.push("/dev/dri:ro".into());
+        }
+        Ok(v)
     }
 
     /// <data>/snapshots/<pod>/ — one subvolume per commit.
@@ -266,6 +289,17 @@ impl PodControl for Svc {
         for p in &req.ports {
             proto::validate_port(p).map_err(bad)?;
         }
+        for b in &req.binds {
+            proto::validate_bind(b).map_err(bad)?;
+        }
+        let mut binds = req.binds.clone();
+        if req.desktop {
+            for d in self.desktop_binds()? {
+                if !binds.contains(&d) {
+                    binds.push(d);
+                }
+            }
+        }
         self.storage.clone_rootfs(&img_dir, &dest).map_err(int)?;
         let meta = PodMeta {
             name: name.clone(),
@@ -273,12 +307,15 @@ impl PodControl for Svc {
             created_unix: state::now_unix(),
             limits: LimitsSpec::default(),
             ephemeral: false,
-            private_users: false,
+            // userns on by default; desktop pods share the home dir and need
+            // host-uid identity, so they opt out.
+            private_users: !req.desktop,
             started: false,
             storage_max_bytes: req.storage_max_bytes,
             ports: req.ports.clone(),
             net_index: 0,
             stack: String::new(),
+            binds,
         };
         let mut st = self.st.lock().await;
         st.pods.insert(name.clone(), meta.clone());
@@ -499,12 +536,19 @@ impl PodControl for Svc {
                             created_unix: state::now_unix(),
                             limits: sp.limits,
                             ephemeral: false,
+                            // Stacks join a pre-made netns via
+                            // --network-namespace-path; setns() needs
+                            // CAP_SYS_ADMIN in its owning userns
+                            // (init_user_ns), which a pick-userns child
+                            // never has — so stack members run without
+                            // userns. Standalone `create` pods do get it.
                             private_users: false,
                             started: false,
                             storage_max_bytes: sp.storage_max_bytes,
                             ports: sp.ports.clone(),
                             net_index: idx,
                             stack: def.name.clone(),
+                            binds: vec![],
                         };
                         st.pods.insert(pname.clone(), m.clone());
                         m
@@ -587,7 +631,10 @@ impl PodControl for Svc {
                 meta.limits = lim;
             }
             meta.ephemeral = req.ephemeral;
-            meta.private_users = req.private_users;
+            // Absent = keep the conf value (a bare `start` must not flip it).
+            if let Some(pu) = req.private_users {
+                meta.private_users = pu;
+            }
             if (!meta.ports.is_empty() || !meta.stack.is_empty()) && meta.net_index == 0 {
                 meta.net_index = next_idx;
             }
@@ -596,6 +643,19 @@ impl PodControl for Svc {
             m
         };
         let rootfs = self.pod_rootfs(&name);
+        // Resolve binds up front: nspawn's failure for a missing source is
+        // cryptic, so check existence (and re-validate hand-edited confs).
+        let mut binds = Vec::with_capacity(meta.binds.len());
+        for spec in &meta.binds {
+            let b = proto::validate_bind(spec).map_err(bad)?;
+            if !Path::new(&b.host).exists() {
+                return Err(Status::failed_precondition(format!(
+                    "bind source {} does not exist",
+                    b.host
+                )));
+            }
+            binds.push(b);
+        }
         let run_dir = proto::run_dir(&self.cfg.data_dir, &name);
         let shm_host = proto::shm_host_dir(&name);
         std::fs::create_dir_all(&run_dir).map_err(int)?;
@@ -650,6 +710,7 @@ impl PodControl for Svc {
             run_dir,
             shm_dir: shm_host,
             ports: meta.ports.clone(),
+            binds,
             netns,
             log: log.clone(),
         };
@@ -802,6 +863,11 @@ impl PodControl for Svc {
                 proto::validate_port(spec).map_err(bad)?;
             }
         }
+        if let Some(bl) = &req.binds {
+            for spec in &bl.binds {
+                proto::validate_bind(spec).map_err(bad)?;
+            }
+        }
         let ports_changed = req.ports.is_some();
         let meta = {
             let mut st = self.st.lock().await;
@@ -812,6 +878,10 @@ impl PodControl for Svc {
             m.storage_max_bytes = req.storage_max_bytes;
             if let Some(pm) = req.ports {
                 m.ports = pm.ports;
+            }
+            // Applied at the next start, not live.
+            if let Some(bl) = req.binds {
+                m.binds = bl.binds;
             }
             let m = m.clone();
             self.save_pod(&m).map_err(int)?;
@@ -941,17 +1011,18 @@ impl PodControl for Svc {
             None => return Err(Status::invalid_argument("empty exec stream")),
         };
         let name = proto::validate_name(&start.pod).map_err(bad)?.to_string();
-        {
+        let private_users = {
             let st = self.st.lock().await;
-            if !st.pods.contains_key(&name) {
+            let Some(m) = st.pods.get(&name) else {
                 return Err(Status::not_found(format!("pod {name} not found")));
-            }
-        }
+            };
+            m.private_users
+        };
         let Some(leader) = self.engine.running_pid(&name).await else {
             return Err(Status::failed_precondition(format!("pod {name} is not running")));
         };
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        crate::exec::run(start, &self.pod_rootfs(&name), leader, stream, tx)
+        crate::exec::run(start, &self.pod_rootfs(&name), leader, private_users, stream, tx)
             .await
             .map_err(int)?;
         Ok(Response::new(ReceiverStream::new(rx)))

@@ -570,6 +570,19 @@ function PodDetail({
             />
           </Group>
 
+          <Group title="Sandbox">
+            <Row
+              label="User namespace"
+              value={
+                pod.privateUsers ? "on (uid 0 ≠ host root)" : "off (shares host uids)"
+              }
+            />
+            <Row
+              label="Bind mounts"
+              value={pod.binds.length ? pod.binds.join(", ") : "none"}
+            />
+          </Group>
+
           <Group title="Port forwarding">
             {ports.length === 0 && (
               <p className="px-4 py-3 text-xs text-muted">

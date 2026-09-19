@@ -164,6 +164,10 @@ export interface Pod {
    * netns — they reach each other on 127.0.0.1, like K8s pod containers.
    */
   stack: string;
+  /** "host[:pod][:ro]" bind mounts, applied at start. */
+  binds: string[];
+  /** nspawn --private-users=pick: pod root is not host root. */
+  privateUsers: boolean;
 }
 
 export interface PodList {
@@ -182,6 +186,13 @@ export interface CreatePodRequest {
   image: string;
   storageMaxBytes: number;
   ports: string[];
+  /**
+   * Desktop preset: caller's home + /tmp rw, /run/user/<uid> + /dev/dri ro.
+   * Implies private_users = false (a shared home needs host-uid identity).
+   */
+  desktop: boolean;
+  /** "host[:pod][:ro]" bind mounts, applied at start. */
+  binds: string[];
 }
 
 export interface ClonePodRequest {
@@ -234,6 +245,11 @@ export interface PortMappings {
   ports: string[];
 }
 
+export interface BindList {
+  /** "host[:pod][:ro]" — full desired list, replaces current. */
+  binds: string[];
+}
+
 export interface UpdatePodConfigRequest {
   name: string;
   limits?:
@@ -245,7 +261,14 @@ export interface UpdatePodConfigRequest {
    */
   storageMaxBytes: number;
   /** Absent = keep current mappings; present (even empty) = replace + resync NAT. */
-  ports?: PortMappings | undefined;
+  ports?:
+    | PortMappings
+    | undefined;
+  /**
+   * Absent = keep current binds; present (even empty) = replace.
+   * Takes effect on the next pod start.
+   */
+  binds?: BindList | undefined;
 }
 
 export interface StartPodRequest {
@@ -258,8 +281,9 @@ export interface StartPodRequest {
   /**
    * Stronger isolation at the cost of host-uid identity (breaks shared
    * home-dir writes as `nick`). Maps to nspawn --private-users=pick.
+   * Absent = keep the conf value; present = override and persist.
    */
-  privateUsers: boolean;
+  privateUsers?: boolean | undefined;
 }
 
 /**
@@ -1597,6 +1621,8 @@ function createBasePod(): Pod {
     storageMaxBytes: 0,
     ports: [],
     stack: "",
+    binds: [],
+    privateUsers: false,
   };
 }
 
@@ -1634,6 +1660,12 @@ export const Pod: MessageFns<Pod> = {
     }
     if (message.stack !== "") {
       writer.uint32(90).string(message.stack);
+    }
+    for (const v of message.binds) {
+      writer.uint32(98).string(v!);
+    }
+    if (message.privateUsers !== false) {
+      writer.uint32(104).bool(message.privateUsers);
     }
     return writer;
   },
@@ -1739,6 +1771,22 @@ export const Pod: MessageFns<Pod> = {
             message.stack = reader.string();
             continue;
           }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.binds.push(reader.string());
+            continue;
+          }
+          case 13: {
+            if (tag !== 104) {
+              break;
+            }
+
+            message.privateUsers = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1776,6 +1824,12 @@ export const Pod: MessageFns<Pod> = {
         : 0,
       ports: globalThis.Array.isArray(object?.ports) ? object.ports.map((e: any) => globalThis.String(e)) : [],
       stack: isSet(object.stack) ? globalThis.String(object.stack) : "",
+      binds: globalThis.Array.isArray(object?.binds) ? object.binds.map((e: any) => globalThis.String(e)) : [],
+      privateUsers: isSet(object.privateUsers)
+        ? globalThis.Boolean(object.privateUsers)
+        : isSet(object.private_users)
+        ? globalThis.Boolean(object.private_users)
+        : false,
     };
   },
 
@@ -1814,6 +1868,12 @@ export const Pod: MessageFns<Pod> = {
     if (message.stack !== "") {
       obj.stack = message.stack;
     }
+    if (message.binds?.length) {
+      obj.binds = message.binds;
+    }
+    if (message.privateUsers !== false) {
+      obj.privateUsers = message.privateUsers;
+    }
     return obj;
   },
 
@@ -1835,6 +1895,8 @@ export const Pod: MessageFns<Pod> = {
     message.storageMaxBytes = object.storageMaxBytes ?? 0;
     message.ports = object.ports?.map((e) => e) || [];
     message.stack = object.stack ?? "";
+    message.binds = object.binds?.map((e) => e) || [];
+    message.privateUsers = object.privateUsers ?? false;
     return message;
   },
 };
@@ -2026,7 +2088,7 @@ export const ListPodsRequest: MessageFns<ListPodsRequest> = {
 };
 
 function createBaseCreatePodRequest(): CreatePodRequest {
-  return { name: "", image: "", storageMaxBytes: 0, ports: [] };
+  return { name: "", image: "", storageMaxBytes: 0, ports: [], desktop: false, binds: [] };
 }
 
 export const CreatePodRequest: MessageFns<CreatePodRequest> = {
@@ -2042,6 +2104,12 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     }
     for (const v of message.ports) {
       writer.uint32(34).string(v!);
+    }
+    if (message.desktop !== false) {
+      writer.uint32(40).bool(message.desktop);
+    }
+    for (const v of message.binds) {
+      writer.uint32(50).string(v!);
     }
     return writer;
   },
@@ -2091,6 +2159,22 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
             message.ports.push(reader.string());
             continue;
           }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.desktop = reader.bool();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.binds.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2113,6 +2197,8 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
         ? globalThis.Number(object.storage_max_bytes)
         : 0,
       ports: globalThis.Array.isArray(object?.ports) ? object.ports.map((e: any) => globalThis.String(e)) : [],
+      desktop: isSet(object.desktop) ? globalThis.Boolean(object.desktop) : false,
+      binds: globalThis.Array.isArray(object?.binds) ? object.binds.map((e: any) => globalThis.String(e)) : [],
     };
   },
 
@@ -2130,6 +2216,12 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     if (message.ports?.length) {
       obj.ports = message.ports;
     }
+    if (message.desktop !== false) {
+      obj.desktop = message.desktop;
+    }
+    if (message.binds?.length) {
+      obj.binds = message.binds;
+    }
     return obj;
   },
 
@@ -2142,6 +2234,8 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     message.image = object.image ?? "";
     message.storageMaxBytes = object.storageMaxBytes ?? 0;
     message.ports = object.ports?.map((e) => e) || [];
+    message.desktop = object.desktop ?? false;
+    message.binds = object.binds?.map((e) => e) || [];
     return message;
   },
 };
@@ -2913,8 +3007,75 @@ export const PortMappings: MessageFns<PortMappings> = {
   },
 };
 
+function createBaseBindList(): BindList {
+  return { binds: [] };
+}
+
+export const BindList: MessageFns<BindList> = {
+  encode(message: BindList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.binds) {
+      writer.uint32(10).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BindList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseBindList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.binds.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): BindList {
+    return { binds: globalThis.Array.isArray(object?.binds) ? object.binds.map((e: any) => globalThis.String(e)) : [] };
+  },
+
+  toJSON(message: BindList): unknown {
+    const obj: any = {};
+    if (message.binds?.length) {
+      obj.binds = message.binds;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<BindList>, I>>(base?: I): BindList {
+    return BindList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<BindList>, I>>(object: I): BindList {
+    const message = createBaseBindList();
+    message.binds = object.binds?.map((e) => e) || [];
+    return message;
+  },
+};
+
 function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
-  return { name: "", limits: undefined, storageMaxBytes: 0, ports: undefined };
+  return { name: "", limits: undefined, storageMaxBytes: 0, ports: undefined, binds: undefined };
 }
 
 export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
@@ -2930,6 +3091,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     }
     if (message.ports !== undefined) {
       PortMappings.encode(message.ports, writer.uint32(34).fork()).join();
+    }
+    if (message.binds !== undefined) {
+      BindList.encode(message.binds, writer.uint32(42).fork()).join();
     }
     return writer;
   },
@@ -2979,6 +3143,14 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
             message.ports = PortMappings.decode(reader, reader.uint32());
             continue;
           }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.binds = BindList.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3001,6 +3173,7 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
         ? globalThis.Number(object.storage_max_bytes)
         : 0,
       ports: isSet(object.ports) ? PortMappings.fromJSON(object.ports) : undefined,
+      binds: isSet(object.binds) ? BindList.fromJSON(object.binds) : undefined,
     };
   },
 
@@ -3018,6 +3191,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     if (message.ports !== undefined) {
       obj.ports = PortMappings.toJSON(message.ports);
     }
+    if (message.binds !== undefined) {
+      obj.binds = BindList.toJSON(message.binds);
+    }
     return obj;
   },
 
@@ -3034,12 +3210,15 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     message.ports = (object.ports !== undefined && object.ports !== null)
       ? PortMappings.fromPartial(object.ports)
       : undefined;
+    message.binds = (object.binds !== undefined && object.binds !== null)
+      ? BindList.fromPartial(object.binds)
+      : undefined;
     return message;
   },
 };
 
 function createBaseStartPodRequest(): StartPodRequest {
-  return { name: "", limits: undefined, ephemeral: false, privateUsers: false };
+  return { name: "", limits: undefined, ephemeral: false, privateUsers: undefined };
 }
 
 export const StartPodRequest: MessageFns<StartPodRequest> = {
@@ -3053,7 +3232,7 @@ export const StartPodRequest: MessageFns<StartPodRequest> = {
     if (message.ephemeral !== false) {
       writer.uint32(24).bool(message.ephemeral);
     }
-    if (message.privateUsers !== false) {
+    if (message.privateUsers !== undefined) {
       writer.uint32(32).bool(message.privateUsers);
     }
     return writer;
@@ -3125,7 +3304,7 @@ export const StartPodRequest: MessageFns<StartPodRequest> = {
         ? globalThis.Boolean(object.privateUsers)
         : isSet(object.private_users)
         ? globalThis.Boolean(object.private_users)
-        : false,
+        : undefined,
     };
   },
 
@@ -3140,7 +3319,7 @@ export const StartPodRequest: MessageFns<StartPodRequest> = {
     if (message.ephemeral !== false) {
       obj.ephemeral = message.ephemeral;
     }
-    if (message.privateUsers !== false) {
+    if (message.privateUsers !== undefined) {
       obj.privateUsers = message.privateUsers;
     }
     return obj;
@@ -3156,7 +3335,7 @@ export const StartPodRequest: MessageFns<StartPodRequest> = {
       ? Limits.fromPartial(object.limits)
       : undefined;
     message.ephemeral = object.ephemeral ?? false;
-    message.privateUsers = object.privateUsers ?? false;
+    message.privateUsers = object.privateUsers ?? undefined;
     return message;
   },
 };

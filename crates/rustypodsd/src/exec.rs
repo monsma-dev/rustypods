@@ -51,8 +51,48 @@ pub fn passwd_entry(rootfs: &Path, user: &str) -> Option<(u32, u32, String, Stri
     None
 }
 
-/// nsenter argv — pure, testable.
-pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<OsString>> {
+/// nspawn's default capability set (man systemd-nspawn --capability=) —
+/// exec'd processes get exactly these in the bounding set, no more. Notably
+/// absent: sys_module, net_admin, sys_rawio. No --no-new-privs: that would
+/// break su/sudo inside the pod.
+pub const NSPAWN_DEFAULT_CAPS: &[&str] = &[
+    "audit_control",
+    "audit_write",
+    "chown",
+    "dac_override",
+    "dac_read_search",
+    "fowner",
+    "fsetid",
+    "ipc_owner",
+    "kill",
+    "lease",
+    "linux_immutable",
+    "mknod",
+    "net_bind_service",
+    "net_broadcast",
+    "net_raw",
+    "setfcap",
+    "setgid",
+    "setpcap",
+    "setuid",
+    "sys_admin",
+    "sys_boot",
+    "sys_chroot",
+    "sys_nice",
+    "sys_ptrace",
+    "sys_resource",
+    "sys_tty_config",
+];
+
+/// nsenter argv — pure, testable. `private_users` mirrors the pod's conf:
+/// when the pod runs under --private-users=pick, exec must also enter its
+/// user namespace or it lands in the wrong uid view.
+pub fn exec_argv(
+    leader: u32,
+    rootfs: &Path,
+    start: &ExecStart,
+    private_users: bool,
+) -> Result<Vec<OsString>> {
     let (uid, gid, home, shell) = if start.user.is_empty() || start.user == "root" {
         (0u32, 0u32, "/root".to_string(), "/bin/sh".to_string())
     } else {
@@ -68,22 +108,31 @@ pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<Os
         "--ipc".into(),
         "--net".into(),
         "--pid".into(),
+    ];
+    if private_users {
+        a.push("--user".into());
+    }
+    a.extend([
         // Enter the pod's cgroup view and join the leader's cgroup atomically —
         // children inherit it at fork, so the in-pod agent counts exec'd work
         // and scope limits apply, with no host-side cgroup.procs race.
         "--cgroup".into(),
         "--join-cgroup".into(),
         "--".into(),
-    ];
+    ]);
+    // One setpriv for everyone: drop the bounding set to nspawn's default
+    // cap list (nsenter'd processes would otherwise carry host-root's full
+    // set), then drop to the target uid/gid when not root.
+    a.push("setpriv".into());
+    a.push(format!("--bounding-set=-all,+{}", NSPAWN_DEFAULT_CAPS.join(",+")).into());
     if uid != 0 {
         a.extend([
-            "setpriv".into(),
             format!("--reuid={uid}").into(),
             format!("--regid={gid}").into(),
             "--init-groups".into(),
-            "--".into(),
         ]);
     }
+    a.push("--".into());
     a.push("env".into());
     a.push(format!("HOME={home}").into());
     a.push(format!("USER={}", if start.user.is_empty() { "root" } else { &start.user }).into());
@@ -170,10 +219,11 @@ pub async fn run(
     start: ExecStart,
     rootfs: &Path,
     leader: u32,
+    private_users: bool,
     inbound: Streaming<ExecChunk>,
     tx: Tx,
 ) -> Result<()> {
-    let argv = exec_argv(leader, rootfs, &start)?;
+    let argv = exec_argv(leader, rootfs, &start, private_users)?;
     if start.tty {
         run_tty(&argv, &start, inbound, tx).await
     } else {
@@ -362,28 +412,44 @@ mod tests {
 
     #[test]
     fn argv_root_cmd() {
-        let a = exec_argv(42, Path::new("/nonexistent"), &start("root", &["echo", "hi"])).unwrap();
+        let a = exec_argv(42, Path::new("/nonexistent"), &start("root", &["echo", "hi"]), false)
+            .unwrap();
         let s: Vec<&str> = a.iter().map(|o| o.to_str().unwrap()).collect();
         assert!(s.starts_with(&[
             "nsenter", "--target", "42", "--mount", "--uts", "--ipc", "--net", "--pid",
             "--cgroup", "--join-cgroup", "--"
         ]));
-        assert!(!s.iter().any(|x| *x == "setpriv"), "root gets no setpriv");
+        assert!(s.iter().any(|x| *x == "setpriv"), "everyone gets the cap drop");
+        assert!(!s.iter().any(|x| x.starts_with("--reuid")), "root gets no reuid");
         assert!(s.iter().any(|x| *x == "HOME=/root"));
         assert!(s.ends_with(&["echo", "hi"]));
+    }
+
+    #[test]
+    fn argv_cap_drop() {
+        let a = exec_argv(42, Path::new("/nonexistent"), &start("root", &["true"]), false).unwrap();
+        let s: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        let bset = s.iter().find(|x| x.starts_with("--bounding-set=")).unwrap();
+        assert!(bset.contains("+sys_admin"));
+        assert!(!bset.contains("sys_module"));
+        assert!(!bset.contains("net_admin"));
+        let pu = exec_argv(42, Path::new("/nonexistent"), &start("root", &["true"]), true).unwrap();
+        let ps: Vec<String> = pu.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(ps.iter().any(|x| x == "--user"));
+        assert!(!s.iter().any(|x| x == "--user"));
     }
 
     #[test]
     fn env_option_injection_rejected() {
         let mut s = start("root", &["true"]);
         s.env = vec!["TERM=xterm".into(), "-i".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_err());
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_err());
         s.env = vec!["-S x".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_err());
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_err());
         s.env = vec!["FOO".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_err());
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_err());
         s.env = vec!["A_1=b=c".into()];
-        assert!(exec_argv(42, Path::new("/nonexistent"), &s).is_ok());
+        assert!(exec_argv(42, Path::new("/nonexistent"), &s, false).is_ok());
     }
 
     #[test]
@@ -395,7 +461,7 @@ mod tests {
             "root:x:0:0::/root:/bin/bash\nnick:x:1000:1000::/home/nick:/bin/bash\n",
         )
         .unwrap();
-        let a = exec_argv(7, &dir, &start("nick", &[])).unwrap();
+        let a = exec_argv(7, &dir, &start("nick", &[]), false).unwrap();
         let s: Vec<&str> = a.iter().map(|o| o.to_str().unwrap()).collect();
         assert!(s.iter().any(|x| *x == "--reuid=1000"));
         assert!(s.iter().any(|x| *x == "HOME=/home/nick"));

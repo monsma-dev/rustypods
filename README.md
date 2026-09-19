@@ -65,8 +65,37 @@ rustypods destroy dev                     # also removes its snapshots
 rustypods --remote user@server ps         # manage a remote daemon over SSH (needs socat there)
 ```
 
-Handy flags: `start --ephemeral` (throwaway run, `-x`) and `start --private-users`
-(stronger isolation, but breaks the seamless `/home/nick` uid mapping).
+Handy flags: `start --ephemeral` (throwaway run, `-x`) and
+`start --no-private-users` (drops the user namespace; persisted to the conf).
+
+## Bind mounts & sandboxing
+
+Pods get no host paths by default. Add explicit binds at create or later —
+they're stored in the pod conf and applied at the next start:
+
+```bash
+rustypods create dev --image arch-base --bind /home/nick --bind /data:/mnt/data:ro
+rustypods config dev --bind /home/nick --bind /run/user/1000:ro   # replaces the list
+rustypods config dev --clear-binds                              # removes them all
+```
+
+Spec syntax is `host[:pod][:ro]` (pod path defaults to host). Anything under
+`/run`, `/etc`, `/usr`, `/boot`, `/proc`, `/sys`, `/dev` or
+`/var/lib/rustypods` is read-only only — a pod's init considers e.g.
+`/run/user/<uid>` its own and will `rm -rf` it during session cleanup.
+
+`create --desktop` adds the distrobox-parity preset (your home + /tmp rw,
+/run/user/<uid> + /dev/dri ro) and disables the user namespace — a shared
+home needs host-uid identity. All other new pods run with
+`--private-users=pick`: pod root is not host root (the first start chowns
+the rootfs once, cheap on btrfs). Exec'd processes additionally get their
+capability bounding set dropped to nspawn's default set.
+
+One exception: stack members (`rustypods apply`) run without a user
+namespace. They join a pre-made shared netns via
+`--network-namespace-path`, and `setns()` to it requires CAP_SYS_ADMIN in
+the netns's owning userns (init_user_ns) — a pick-userns child never has
+that, so the pod can't even boot. Standalone `create` pods do get userns.
 
 ## Storage quotas (btrfs qgroups)
 
@@ -185,9 +214,9 @@ Files are owned by uid 1000 so host and pod processes can map them as `nick`.
   SetUnitProperties, `rustypods reload` rereads a hand edit.
 - **Stop semantics**: `stop` = `KillMachine(name, "leader", SIGRTMIN+3)`
   (clean poweroff, empirically verified) → `TerminateMachine` as fallback.
-- **UIDs**: identity mapping (no `--private-users` by default) so
-  container-`nick` = host uid 1000 and `/home/nick` writes just work —
-  distrobox parity.
+- **UIDs**: `--private-users=pick` is the default for new pods (pod root ≠
+  host root). `--desktop` pods keep identity mapping so a bound
+  `/home/<user>` writes as the real uid — distrobox parity.
 - **Sanitize on import**: distrobox leftovers (`/etc/hostname`,
   `machine-id`, entrypoint bins, profile.d hooks) are wiped so `--boot`
   starts cleanly.

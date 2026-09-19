@@ -56,6 +56,13 @@ enum Cmd {
         /// Implies private networking (--network-veth), so no host-net parity.
         #[arg(long)]
         port: Vec<String>,
+        /// Desktop preset: your home + /tmp rw, /run/user/<uid> + /dev/dri ro.
+        /// Implies no user-namespace (shared home needs host-uid identity).
+        #[arg(long)]
+        desktop: bool,
+        /// Bind mount host[:pod][:ro]; repeatable. Applied at start.
+        #[arg(long)]
+        bind: Vec<String>,
     },
     /// Start a pod (nspawn --boot, machined registration).
     Start {
@@ -73,8 +80,12 @@ enum Cmd {
         #[arg(long)]
         ephemeral: bool,
         /// Stronger isolation; breaks shared-home uid mapping.
-        #[arg(long)]
+        /// Overrides the conf value (persisted).
+        #[arg(long, conflicts_with = "no_private_users")]
         private_users: bool,
+        /// Disable the user namespace for this and future starts.
+        #[arg(long)]
+        no_private_users: bool,
     },
     /// Stop a pod (SIGRTMIN+3 → terminate).
     Stop { name: String },
@@ -126,6 +137,13 @@ enum Cmd {
         /// Btrfs quota cap, e.g. 20G — "0" removes it (hot-applied).
         #[arg(long)]
         storage_max: Option<String>,
+        /// Bind mount host[:pod][:ro]; repeatable. Replaces the whole list —
+        /// applied at the next start.
+        #[arg(long, conflicts_with = "clear_binds")]
+        bind: Vec<String>,
+        /// Remove all bind mounts (applied at the next start).
+        #[arg(long)]
+        clear_binds: bool,
     },
     /// Reread a hand-edited <pod>.conf and apply it.
     Reload { name: String },
@@ -414,26 +432,33 @@ async fn main() -> Result<()> {
             connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
             println!("image {name} removed");
         }
-        Cmd::Create { name, image, storage_max, port } => {
+        Cmd::Create { name, image, storage_max, port, desktop, bind } => {
             let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
             if !port.is_empty() {
                 eprintln!("note: --port implies a private netns (--network-veth); the pod no longer shares host networking");
             }
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind })
                 .await?
                 .into_inner();
             print_pod(&p);
         }
-        Cmd::Start { name, memory_high, memory_max, cpu, ephemeral, private_users } => {
+        Cmd::Start { name, memory_high, memory_max, cpu, ephemeral, private_users, no_private_users } => {
+            let pu = if private_users {
+                Some(true)
+            } else if no_private_users {
+                Some(false)
+            } else {
+                None
+            };
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .start_pod(StartPodRequest {
                     name: name.clone(),
                     limits: limits_proto(memory_high.as_deref(), memory_max.as_deref(), cpu)?,
                     ephemeral,
-                    private_users,
+                    private_users: pu,
                 })
                 .await?
                 .into_inner();
@@ -452,7 +477,7 @@ async fn main() -> Result<()> {
                     name,
                     limits: None,
                     ephemeral: false,
-                    private_users: false,
+                    private_users: None,
                 })
                 .await?
                 .into_inner();
@@ -569,7 +594,7 @@ async fn main() -> Result<()> {
                                 name: m,
                                 limits: None,
                                 ephemeral: false,
-                                private_users: false,
+                                private_users: None,
                             })
                             .await?
                             .into_inner()
@@ -581,7 +606,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max } => {
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -611,12 +636,20 @@ async fn main() -> Result<()> {
                 .map(parse_bytes)
                 .transpose()?
                 .unwrap_or(cur.storage_max_bytes);
+            let binds = if clear_binds {
+                Some(BindList { binds: vec![] })
+            } else if !bind.is_empty() {
+                Some(BindList { binds: bind })
+            } else {
+                None
+            };
             let p = c
                 .update_pod_config(UpdatePodConfigRequest {
                     name,
                     limits: Some(lim),
                     storage_max_bytes,
                     ports: None,
+                    binds,
                 })
                 .await?
                 .into_inner();

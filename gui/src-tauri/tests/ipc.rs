@@ -60,6 +60,7 @@ fn pods_lifecycle_via_ipc() {
         .find(|p| p["name"] == "dev")
         .unwrap();
     assert_eq!(dev["state"], 3);
+    assert!(dev["binds"].is_array(), "dev.binds should be an array: {dev:?}");
 
     let started = invoke(&wv, "start_pod", json!({"name": "dev"})).expect("start failed");
     assert_eq!(started["state"], 2);

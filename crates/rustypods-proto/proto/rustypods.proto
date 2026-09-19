@@ -149,6 +149,10 @@ message Pod {
   // Stack this pod belongs to ("" = standalone). Stack members share one
   // netns — they reach each other on 127.0.0.1, like K8s pod containers.
   string stack = 11;
+  // "host[:pod][:ro]" bind mounts, applied at start.
+  repeated string binds = 12;
+  // nspawn --private-users=pick: pod root is not host root.
+  bool private_users = 13;
 }
 
 message PodList {
@@ -166,6 +170,11 @@ message CreatePodRequest {
   string image = 2;
   uint64 storage_max_bytes = 3;
   repeated string ports = 4;
+  // Desktop preset: caller's home + /tmp rw, /run/user/<uid> + /dev/dri ro.
+  // Implies private_users = false (a shared home needs host-uid identity).
+  bool desktop = 5;
+  // "host[:pod][:ro]" bind mounts, applied at start.
+  repeated string binds = 6;
 }
 
 message ClonePodRequest {
@@ -217,6 +226,11 @@ message PortMappings {
   repeated string ports = 1;
 }
 
+message BindList {
+  // "host[:pod][:ro]" — full desired list, replaces current.
+  repeated string binds = 1;
+}
+
 message UpdatePodConfigRequest {
   string name = 1;
   Limits limits = 2;
@@ -225,6 +239,9 @@ message UpdatePodConfigRequest {
   uint64 storage_max_bytes = 3;
   // Absent = keep current mappings; present (even empty) = replace + resync NAT.
   optional PortMappings ports = 4;
+  // Absent = keep current binds; present (even empty) = replace.
+  // Takes effect on the next pod start.
+  optional BindList binds = 5;
 }
 
 message StartPodRequest {
@@ -234,7 +251,8 @@ message StartPodRequest {
   bool ephemeral = 3;
   // Stronger isolation at the cost of host-uid identity (breaks shared
   // home-dir writes as `nick`). Maps to nspawn --private-users=pick.
-  bool private_users = 4;
+  // Absent = keep the conf value; present = override and persist.
+  optional bool private_users = 4;
 }
 
 // Bidi exec: first client chunk is `start`; then stdin/winsize flow in,

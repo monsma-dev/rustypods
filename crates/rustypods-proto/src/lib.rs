@@ -143,6 +143,68 @@ pub fn validate_port(spec: &str) -> anyhow::Result<()> {
     }
 }
 
+/// A parsed bind-mount spec (`host[:pod][:ro]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindSpec {
+    pub host: String,
+    pub pod: String,
+    pub ro: bool,
+}
+
+fn clean_abs_path(p: &str) -> bool {
+    p.starts_with('/')
+        && (p == "/" || !p.ends_with('/'))
+        && p.split('/')
+            .skip(1)
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+fn under(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Validate "host[:pod][:ro]": both paths absolute, no empty/dot components,
+/// no trailing slash. Host may not be exactly a system root ("/", "/proc",
+/// "/sys", "/dev", "/boot", "/usr", "/etc", "/var", "/var/lib", "/run").
+/// Read-write binds under /run, /var/lib/rustypods, /etc, /usr, /boot,
+/// /proc, /sys, /dev are refused — those are :ro-only (a pod's init system
+/// considers e.g. /run/user/<uid> "theirs" and rm -rf's it; see AGENTS.md).
+pub fn validate_bind(spec: &str) -> anyhow::Result<BindSpec> {
+    let mut parts: Vec<&str> = spec.split(':').collect();
+    let ro = parts.last() == Some(&"ro");
+    if ro {
+        parts.pop();
+    }
+    let bad = |spec: &str| anyhow::anyhow!("invalid bind '{spec}' — expected host[:pod][:ro], absolute paths");
+    let (host, pod) = match parts.as_slice() {
+        [h] => (*h, *h),
+        [h, p] => (*h, *p),
+        _ => return Err(bad(spec)),
+    };
+    if !clean_abs_path(host) || !clean_abs_path(pod) {
+        return Err(bad(spec));
+    }
+    const EXACT_DENY: &[&str] = &[
+        "/", "/proc", "/sys", "/dev", "/boot", "/usr", "/etc", "/var", "/var/lib", "/run",
+    ];
+    if EXACT_DENY.contains(&host) {
+        return Err(anyhow::anyhow!("invalid bind '{spec}' — host path {host} may not be bound wholesale"));
+    }
+    const RW_DENY: &[&str] = &[
+        "/run", "/var/lib/rustypods", "/etc", "/usr", "/boot", "/proc", "/sys", "/dev",
+    ];
+    if !ro && RW_DENY.iter().any(|p| under(host, p)) {
+        return Err(anyhow::anyhow!(
+            "invalid bind '{spec}' — {host} is read-only territory, add ':ro'"
+        ));
+    }
+    Ok(BindSpec {
+        host: host.to_string(),
+        pod: pod.to_string(),
+        ro,
+    })
+}
+
 /// Parse "10G", "512M", "1024" (bytes) into a byte count.
 pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
@@ -202,6 +264,22 @@ mod tests {
         assert!(validate_unix_user("nick").is_ok());
         assert!(validate_unix_user("root").is_ok());
         assert!(validate_unix_user("-u").is_err());
+    }
+
+    #[test]
+    fn bind_validation() {
+        let b = validate_bind("/home/nick").unwrap();
+        assert_eq!(b, BindSpec { host: "/home/nick".into(), pod: "/home/nick".into(), ro: false });
+        assert!(validate_bind("/tmp").is_ok());
+        assert!(validate_bind("/run/user/1000:ro").unwrap().ro);
+        assert!(validate_bind("/dev/dri:ro").unwrap().ro);
+        assert!(validate_bind("/run/user/1000").is_err());
+        assert!(validate_bind("/etc").is_err());
+        assert!(validate_bind("home/nick").is_err());
+        assert!(validate_bind("/a/../b").is_err());
+        assert!(validate_bind("/data:/mnt/data").is_ok());
+        assert!(validate_bind("/data:/mnt/data:ro").unwrap().ro);
+        assert!(validate_bind("/x:rel").is_err());
     }
 
     #[test]

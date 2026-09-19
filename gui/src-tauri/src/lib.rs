@@ -71,7 +71,7 @@ async fn start_pod(rt: State<'_, Rt>, name: String) -> Result<Pod, String> {
                 name,
                 limits: None,
                 ephemeral: false,
-                private_users: false,
+                private_users: None,
             })
             .await
             .map_err(|e| e.message().to_string())?
@@ -116,6 +116,7 @@ async fn update_pod_config(
                 }),
                 storage_max_bytes,
                 ports: ports.map(|ports| PortMappings { ports }),
+                binds: None,
             })
             .await
             .map_err(|e| e.message().to_string())?

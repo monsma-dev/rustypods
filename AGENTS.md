@@ -35,9 +35,11 @@ NOTE: always `set -o pipefail` when piping cargo output — a bare
 On 2026-09-19 a `--bind=/run/user/1000` (rw) let the pod's logind run
 `user-runtime-dir@1000` session cleanup, which `rm -rf`'d the bound dir —
 wiping the host's user bus + systemd socket (rootless podman dead until
-relogin). The bind is `--bind-ro=` now; socket connects work fine on ro
-mounts. Same class of caution applies to any host dir another init system
-considers "theirs" (`/run`, `/var/lib`, `/etc`).
+relogin). rw-binds under `/run` (and /etc, /usr, /boot, /proc, /sys, /dev,
+/var/lib/rustypods) are now refused outright by
+`rustypods_proto::validate_bind` — they're `:ro` only. Same class of
+caution applies to any host dir another init system considers "theirs"
+(`/run`, `/var/lib`, `/etc`).
 
 ## machined/systemd via zbus (no subprocesses)
 
@@ -95,6 +97,10 @@ rustypodsd does it itself:
 - nft scripts use `#` comments — `//` is a syntax error (broke a rebuild).
 - `pkexec` strips PATH to sbin-less dirs → always use absolute paths for
   nft/sysctl/tcpdump in scripts and one-off checks.
+- Hard-won: `--private-users=pick` is incompatible with
+  `--network-namespace-path` (setns to a foreign netns needs CAP_SYS_ADMIN
+  in init_user_ns) → stack members run with `private_users: false`;
+  standalone `create` pods get userns by default.
 - Privileged pod ports (<1024) need `--user root` inside the pod.
 
 ## Storage quotas (btrfs qgroups)
