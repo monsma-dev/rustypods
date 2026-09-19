@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import type { DaemonStatus, ImageInfo, PodInfo } from "./types";
 
@@ -11,79 +11,397 @@ const NAV: { id: View; label: string; icon: string }[] = [
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
+const GIB = 2 ** 30;
+
+const fmtGib = (bytes: number) =>
+  bytes === 0 ? "unlimited" : `${(bytes / GIB).toFixed(1)} GiB`;
+
+/* ---------- atoms ---------- */
+
 function StateBadge({ state }: { state: PodInfo["state"] }) {
   const cls =
     state === "running"
       ? "bg-ok/15 text-ok"
       : state === "failed"
         ? "bg-err/15 text-err"
-        : "bg-muted/15 text-muted";
+        : "bg-white/5 text-muted";
   return (
-    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${cls}`}>
+    <span className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${cls}`}>
       {state}
     </span>
   );
 }
 
-function PodCard({
-  pod,
-  busy,
-  onStart,
-  onStop,
+/** Libadwaita "inset list group": bordered card with divided rows. */
+function Group({
+  title,
+  children,
 }: {
-  pod: PodInfo;
-  busy: boolean;
-  onStart: () => void;
-  onStop: () => void;
+  title?: string;
+  children: React.ReactNode;
 }) {
-  const running = pod.state === "running";
-  const details = [
-    pod.memory_max !== "0B" && `max ${pod.memory_max}`,
-    pod.cpu_quota_percent > 0 && `cpu ${pod.cpu_quota_percent}%`,
-    pod.storage_max !== "0B" && `disk ${pod.storage_max}`,
-    pod.ports.length > 0 && `ports ${pod.ports.join(", ")}`,
-    pod.stack && `stack ${pod.stack}`,
-    pod.ephemeral && "ephemeral",
-  ].filter(Boolean);
   return (
-    <div className="rounded-xl border border-border bg-card p-4 transition-colors hover:bg-cardHover">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h3 className="truncate text-sm font-semibold">{pod.name}</h3>
-          <p className="truncate text-xs text-muted">{pod.image}</p>
-        </div>
-        <StateBadge state={pod.state} />
-      </div>
-      {details.length > 0 && (
-        <p className="mt-2 truncate text-xs text-muted">{details.join(" · ")}</p>
+    <section>
+      {title && (
+        <h3 className="mb-1.5 px-1 text-[11px] font-semibold uppercase tracking-wider text-muted">
+          {title}
+        </h3>
       )}
-      <div className="mt-3 flex items-center justify-between">
-        <span className="text-xs text-muted">
-          {running ? `pid ${pod.leader_pid}` : "—"}
-        </span>
-        {running ? (
-          <button
-            disabled={busy}
-            onClick={onStop}
-            className="rounded-lg bg-err/15 px-3 py-1 text-xs font-medium text-err transition-colors hover:bg-err/25 disabled:opacity-40"
-          >
-            Stop
-          </button>
-        ) : (
-          <button
-            disabled={busy}
-            onClick={onStart}
-            className="rounded-lg bg-accent px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-accentHover disabled:opacity-40"
-          >
-            Start
-          </button>
-        )}
+      <div className="divide-y divide-white/5 rounded-xl border border-white/10 bg-card">
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function Row({
+  label,
+  value,
+  mono = true,
+}: {
+  label: string;
+  value: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 px-4 py-2.5">
+      <span className="text-xs text-muted">{label}</span>
+      <span className={`truncate text-xs ${mono ? "font-mono" : ""}`}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+/** Slider + numeric input bound to a raw value (0 = unlimited). `scale` is raw
+ *  units per displayed unit (e.g. GiB→bytes); `step` the slider granularity. */
+function LimitSlider({
+  label,
+  hint,
+  value,
+  onChange,
+  max,
+  step,
+  scale,
+  unit,
+  fmt,
+}: {
+  label: string;
+  hint?: string;
+  value: number;
+  onChange: (v: number) => void;
+  max: number;
+  step: number;
+  scale: number;
+  unit: string;
+  fmt: (v: number) => string;
+}) {
+  return (
+    <div className="px-4 py-3">
+      <div className="mb-2 flex items-baseline justify-between">
+        <div>
+          <span className="text-xs font-medium">{label}</span>
+          {hint && <span className="ml-2 text-[10px] text-muted">{hint}</span>}
+        </div>
+        <div className="flex items-center gap-1.5">
+          <input
+            type="number"
+            min={0}
+            max={max / scale}
+            step={step / scale}
+            value={value / scale}
+            onChange={(e) =>
+              onChange(
+                Math.min(max, Math.max(0, Number(e.target.value) * scale))
+              )
+            }
+            className="w-16 rounded-md border border-white/10 bg-bg px-1.5 py-0.5 text-right font-mono text-xs focus:border-accent focus:outline-none"
+          />
+          <span className="w-16 text-[10px] text-muted">
+            {value === 0 ? "unlimited" : unit}
+          </span>
+        </div>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="slider w-full"
+        aria-label={label}
+      />
+      <div className="mt-0.5 flex justify-between text-[9px] text-muted">
+        <span>0</span>
+        <span>{fmt(max)}</span>
       </div>
     </div>
   );
 }
 
-function PodsView({ pods, act }: { pods: PodInfo[]; act: (f: () => Promise<unknown>) => void }) {
+/* ---------- pod detail slide-over ---------- */
+
+interface PortRow {
+  host: string;
+  pod: string;
+  proto: "tcp" | "udp";
+}
+
+const parsePort = (spec: string): PortRow => {
+  const [ports, proto] = spec.split("/");
+  const [host, pod] = ports.split(":");
+  return { host: host ?? "", pod: pod ?? "", proto: proto === "udp" ? "udp" : "tcp" };
+};
+
+const serializePort = (r: PortRow) =>
+  `${r.host}:${r.pod}${r.proto === "udp" ? "/udp" : ""}`;
+
+function PodDetail({
+  pod,
+  onClose,
+  act,
+}: {
+  pod: PodInfo;
+  onClose: () => void;
+  act: (f: () => Promise<unknown>) => void;
+}) {
+  const [memHigh, setMemHigh] = useState(pod.memory_high_bytes);
+  const [memMax, setMemMax] = useState(pod.memory_max_bytes);
+  const [cpu, setCpu] = useState(pod.cpu_quota_percent);
+  const [disk, setDisk] = useState(pod.storage_max_bytes);
+  const [ports, setPorts] = useState<PortRow[]>(pod.ports.map(parsePort));
+  const [newPort, setNewPort] = useState<PortRow>({ host: "", pod: "", proto: "tcp" });
+
+  const dirty =
+    memHigh !== pod.memory_high_bytes ||
+    memMax !== pod.memory_max_bytes ||
+    cpu !== pod.cpu_quota_percent ||
+    disk !== pod.storage_max_bytes ||
+    ports.map(serializePort).join(",") !== pod.ports.join(",");
+
+  const running = pod.state === "running";
+
+  const apply = () =>
+    act(() =>
+      api.updatePodConfig({
+        name: pod.name,
+        memory_high_bytes: memHigh,
+        memory_max_bytes: memMax,
+        cpu_quota_percent: cpu,
+        storage_max_bytes: disk,
+        ports: ports.map(serializePort),
+      })
+    );
+
+  const validNew =
+    /^\d+$/.test(newPort.host) &&
+    /^\d+$/.test(newPort.pod) &&
+    +newPort.host > 0 &&
+    +newPort.host <= 65535 &&
+    +newPort.pod > 0 &&
+    +newPort.pod <= 65535;
+
+  return (
+    <div className="fixed inset-0 z-40" onClick={onClose}>
+      <div className="absolute inset-0 bg-black/40" />
+      <aside
+        className="absolute right-0 top-0 flex h-full w-[400px] flex-col border-l border-white/10 bg-bg2 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* header */}
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <h2 className="truncate text-sm font-bold">{pod.name}</h2>
+              <StateBadge state={pod.state} />
+            </div>
+            <p className="mt-0.5 truncate text-[11px] text-muted">
+              {pod.image}
+              {running && ` · pid ${pod.leader_pid}`}
+              {pod.stack && ` · stack ${pod.stack}`}
+            </p>
+          </div>
+          <div className="flex items-center gap-1.5">
+            {running ? (
+              <button
+                onClick={() => act(() => api.stopPod(pod.name))}
+                className="rounded-lg bg-err/15 px-3 py-1.5 text-xs font-medium text-err transition-colors hover:bg-err/25"
+              >
+                Stop
+              </button>
+            ) : (
+              <button
+                onClick={() => act(() => api.startPod(pod.name))}
+                className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accentHover"
+              >
+                Start
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              className="rounded-lg px-2 py-1.5 text-sm text-muted transition-colors hover:bg-white/5"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+
+        {/* body */}
+        <div className="flex-1 space-y-5 overflow-y-auto p-4">
+          <Group title="Resources">
+            <LimitSlider
+              label="Memory high"
+              hint="throttle above this"
+              value={memHigh}
+              onChange={setMemHigh}
+              max={32 * GIB}
+              step={GIB / 2}
+              scale={GIB}
+              unit="GiB"
+              fmt={fmtGib}
+            />
+            <LimitSlider
+              label="Memory max"
+              hint="OOM-kill above this"
+              value={memMax}
+              onChange={setMemMax}
+              max={32 * GIB}
+              step={GIB / 2}
+              scale={GIB}
+              unit="GiB"
+              fmt={fmtGib}
+            />
+            <LimitSlider
+              label="CPU quota"
+              hint="100% = 1 core"
+              value={cpu}
+              onChange={setCpu}
+              max={800}
+              step={25}
+              scale={1}
+              unit="%"
+              fmt={(v) => `${v}%`}
+            />
+          </Group>
+
+          <Group title="Storage">
+            <LimitSlider
+              label="Disk quota"
+              hint="btrfs qgroup, hot-applied"
+              value={disk}
+              onChange={setDisk}
+              max={100 * GIB}
+              step={GIB}
+              scale={GIB}
+              unit="GiB"
+              fmt={fmtGib}
+            />
+          </Group>
+
+          <Group title="Port forwarding">
+            {ports.length === 0 && (
+              <p className="px-4 py-3 text-xs text-muted">
+                No published ports — traffic stays on the pod's own network.
+              </p>
+            )}
+            {ports.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 px-4 py-2">
+                <code className="flex-1 text-xs">
+                  host :{r.host} → pod :{r.pod}
+                  <span className="text-muted">/{r.proto}</span>
+                </code>
+                <button
+                  onClick={() => setPorts(ports.filter((_, j) => j !== i))}
+                  className="rounded-md px-2 py-0.5 text-xs text-muted transition-colors hover:bg-err/15 hover:text-err"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            <div className="flex items-center gap-1.5 px-4 py-2.5">
+              <input
+                placeholder="host"
+                value={newPort.host}
+                onChange={(e) => setNewPort({ ...newPort, host: e.target.value })}
+                className="w-16 rounded-md border border-white/10 bg-bg px-1.5 py-1 font-mono text-xs focus:border-accent focus:outline-none"
+              />
+              <span className="text-xs text-muted">→</span>
+              <input
+                placeholder="pod"
+                value={newPort.pod}
+                onChange={(e) => setNewPort({ ...newPort, pod: e.target.value })}
+                className="w-16 rounded-md border border-white/10 bg-bg px-1.5 py-1 font-mono text-xs focus:border-accent focus:outline-none"
+              />
+              <select
+                value={newPort.proto}
+                onChange={(e) =>
+                  setNewPort({ ...newPort, proto: e.target.value as "tcp" | "udp" })
+                }
+                className="rounded-md border border-white/10 bg-bg px-1.5 py-1 text-xs focus:border-accent focus:outline-none"
+              >
+                <option value="tcp">tcp</option>
+                <option value="udp">udp</option>
+              </select>
+              <button
+                disabled={!validNew}
+                onClick={() => {
+                  setPorts([...ports, newPort]);
+                  setNewPort({ host: "", pod: "", proto: "tcp" });
+                }}
+                className="ml-auto rounded-lg bg-white/10 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-white/15 disabled:opacity-40"
+              >
+                Add
+              </button>
+            </div>
+          </Group>
+        </div>
+
+        {/* footer */}
+        <div className="flex items-center justify-between border-t border-white/10 px-4 py-3">
+          <span className="text-[11px] text-muted">
+            {dirty ? "Unsaved changes" : "Applied live — no restart needed"}
+          </span>
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                setMemHigh(pod.memory_high_bytes);
+                setMemMax(pod.memory_max_bytes);
+                setCpu(pod.cpu_quota_percent);
+                setDisk(pod.storage_max_bytes);
+                setPorts(pod.ports.map(parsePort));
+              }}
+              disabled={!dirty}
+              className="rounded-lg px-3 py-1.5 text-xs text-muted transition-colors hover:bg-white/5 disabled:opacity-40"
+            >
+              Reset
+            </button>
+            <button
+              onClick={apply}
+              disabled={!dirty}
+              className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accentHover disabled:opacity-40"
+            >
+              Apply
+            </button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+/* ---------- views ---------- */
+
+function PodsView({
+  pods,
+  act,
+  onOpen,
+}: {
+  pods: PodInfo[];
+  act: (f: () => Promise<unknown>) => void;
+  onOpen: (p: PodInfo) => void;
+}) {
   if (pods.length === 0) {
     return (
       <p className="mt-10 text-center text-sm text-muted">
@@ -92,21 +410,93 @@ function PodsView({ pods, act }: { pods: PodInfo[]; act: (f: () => Promise<unkno
     );
   }
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
-      {pods.map((p) => (
-        <PodCard
-          key={p.name}
-          pod={p}
-          busy={false}
-          onStart={() => act(() => api.startPod(p.name))}
-          onStop={() => act(() => api.stopPod(p.name))}
-        />
-      ))}
+    <div className="overflow-hidden rounded-xl border border-white/10 bg-card">
+      <table className="w-full text-left text-[13px]">
+        <thead className="border-b border-white/10 bg-white/[0.03] text-[11px] uppercase tracking-wider text-muted">
+          <tr>
+            <th className="px-4 py-2 font-medium">Pod</th>
+            <th className="px-3 py-2 font-medium">Status</th>
+            <th className="px-3 py-2 font-medium">Limits</th>
+            <th className="px-3 py-2 font-medium">Ports</th>
+            <th className="px-3 py-2 text-right font-medium">Actions</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-white/5">
+          {pods.map((p) => {
+            const running = p.state === "running";
+            const limits = [
+              p.memory_max_bytes > 0 && `≤${p.memory_max}`,
+              p.cpu_quota_percent > 0 && `${p.cpu_quota_percent}% cpu`,
+              p.storage_max_bytes > 0 && `${p.storage_max} disk`,
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            return (
+              <tr
+                key={p.name}
+                onClick={() => onOpen(p)}
+                className="cursor-pointer transition-colors hover:bg-white/[0.04]"
+              >
+                <td className="px-4 py-2.5">
+                  <div className="font-medium">{p.name}</div>
+                  <div className="text-[11px] text-muted">
+                    {p.image}
+                    {p.stack && ` · ${p.stack}`}
+                  </div>
+                </td>
+                <td className="px-3 py-2.5">
+                  <StateBadge state={p.state} />
+                  {running && (
+                    <span className="ml-2 font-mono text-[11px] text-muted">
+                      {p.leader_pid}
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2.5 text-xs text-muted">
+                  {limits || "—"}
+                </td>
+                <td className="px-3 py-2.5 font-mono text-xs text-muted">
+                  {p.ports.join(", ") || "—"}
+                </td>
+                <td className="px-3 py-2.5 text-right">
+                  {running ? (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        act(() => api.stopPod(p.name));
+                      }}
+                      className="rounded-lg bg-err/15 px-2.5 py-1 text-xs font-medium text-err transition-colors hover:bg-err/25"
+                    >
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        act(() => api.startPod(p.name));
+                      }}
+                      className="rounded-lg bg-accent px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-accentHover"
+                    >
+                      Start
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-function StacksView({ pods }: { pods: PodInfo[] }) {
+function StacksView({
+  pods,
+  onOpen,
+}: {
+  pods: PodInfo[];
+  onOpen: (p: PodInfo) => void;
+}) {
   const groups = new Map<string, PodInfo[]>();
   for (const p of pods.filter((p) => p.stack)) {
     groups.set(p.stack, [...(groups.get(p.stack) ?? []), p]);
@@ -121,19 +511,23 @@ function StacksView({ pods }: { pods: PodInfo[] }) {
   return (
     <div className="space-y-4">
       {[...groups.entries()].map(([stack, members]) => (
-        <div key={stack} className="rounded-xl border border-border bg-card p-4">
-          <h3 className="mb-2 text-sm font-semibold">
-            {stack} <span className="text-xs font-normal text-muted">shared netns · {members.length} pods</span>
-          </h3>
-          <div className="flex flex-wrap gap-2">
-            {members.map((p) => (
-              <div key={p.name} className="flex items-center gap-2 rounded-lg bg-bg2 px-3 py-1.5 text-xs">
-                <span>{p.name}</span>
+        <Group key={stack} title={`${stack} · shared netns`}>
+          {members.map((p) => (
+            <button
+              key={p.name}
+              onClick={() => onOpen(p)}
+              className="flex w-full items-center justify-between px-4 py-2.5 text-left transition-colors hover:bg-white/[0.04]"
+            >
+              <span className="text-[13px] font-medium">{p.name}</span>
+              <span className="flex items-center gap-3">
+                <span className="font-mono text-[11px] text-muted">
+                  {p.ports.join(", ")}
+                </span>
                 <StateBadge state={p.state} />
-              </div>
-            ))}
-          </div>
-        </div>
+              </span>
+            </button>
+          ))}
+        </Group>
       ))}
     </div>
   );
@@ -141,89 +535,141 @@ function StacksView({ pods }: { pods: PodInfo[] }) {
 
 function ImagesView({ images }: { images: ImageInfo[] }) {
   if (images.length === 0) {
-    return <p className="mt-10 text-center text-sm text-muted">No images — <code>rustypods import --from-distrobox …</code></p>;
+    return (
+      <p className="mt-10 text-center text-sm text-muted">
+        No images — <code>rustypods import --from-distrobox …</code>
+      </p>
+    );
   }
   return (
-    <div className="overflow-hidden rounded-xl border border-border">
-      <table className="w-full text-left text-sm">
-        <thead className="bg-bg2 text-xs text-muted">
-          <tr>
-            <th className="px-4 py-2 font-medium">Name</th>
-            <th className="px-4 py-2 font-medium">Source</th>
-            <th className="px-4 py-2 font-medium">Path</th>
-          </tr>
-        </thead>
-        <tbody>
-          {images.map((i) => (
-            <tr key={i.name} className="border-t border-border">
-              <td className="px-4 py-2 font-medium">{i.name}</td>
-              <td className="px-4 py-2 text-muted">{i.source}</td>
-              <td className="px-4 py-2 font-mono text-xs text-muted">{i.path}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <Group>
+      {images.map((i) => (
+        <div key={i.name} className="flex items-center justify-between px-4 py-2.5">
+          <div>
+            <div className="text-[13px] font-medium">{i.name}</div>
+            <div className="font-mono text-[11px] text-muted">{i.path}</div>
+          </div>
+          <span className="text-xs text-muted">{i.source}</span>
+        </div>
+      ))}
+    </Group>
   );
 }
 
 function SettingsView({
   info,
-  lean,
-  setLean,
+  intervalMs,
+  setIntervalMs,
+  reduceMotion,
+  setReduceMotion,
 }: {
   info: DaemonStatus | null;
-  lean: boolean;
-  setLean: (v: boolean) => void;
+  intervalMs: number;
+  setIntervalMs: (v: number) => void;
+  reduceMotion: boolean;
+  setReduceMotion: (v: boolean) => void;
 }) {
   return (
-    <div className="max-w-lg space-y-4">
-      <div className="rounded-xl border border-border bg-card p-4">
-        <h3 className="mb-3 text-sm font-semibold">Daemon</h3>
+    <div className="max-w-xl space-y-5">
+      <Group title="Daemon">
         {info ? (
-          <dl className="grid grid-cols-2 gap-y-1 text-xs">
-            <dt className="text-muted">version</dt><dd className="font-mono">{info.version}</dd>
-            <dt className="text-muted">socket</dt><dd className="font-mono truncate">{info.socket_path}</dd>
-            <dt className="text-muted">engine</dt><dd className="font-mono">{info.runtime_engine}</dd>
-            <dt className="text-muted">storage</dt><dd className="font-mono">{info.storage_driver}</dd>
-            <dt className="text-muted">machined</dt><dd className="font-mono">{String(info.machined)}</dd>
-          </dl>
+          <>
+            <Row label="Version" value={info.version} />
+            <Row label="Socket" value={info.socket_path} />
+            <Row label="Data dir" value={info.data_dir} />
+            <Row label="Runtime engine" value={info.runtime_engine} />
+            <Row label="machined" value={String(info.machined)} />
+          </>
         ) : (
-          <p className="text-xs text-muted">daemon unreachable</p>
+          <p className="px-4 py-3 text-xs text-muted">daemon unreachable</p>
         )}
-      </div>
-      <div className="rounded-xl border border-border bg-card p-4">
-        <label className="flex cursor-pointer items-center justify-between">
+      </Group>
+
+      <Group title="Interface">
+        <div className="flex items-center justify-between px-4 py-3">
           <div>
-            <h3 className="text-sm font-semibold">Lean mode</h3>
-            <p className="text-xs text-muted">
-              Raspberry-Pi mode: 5s polling, no animations.
-            </p>
+            <div className="text-[13px] font-medium">Refresh interval</div>
+            <div className="text-[11px] text-muted">
+              How often pod state is polled. Higher = lighter on slow hardware.
+            </div>
+          </div>
+          <select
+            value={intervalMs}
+            onChange={(e) => setIntervalMs(Number(e.target.value))}
+            className="rounded-lg border border-white/10 bg-bg px-2 py-1 text-xs focus:border-accent focus:outline-none"
+          >
+            <option value={1000}>1 s</option>
+            <option value={2000}>2 s</option>
+            <option value={5000}>5 s</option>
+            <option value={10000}>10 s</option>
+          </select>
+        </div>
+        <label className="flex cursor-pointer items-center justify-between px-4 py-3">
+          <div>
+            <div className="text-[13px] font-medium">Reduce motion</div>
+            <div className="text-[11px] text-muted">
+              Disable animations — recommended on Raspberry Pi.
+            </div>
           </div>
           <input
             type="checkbox"
-            checked={lean}
-            onChange={(e) => setLean(e.target.checked)}
+            checked={reduceMotion}
+            onChange={(e) => setReduceMotion(e.target.checked)}
             className="h-5 w-9 cursor-pointer accent-accent"
           />
         </label>
-      </div>
+      </Group>
+
+      <Group title="Storage">
+        <Row label="Driver" value={info?.storage_driver ?? "—"} />
+        <Row
+          label="Quotas"
+          value={
+            info?.storage_driver === "btrfs"
+              ? "btrfs qgroups — hot-applied"
+              : "unavailable (non-btrfs)"
+          }
+          mono={false}
+        />
+        <Row
+          label="Snapshots"
+          value={
+            info?.storage_driver === "btrfs"
+              ? "instant CoW (commit / rollback)"
+              : "reflink copy fallback"
+          }
+          mono={false}
+        />
+      </Group>
     </div>
   );
 }
 
+/* ---------- app ---------- */
+
 export default function App() {
-  const [view, setView] = useState<View>("pods");
+  const [view, setView] = useState<View>(() => {
+    const v = new URLSearchParams(location.search).get("view");
+    return v === "stacks" || v === "images" || v === "settings" ? v : "pods";
+  });
   const [pods, setPods] = useState<PodInfo[]>([]);
   const [images, setImages] = useState<ImageInfo[]>([]);
   const [info, setInfo] = useState<DaemonStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [lean, setLean] = useState(false);
+  const [intervalMs, setIntervalMs] = useState(2000);
+  const [reduceMotion, setReduceMotion] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState<string | null>(
+    () => new URLSearchParams(location.search).get("detail")
+  );
 
   const refresh = useCallback(async () => {
     try {
-      const [p, i, d] = await Promise.all([api.getPods(), api.getImages(), api.getDaemonInfo()]);
+      const [p, i, d] = await Promise.all([
+        api.getPods(),
+        api.getImages(),
+        api.getDaemonInfo(),
+      ]);
       setPods(p);
       setImages(i);
       setInfo(d);
@@ -235,9 +681,9 @@ export default function App() {
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, lean ? 5000 : 2000);
+    const t = setInterval(refresh, intervalMs);
     return () => clearInterval(t);
-  }, [refresh, lean]);
+  }, [refresh, intervalMs]);
 
   const act = useCallback(
     async (f: () => Promise<unknown>) => {
@@ -254,6 +700,11 @@ export default function App() {
     [refresh]
   );
 
+  const selectedPod = useMemo(
+    () => pods.find((p) => p.name === selected) ?? null,
+    [pods, selected]
+  );
+
   const titles: Record<View, string> = {
     pods: "Pods",
     stacks: "Stacks",
@@ -262,45 +713,89 @@ export default function App() {
   };
 
   return (
-    <div className={`flex h-screen ${lean ? "lean" : ""}`}>
-      <aside className="flex w-48 flex-col border-r border-border bg-bg2">
-        <div className="px-4 py-4">
-          <h1 className="text-base font-bold tracking-tight">RustyPods</h1>
-          <p className="text-[10px] text-muted">bare-metal pods</p>
+    <div className={`flex h-screen ${reduceMotion ? "lean" : ""}`}>
+      <aside className="flex w-52 flex-col border-r border-white/10 bg-bg2">
+        <div className="border-b border-white/10 px-4 py-3.5">
+          <h1 className="text-[15px] font-bold tracking-tight">RustyPods</h1>
+          <p className="text-[10px] text-muted">bare-metal pod engine</p>
         </div>
-        <nav className="flex-1 space-y-0.5 px-2">
+        <nav className="flex-1 space-y-0.5 p-2">
           {NAV.map((n) => (
             <button
               key={n.id}
               onClick={() => setView(n.id)}
-              className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors ${
-                view === n.id ? "bg-accent/15 text-accent" : "text-fg hover:bg-card"
+              className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${
+                view === n.id
+                  ? "bg-accent/15 font-medium text-accent"
+                  : "text-fg/80 hover:bg-white/5"
               }`}
             >
               <span className="w-4 text-center">{n.icon}</span>
               {n.label}
+              {n.id === "pods" && pods.length > 0 && (
+                <span className="ml-auto rounded-md bg-white/5 px-1.5 text-[10px] text-muted">
+                  {pods.length}
+                </span>
+              )}
             </button>
           ))}
         </nav>
-        <div className="px-4 py-3 text-[10px] text-muted">
-          {info ? `v${info.version} · ${info.storage_driver}` : "offline"}
+        <div className="border-t border-white/10 px-4 py-2.5 text-[10px] text-muted">
+          {info ? (
+            <span className="font-mono">
+              v{info.version} · {info.storage_driver}
+            </span>
+          ) : (
+            "daemon offline"
+          )}
         </div>
       </aside>
-      <main className="flex-1 overflow-y-auto p-6">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">{titles[view]}</h2>
-          {busy && <span className="text-xs text-muted">working…</span>}
-        </div>
-        {error && (
-          <div className="mb-4 rounded-xl border border-err/40 bg-err/10 px-4 py-2 text-xs text-err">
-            {error}
+
+      <main className="flex-1 overflow-y-auto">
+        <header className="sticky top-0 z-10 flex items-center justify-between border-b border-white/10 bg-bg/80 px-5 py-3 backdrop-blur">
+          <h2 className="text-[15px] font-semibold">{titles[view]}</h2>
+          <div className="flex items-center gap-3">
+            {busy && <span className="text-[11px] text-muted">working…</span>}
+            {info && (
+              <span
+                className={`h-2 w-2 rounded-full ${info.machined ? "bg-ok" : "bg-warn"}`}
+                title={info.machined ? "machined ok" : "machined degraded"}
+              />
+            )}
           </div>
-        )}
-        {view === "pods" && <PodsView pods={pods} act={act} />}
-        {view === "stacks" && <StacksView pods={pods} />}
-        {view === "images" && <ImagesView images={images} />}
-        {view === "settings" && <SettingsView info={info} lean={lean} setLean={setLean} />}
+        </header>
+        <div className="p-5">
+          {error && (
+            <div className="mb-4 rounded-xl border border-err/40 bg-err/10 px-4 py-2 text-xs text-err">
+              {error}
+            </div>
+          )}
+          {view === "pods" && (
+            <PodsView pods={pods} act={act} onOpen={(p) => setSelected(p.name)} />
+          )}
+          {view === "stacks" && (
+            <StacksView pods={pods} onOpen={(p) => setSelected(p.name)} />
+          )}
+          {view === "images" && <ImagesView images={images} />}
+          {view === "settings" && (
+            <SettingsView
+              info={info}
+              intervalMs={intervalMs}
+              setIntervalMs={setIntervalMs}
+              reduceMotion={reduceMotion}
+              setReduceMotion={setReduceMotion}
+            />
+          )}
+        </div>
       </main>
+
+      {selectedPod && (
+        <PodDetail
+          pod={selectedPod}
+          onClose={() => setSelected(null)}
+          act={act}
+        />
+      )}
     </div>
   );
 }

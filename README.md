@@ -207,10 +207,14 @@ npm run tauri dev     # vite + native window, needs the daemon running
 npm run build         # frontend only → gui/dist
 ```
 
-Commands: `get_pods`, `start_pod`, `stop_pod`, `get_images`,
-`get_daemon_info`. Views: Pods (cards + start/stop), Stacks (grouped by
-shared netns), Images, Settings (daemon info + **lean mode** — 5 s
-polling, all animations off, for Pi-class hardware).
+Commands: `get_pods`, `start_pod`, `stop_pod`, `update_pod_config`,
+`get_images`, `get_daemon_info`. Views: Pods (dense table, click a row
+for the detail panel), Stacks (grouped by shared netns), Images,
+Settings (daemon info, refresh interval, reduce-motion).
+
+The pod detail panel edits cgroup limits (memory high/max, CPU quota),
+the btrfs disk quota and port forwards via `UpdatePodConfig` — applied
+live, no restart. Screenshots in `docs/screenshots/`.
 
 End-to-end IPC test against a live daemon (uses `tauri::test`
 MockRuntime — no webview needed):

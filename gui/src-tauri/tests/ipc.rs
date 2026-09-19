@@ -64,6 +64,40 @@ fn pods_lifecycle_via_ipc() {
     assert_eq!(started["state"], "running");
     assert!(started["leader_pid"].as_u64().unwrap() > 0);
 
+    // Live config update: new limits + a port mapping, hot-applied.
+    let updated = invoke(
+        &wv,
+        "update_pod_config",
+        json!({
+            "name": "dev",
+            "memoryHighBytes": 8u64 << 30,
+            "memoryMaxBytes": 9u64 << 30,
+            "cpuQuotaPercent": 200,
+            "storageMaxBytes": 15u64 << 30,
+            "ports": ["18099:22/tcp"],
+        }),
+    )
+    .expect("update_pod_config failed");
+    assert_eq!(updated["memory_high_bytes"], 8u64 << 30);
+    assert_eq!(updated["cpu_quota_percent"], 200);
+    assert_eq!(updated["ports"], json!(["18099:22/tcp"]));
+
+    // Restore dev's original config.
+    let restored = invoke(
+        &wv,
+        "update_pod_config",
+        json!({
+            "name": "dev",
+            "memoryHighBytes": 10u64 << 30,
+            "memoryMaxBytes": 12u64 << 30,
+            "cpuQuotaPercent": 400,
+            "storageMaxBytes": 20u64 << 30,
+            "ports": Vec::<String>::new(),
+        }),
+    )
+    .expect("restore failed");
+    assert_eq!(restored["ports"], json!([]));
+
     let info = invoke(&wv, "get_daemon_info", json!({})).expect("ping failed");
     assert_eq!(info["storage_driver"], "btrfs");
 }

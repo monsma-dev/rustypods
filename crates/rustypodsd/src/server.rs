@@ -767,6 +767,12 @@ impl PodControl for Svc {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
         let lim = limits_from(req.limits);
+        if let Some(pm) = &req.ports {
+            for spec in &pm.ports {
+                validate_port(spec).map_err(bad)?;
+            }
+        }
+        let ports_changed = req.ports.is_some();
         let meta = {
             let mut st = self.st.lock().await;
             let Some(m) = st.pods.get_mut(&name) else {
@@ -774,6 +780,9 @@ impl PodControl for Svc {
             };
             m.limits = lim;
             m.storage_max_bytes = req.storage_max_bytes;
+            if let Some(pm) = req.ports {
+                m.ports = pm.ports;
+            }
             let m = m.clone();
             self.save_pod(&m).map_err(int)?;
             m
@@ -783,6 +792,9 @@ impl PodControl for Svc {
             self.engine.apply_limits(&name, &meta.limits).await.map_err(int)?;
         }
         self.apply_storage_cap(&meta).map_err(int)?;
+        if ports_changed {
+            self.sync_nat().await;
+        }
         let leader = self.engine.running_pid(&name).await;
         Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
     }

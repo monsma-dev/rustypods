@@ -12,3 +12,34 @@ body {
   transition: none !important;
   animation: none !important;
 }
+
+/* GNOME-ish range slider (WebKitGTK + Chromium). */
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.12);
+  outline: none;
+  cursor: pointer;
+}
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #3584e4;
+  border: 2px solid #1e1e24;
+  transition: transform 0.1s;
+}
+.slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+.slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #3584e4;
+  border: 2px solid #1e1e24;
+}

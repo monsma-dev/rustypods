@@ -6,8 +6,11 @@ export interface PodInfo {
   created_unix: number;
   memory_high: string;
   memory_max: string;
+  memory_high_bytes: number;
+  memory_max_bytes: number;
   cpu_quota_percent: number;
   storage_max: string;
+  storage_max_bytes: number;
   ports: string[];
   stack: string;
   ephemeral: boolean;

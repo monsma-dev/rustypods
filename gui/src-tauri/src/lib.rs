@@ -50,8 +50,11 @@ struct PodInfo {
     created_unix: u64,
     memory_high: String,
     memory_max: String,
+    memory_high_bytes: u64,
+    memory_max_bytes: u64,
     cpu_quota_percent: u32,
     storage_max: String,
+    storage_max_bytes: u64,
     ports: Vec<String>,
     stack: String,
     ephemeral: bool,
@@ -68,8 +71,11 @@ fn to_info(p: Pod) -> PodInfo {
         created_unix: p.created_unix,
         memory_high: fmt_bytes(lim.memory_high_bytes),
         memory_max: fmt_bytes(lim.memory_max_bytes),
+        memory_high_bytes: lim.memory_high_bytes,
+        memory_max_bytes: lim.memory_max_bytes,
         cpu_quota_percent: lim.cpu_quota_percent,
         storage_max: fmt_bytes(p.storage_max_bytes),
+        storage_max_bytes: p.storage_max_bytes,
         ports: p.ports,
         stack: p.stack,
         ephemeral: p.ephemeral,
@@ -112,6 +118,37 @@ async fn stop_pod(rt: State<'_, Rt>, name: String) -> Result<PodInfo, String> {
     call(&rt.0, |mut c| async move {
         let p = c
             .stop_pod(PodRef { name })
+            .await
+            .map_err(|e| e.message().to_string())?
+            .into_inner();
+        Ok(to_info(p))
+    })
+    .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn update_pod_config(
+    rt: State<'_, Rt>,
+    name: String,
+    memory_high_bytes: u64,
+    memory_max_bytes: u64,
+    cpu_quota_percent: u32,
+    storage_max_bytes: u64,
+    ports: Option<Vec<String>>,
+) -> Result<PodInfo, String> {
+    call(&rt.0, move |mut c| async move {
+        let p = c
+            .update_pod_config(UpdatePodConfigRequest {
+                name,
+                limits: Some(Limits {
+                    memory_high_bytes,
+                    memory_max_bytes,
+                    cpu_quota_percent,
+                }),
+                storage_max_bytes,
+                ports: ports.map(|ports| PortMappings { ports }),
+            })
             .await
             .map_err(|e| e.message().to_string())?
             .into_inner();
@@ -186,6 +223,7 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
         get_pods,
         start_pod,
         stop_pod,
+        update_pod_config,
         get_images,
         get_daemon_info,
     ])

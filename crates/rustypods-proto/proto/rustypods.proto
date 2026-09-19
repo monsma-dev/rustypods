@@ -212,12 +212,19 @@ message ApplyStackResponse {
   repeated Pod pods = 2;
 }
 
+message PortMappings {
+  // "hostPort:podPort[/tcp|/udp]" — full desired list, replaces current.
+  repeated string ports = 1;
+}
+
 message UpdatePodConfigRequest {
   string name = 1;
   Limits limits = 2;
   // Concrete value — the CLI resolves "flag absent = keep current" itself.
   // 0 = no cap. Hot-applied via btrfs qgroup on the pod rootfs.
   uint64 storage_max_bytes = 3;
+  // Absent = keep current mappings; present (even empty) = replace + resync NAT.
+  optional PortMappings ports = 4;
 }
 
 message StartPodRequest {
