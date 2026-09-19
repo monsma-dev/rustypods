@@ -1237,8 +1237,12 @@ impl PodControl for Svc {
                     .map(|s| s.success())
                     .unwrap_or(false);
             let spawned = if has_journal {
+                // `-o cat`: raw message text only — no timestamp/host/unit
+                // prefix. AI/agent consumers of the gRPC stream (and humans
+                // copying compiler errors) want the message, not journal
+                // chrome.
                 tokio::process::Command::new("journalctl")
-                    .args(["-M", &name, "-f", "-n", "100", "-o", "short", "--no-pager"])
+                    .args(["-M", &name, "-f", "-n", "100", "-o", "cat", "--no-pager"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
