@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
-import type { DaemonStatus, ImageInfo, PodInfo } from "./types";
+import type { DaemonStatus, ImageInfo, MetricSample, PodInfo } from "./types";
 
 type View = "pods" | "stacks" | "images" | "settings";
 
@@ -140,6 +140,184 @@ function LimitSlider({
   );
 }
 
+/* ---------- live metrics ---------- */
+
+/** Tiny SVG sparkline — one or more series, optional dashed limit markers. */
+function Spark({
+  series,
+  colors,
+  max,
+  marks = [],
+  h = 52,
+}: {
+  series: number[][];
+  colors: string[];
+  max: number;
+  marks?: { v: number; color: string }[];
+  h?: number;
+}) {
+  const w = 344;
+  const y = (v: number) => h - Math.min(1, v / max) * (h - 2) - 1;
+  const path = (data: number[]) =>
+    data
+      .map(
+        (v, i) =>
+          `${i === 0 ? "M" : "L"}${((i / Math.max(1, data.length - 1)) * w).toFixed(1)},${y(v).toFixed(1)}`
+      )
+      .join(" ");
+  return (
+    <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
+      {marks.map((m, i) => (
+        <line
+          key={i}
+          x1={0}
+          x2={w}
+          y1={y(m.v)}
+          y2={y(m.v)}
+          stroke={m.color}
+          strokeWidth={1}
+          strokeDasharray="4 3"
+          opacity={0.7}
+        />
+      ))}
+      {series.map((data, i) => (
+        <path
+          key={i}
+          d={path(data)}
+          fill="none"
+          stroke={colors[i]}
+          strokeWidth={1.5}
+          strokeLinejoin="round"
+        />
+      ))}
+    </svg>
+  );
+}
+
+const fmtBytesShort = (b: number) => {
+  if (b >= GIB) return `${(b / GIB).toFixed(1)}G`;
+  if (b >= 2 ** 20) return `${(b / 2 ** 20).toFixed(0)}M`;
+  return `${(b / 2 ** 10).toFixed(0)}K`;
+};
+
+function MetricsSection({ pod, lean }: { pod: PodInfo; lean: boolean }) {
+  const [samples, setSamples] = useState<MetricSample[]>([]);
+
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let dead = false;
+    api
+      .onMetrics(pod.name, (m) => {
+        if (!dead) setSamples((s) => [...s.slice(-59), m]);
+      })
+      .then((u) => (un = u));
+    api.watchMetrics(pod.name);
+    return () => {
+      dead = true;
+      un?.();
+      api.unwatchMetrics(pod.name);
+    };
+  }, [pod.name]);
+
+  const last = samples[samples.length - 1];
+  const noData = !last || (last.mem_bytes === 0 && last.ts_unix_ms === 0);
+  const peak = (f: (m: MetricSample) => number) =>
+    Math.max(1, ...samples.map(f));
+
+  return (
+    <Group title="Live metrics">
+      {noData ? (
+        <p className="px-4 py-3 text-xs text-muted">
+          No agent telemetry — the rustypods-agent reports only while the pod
+          runs.
+        </p>
+      ) : lean ? (
+        // Lean/RPi: text-only, no SVG work.
+        <>
+          <Row label="Memory" value={`${fmtBytesShort(last.mem_bytes)} used`} />
+          <Row label="CPU" value={`${last.cpu_pct.toFixed(0)}%`} />
+          <Row
+            label="PSI (mem / io / cpu)"
+            value={`${last.mem_psi_avg10.toFixed(1)} / ${last.io_psi_avg10.toFixed(1)} / ${last.cpu_psi_avg10.toFixed(1)}`}
+          />
+          <Row label="PIDs" value={String(last.pids)} />
+        </>
+      ) : (
+        <>
+          <div className="px-4 py-3">
+            <div className="mb-1 flex justify-between text-[11px]">
+              <span className="font-medium">Memory</span>
+              <span className="font-mono text-muted">
+                {fmtBytesShort(last.mem_bytes)}
+                {pod.memory_max_bytes > 0 && ` / ${pod.memory_max}`}
+              </span>
+            </div>
+            <Spark
+              series={[samples.map((m) => m.mem_bytes)]}
+              colors={["#3584e4"]}
+              max={Math.max(
+                pod.memory_max_bytes,
+                pod.memory_high_bytes,
+                peak((m) => m.mem_bytes) * 1.15
+              )}
+              marks={[
+                pod.memory_high_bytes > 0 && { v: pod.memory_high_bytes, color: "#f6d32d" },
+                pod.memory_max_bytes > 0 && { v: pod.memory_max_bytes, color: "#e01b24" },
+              ].filter(Boolean) as { v: number; color: string }[]}
+            />
+          </div>
+          <div className="px-4 py-3">
+            <div className="mb-1 flex justify-between text-[11px]">
+              <span className="font-medium">CPU</span>
+              <span className="font-mono text-muted">
+                {last.cpu_pct.toFixed(0)}%
+                {pod.cpu_quota_percent > 0 && ` / ${pod.cpu_quota_percent}%`}
+              </span>
+            </div>
+            <Spark
+              series={[samples.map((m) => m.cpu_pct)]}
+              colors={["#33d17a"]}
+              max={Math.max(
+                pod.cpu_quota_percent || 100,
+                peak((m) => m.cpu_pct) * 1.15
+              )}
+              marks={
+                pod.cpu_quota_percent > 0
+                  ? [{ v: pod.cpu_quota_percent, color: "#f6d32d" }]
+                  : []
+              }
+            />
+          </div>
+          <div className="px-4 py-3">
+            <div className="mb-1 flex justify-between text-[11px]">
+              <span className="font-medium">Pressure stall (avg10)</span>
+              <span className="flex gap-2 font-mono text-muted">
+                <span className="text-accent">mem {last.mem_psi_avg10.toFixed(1)}</span>
+                <span className="text-warn">io {last.io_psi_avg10.toFixed(1)}</span>
+                <span className="text-err">cpu {last.cpu_psi_avg10.toFixed(1)}</span>
+              </span>
+            </div>
+            <Spark
+              series={[
+                samples.map((m) => m.mem_psi_avg10),
+                samples.map((m) => m.io_psi_avg10),
+                samples.map((m) => m.cpu_psi_avg10),
+              ]}
+              colors={["#3584e4", "#f6d32d", "#e01b24"]}
+              max={Math.max(
+                10,
+                peak((m) => m.mem_psi_avg10),
+                peak((m) => m.io_psi_avg10),
+                peak((m) => m.cpu_psi_avg10)
+              )}
+            />
+          </div>
+        </>
+      )}
+    </Group>
+  );
+}
+
 /* ---------- pod detail slide-over ---------- */
 
 interface PortRow {
@@ -159,10 +337,12 @@ const serializePort = (r: PortRow) =>
 
 function PodDetail({
   pod,
+  lean,
   onClose,
   act,
 }: {
   pod: PodInfo;
+  lean: boolean;
   onClose: () => void;
   act: (f: () => Promise<unknown>) => void;
 }) {
@@ -250,6 +430,7 @@ function PodDetail({
 
         {/* body */}
         <div className="flex-1 space-y-5 overflow-y-auto p-4">
+          <MetricsSection pod={pod} lean={lean} />
           <Group title="Resources">
             <LimitSlider
               label="Memory high"
@@ -791,7 +972,9 @@ export default function App() {
 
       {selectedPod && (
         <PodDetail
+          key={selectedPod.name}
           pod={selectedPod}
+          lean={reduceMotion || intervalMs >= 5000}
           onClose={() => setSelected(null)}
           act={act}
         />

@@ -80,6 +80,7 @@ fn sample(prev: Option<(u64, u64)>) -> (Metric, (u64, u64)) {
             pids: cgroup_val("pids.current").unwrap_or(0),
             mem_psi_avg10: psi_some("/proc/pressure/memory"),
             io_psi_avg10: psi_some("/proc/pressure/io"),
+            cpu_psi_avg10: psi_some("/proc/pressure/cpu"),
         },
         (usage, now_ms() * 1000),
     )

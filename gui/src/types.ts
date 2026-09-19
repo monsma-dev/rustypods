@@ -23,6 +23,18 @@ export interface ImageInfo {
   created_unix: number;
 }
 
+export interface MetricSample {
+  pod: string;
+  ts_unix_ms: number;
+  mem_bytes: number;
+  mem_high_bytes: number;
+  cpu_pct: number;
+  pids: number;
+  mem_psi_avg10: number;
+  io_psi_avg10: number;
+  cpu_psi_avg10: number;
+}
+
 export interface DaemonStatus {
   version: string;
   socket_path: string;

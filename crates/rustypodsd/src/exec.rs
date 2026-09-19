@@ -9,7 +9,6 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use rustypods_proto::rpc::{exec_chunk::Kind, ExecChunk, ExecExit, ExecStart};
 use tokio::io::AsyncReadExt;
@@ -69,6 +68,11 @@ pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<Os
         "--ipc".into(),
         "--net".into(),
         "--pid".into(),
+        // Enter the pod's cgroup view and join the leader's cgroup atomically —
+        // children inherit it at fork, so the in-pod agent counts exec'd work
+        // and scope limits apply, with no host-side cgroup.procs race.
+        "--cgroup".into(),
+        "--join-cgroup".into(),
         "--".into(),
     ];
     if uid != 0 {
@@ -98,56 +102,6 @@ pub fn exec_argv(leader: u32, rootfs: &Path, start: &ExecStart) -> Result<Vec<Os
         a.extend(start.argv.iter().map(OsString::from));
     }
     Ok(a)
-}
-
-/// nsenter forks with -p: the spawned pid is the waiter, its child is the
-/// real payload in the pod pidns. Poll until the child shows up.
-async fn nsenter_child_pid(parent: u32) -> Option<u32> {
-    let f = format!("/proc/{parent}/task/{parent}/children");
-    for _ in 0..60 {
-        if let Ok(s) = std::fs::read_to_string(&f) {
-            if let Some(p) = s.split_whitespace().next() {
-                return p.parse().ok();
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    None
-}
-
-/// Move the payload into the pod scope as soon as it forks (decoupled from
-/// the io bridge). Fallback chain below handles the no-internal-process rule.
-fn spawn_cgroup_join(pod: String, nsenter_pid: u32) {
-    tokio::spawn(async move {
-        if let Some(child) = nsenter_child_pid(nsenter_pid).await {
-            join_pod_cgroup(&pod, child);
-        }
-    });
-}
-
-fn join_pod_cgroup(pod: &str, pid: u32) {
-    let base = format!("/sys/fs/cgroup/machine.slice/machine-{pod}.scope");
-    tracing::info!("exec: pid {pid} → {base}");
-    for procs in [
-        format!("{base}/cgroup.procs"),
-        format!("{base}/payload/cgroup.procs"),
-    ] {
-        match std::fs::write(&procs, pid.to_string()) {
-            Ok(()) => {
-                tracing::info!("exec: {pid} via {procs}");
-                return;
-            }
-            Err(e) => tracing::info!("exec: {procs}: {e}"),
-        }
-    }
-    // Delegated parents refuse procs (no-internal-process); own leaf works.
-    let leaf = format!("{base}/rustypods-exec");
-    match std::fs::create_dir_all(&leaf)
-        .and_then(|_| std::fs::write(format!("{leaf}/cgroup.procs"), pid.to_string()))
-    {
-        Ok(()) => tracing::info!("exec: {pid} via {leaf}"),
-        Err(e) => tracing::warn!("exec {pid} not moved into pod cgroup: {e}"),
-    }
 }
 
 fn set_winsize(fd: std::os::fd::RawFd, rows: u32, cols: u32) {
@@ -238,9 +192,6 @@ async fn run_tty(
     let mut cmd = tokio::process::Command::from(scmd);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("nsenter spawn")?;
-    if let Some(pid) = child.id() {
-        spawn_cgroup_join(start.pod.clone(), pid);
-    }
 
     let master_file = std::fs::File::from(master);
     let reader_file = master_file.try_clone()?;
@@ -308,7 +259,7 @@ async fn run_tty(
 
 async fn run_pipe(
     argv: &[OsString],
-    pod: String,
+    _pod: String,
     mut inbound: Streaming<ExecChunk>,
     tx: Tx,
 ) -> Result<()> {
@@ -321,9 +272,6 @@ async fn run_pipe(
     let mut cmd = tokio::process::Command::from(scmd);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("nsenter spawn")?;
-    if let Some(pid) = child.id() {
-        spawn_cgroup_join(pod, pid);
-    }
     let mut stdin = child.stdin.take().context("stdin")?;
     let mut stdout = child.stdout.take().context("stdout")?;
     let mut stderr = child.stderr.take().context("stderr")?;
@@ -402,7 +350,8 @@ mod tests {
         let a = exec_argv(42, Path::new("/nonexistent"), &start("root", &["echo", "hi"])).unwrap();
         let s: Vec<&str> = a.iter().map(|o| o.to_str().unwrap()).collect();
         assert!(s.starts_with(&[
-            "nsenter", "--target", "42", "--mount", "--uts", "--ipc", "--net", "--pid", "--"
+            "nsenter", "--target", "42", "--mount", "--uts", "--ipc", "--net", "--pid",
+            "--cgroup", "--join-cgroup", "--"
         ]));
         assert!(!s.iter().any(|x| *x == "setpriv"), "root gets no setpriv");
         assert!(s.iter().any(|x| *x == "HOME=/root"));

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DaemonStatus, ImageInfo, PodInfo } from "./types";
+import { listen } from "@tauri-apps/api/event";
+import type { DaemonStatus, ImageInfo, MetricSample, PodInfo } from "./types";
 
 // Outside the Tauri webview (plain `npm run dev` in a browser) there is no IPC
 // bridge — serve mock data so the UI stays demoable/testable.
@@ -130,6 +131,94 @@ export interface PodConfigUpdate {
   cpu_quota_percent: number;
   storage_max_bytes: number;
   ports?: string[];
+}
+
+// ---- live metrics (daemon stream → "pod-metrics" Tauri event) ----
+
+export const watchMetrics = async (name: string): Promise<void> => {
+  if (inTauri) {
+    await invoke("watch_metrics", { name });
+    return;
+  }
+  mockWatch(name);
+};
+
+export const unwatchMetrics = async (name: string): Promise<void> => {
+  if (inTauri) {
+    await invoke("unwatch_metrics", { name });
+    return;
+  }
+  mockUnwatch(name);
+};
+
+/** Subscribe to MetricSamples for one pod. Returns an unsubscribe fn. */
+export const onMetrics = async (
+  pod: string,
+  cb: (m: MetricSample) => void
+): Promise<() => void> => {
+  if (inTauri) {
+    const un = await listen<MetricSample>("pod-metrics", (e) => {
+      if (e.payload.pod === pod) cb(e.payload);
+    });
+    return un;
+  }
+  return mockSubscribe(pod, cb);
+};
+
+// --- mock metrics for browser dev ---
+
+const mockSubs = new Map<string, Set<(m: MetricSample) => void>>();
+let mockTimer: ReturnType<typeof setInterval> | null = null;
+let mockT = 0;
+
+function mockSample(pod: string, t: number, now: number): MetricSample | null {
+  const p = MOCK_PODS.find((p) => p.name === pod);
+  if (!p || p.state !== "running") return null;
+  const w = Math.sin(t / 6);
+  return {
+    pod,
+    ts_unix_ms: now,
+    mem_bytes: (4 + w * 1.5 + Math.random()) * 2 ** 30,
+    mem_high_bytes: p.memory_high_bytes,
+    cpu_pct: Math.max(0, 120 + w * 90 + Math.random() * 40),
+    pids: 42,
+    mem_psi_avg10: Math.max(0, 3 + w * 2 + Math.random()),
+    io_psi_avg10: Math.max(0, 1 + w + Math.random() * 0.5),
+    cpu_psi_avg10: Math.max(0, 5 + w * 3 + Math.random() * 1.5),
+  };
+}
+
+function mockEmit() {
+  mockT += 1;
+  for (const pod of mockSubs.keys()) {
+    const m = mockSample(pod, mockT, Date.now());
+    if (m) mockSubs.get(pod)?.forEach((cb) => cb(m));
+  }
+}
+
+function mockSubscribe(pod: string, cb: (m: MetricSample) => void) {
+  let set = mockSubs.get(pod);
+  if (!set) mockSubs.set(pod, (set = new Set()));
+  set.add(cb);
+  // Backfill ~40s of history so the sparkline has shape immediately.
+  for (let t = mockT - 20; t < mockT; t++) {
+    const m = mockSample(pod, t, Date.now() - (mockT - t) * 2000);
+    if (m) cb(m);
+  }
+  return () => set.delete(cb);
+}
+
+function mockWatch(pod: string) {
+  if (!mockTimer) mockTimer = setInterval(mockEmit, 2000);
+  void pod;
+}
+
+function mockUnwatch(pod: string) {
+  mockSubs.delete(pod);
+  if (mockSubs.size === 0 && mockTimer) {
+    clearInterval(mockTimer);
+    mockTimer = null;
+  }
 }
 
 export const updatePodConfig = async (u: PodConfigUpdate): Promise<PodInfo> => {

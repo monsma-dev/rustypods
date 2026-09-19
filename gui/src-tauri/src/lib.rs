@@ -1,11 +1,13 @@
 //! RustyPods Desktop backend — thin IPC bridge: React `invoke()` → gRPC over
 //! /run/rustypods/daemon.sock via the shared rustypods-client crate.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{Emitter, State};
 use tonic::transport::Channel;
 
 use rustypods_client::connect;
@@ -15,6 +17,10 @@ use rustypods_proto::{fmt_bytes, SOCKET_PATH};
 
 /// One tokio runtime for the app — Tauri commands spawn gRPC work on it.
 struct Rt(tokio::runtime::Runtime);
+
+/// Active PodMetrics subscriptions — pod name → stream task abort handle.
+#[derive(Default)]
+struct WatchMap(Mutex<HashMap<String, tokio::task::AbortHandle>>);
 
 async fn call<T, F, Fut>(rt: &tokio::runtime::Runtime, f: F) -> Result<T, String>
 where
@@ -186,6 +192,74 @@ async fn get_images(rt: State<'_, Rt>) -> Result<Vec<ImageInfo>, String> {
     .await
 }
 
+#[derive(Serialize, Clone)]
+struct MetricSample {
+    pod: String,
+    ts_unix_ms: u64,
+    mem_bytes: u64,
+    mem_high_bytes: u64,
+    cpu_pct: f64,
+    pids: u64,
+    mem_psi_avg10: f64,
+    io_psi_avg10: f64,
+    cpu_psi_avg10: f64,
+}
+
+/// Subscribe to a pod's live metric stream; each sample is emitted to the
+/// frontend as a `pod-metrics` event. Re-subscribing replaces the old task.
+#[tauri::command]
+async fn watch_metrics<R: tauri::Runtime>(
+    rt: State<'_, Rt>,
+    watches: State<'_, WatchMap>,
+    app: tauri::AppHandle<R>,
+    name: String,
+) -> Result<(), String> {
+    let pod = name.clone();
+    let task = rt.0.spawn(async move {
+        let Ok(mut c) = connect(PathBuf::from(SOCKET_PATH), None).await else {
+            return;
+        };
+        let Ok(mut s) = c
+            .pod_metrics(PodRef {
+                name: pod.clone(),
+            })
+            .await
+            .map(|r| r.into_inner())
+        else {
+            return;
+        };
+        while let Ok(Some(m)) = s.message().await {
+            let sample = MetricSample {
+                pod: pod.clone(),
+                ts_unix_ms: m.ts_unix_ms,
+                mem_bytes: m.mem_bytes,
+                mem_high_bytes: m.mem_high_bytes,
+                cpu_pct: m.cpu_pct,
+                pids: m.pids,
+                mem_psi_avg10: m.mem_psi_avg10,
+                io_psi_avg10: m.io_psi_avg10,
+                cpu_psi_avg10: m.cpu_psi_avg10,
+            };
+            if app.emit("pod-metrics", sample).is_err() {
+                break;
+            }
+        }
+    });
+    let mut w = watches.0.lock().unwrap();
+    if let Some(old) = w.insert(name, task.abort_handle()) {
+        old.abort();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn unwatch_metrics(watches: State<'_, WatchMap>, name: String) -> Result<(), String> {
+    if let Some(h) = watches.0.lock().unwrap().remove(&name) {
+        h.abort();
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct DaemonStatus {
     version: String,
@@ -219,14 +293,19 @@ async fn get_daemon_info(rt: State<'_, Rt>) -> Result<DaemonStatus, String> {
 /// Shared builder wiring — used by the desktop entry point and the IPC tests.
 pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    builder.manage(Rt(rt)).invoke_handler(tauri::generate_handler![
-        get_pods,
-        start_pod,
-        stop_pod,
-        update_pod_config,
-        get_images,
-        get_daemon_info,
-    ])
+    builder
+        .manage(Rt(rt))
+        .manage(WatchMap::default())
+        .invoke_handler(tauri::generate_handler![
+            get_pods,
+            start_pod,
+            stop_pod,
+            update_pod_config,
+            watch_metrics,
+            unwatch_metrics,
+            get_images,
+            get_daemon_info,
+        ])
 }
 
 pub fn run() {

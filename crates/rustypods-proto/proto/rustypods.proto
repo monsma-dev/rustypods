@@ -279,6 +279,7 @@ message Metric {
   uint64 pids = 5;
   double mem_psi_avg10 = 6;
   double io_psi_avg10 = 7;
+  double cpu_psi_avg10 = 8;
 }
 
 message LogLine {

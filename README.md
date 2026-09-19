@@ -214,7 +214,12 @@ Settings (daemon info, refresh interval, reduce-motion).
 
 The pod detail panel edits cgroup limits (memory high/max, CPU quota),
 the btrfs disk quota and port forwards via `UpdatePodConfig` — applied
-live, no restart. Screenshots in `docs/screenshots/`.
+live, no restart. While a pod runs, `watch_metrics` streams the in-pod
+agent's samples to the frontend as `pod-metrics` Tauri events: the
+panel renders 60-sample SVG sparklines for memory (with high/max limit
+lines), CPU vs quota, and PSI stall (mem/io/cpu). Reduce-motion or a
+≥5 s refresh interval falls back to text stats. Screenshots in
+`docs/screenshots/`.
 
 End-to-end IPC test against a live daemon (uses `tauri::test`
 MockRuntime — no webview needed):
