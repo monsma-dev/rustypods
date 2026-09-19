@@ -305,7 +305,7 @@ impl PodControl for Svc {
             name: name.clone(),
             image,
             created_unix: state::now_unix(),
-            limits: LimitsSpec::default(),
+            limits: limits_from(req.limits),
             ephemeral: false,
             // userns on by default; desktop pods share the home dir and need
             // host-uid identity, so they opt out.

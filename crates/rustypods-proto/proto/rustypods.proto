@@ -175,6 +175,9 @@ message CreatePodRequest {
   bool desktop = 5;
   // "host[:pod][:ro]" bind mounts, applied at start.
   repeated string binds = 6;
+  // Resource guardrails, persisted in the conf; 0 fields = unlimited.
+  // Applied to machine-<name>.scope on every start.
+  optional Limits limits = 7;
 }
 
 message ClonePodRequest {

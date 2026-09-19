@@ -439,7 +439,7 @@ async fn main() -> Result<()> {
             }
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind, limits: None })
                 .await?
                 .into_inner();
             print_pod(&p);

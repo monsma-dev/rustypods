@@ -103,3 +103,54 @@ fn pods_lifecycle_via_ipc() {
     let info = invoke(&wv, "get_daemon_info", json!({})).expect("ping failed");
     assert_eq!(info["storageDriver"], "btrfs");
 }
+
+/// Wizard round-trip: create_pod → start_pod → stop_pod → destroy_pod for a
+/// throwaway pod. Requires the daemon + an `arch-base` image; nspawn boot
+/// takes a few seconds.
+#[test]
+fn create_wizard_cycle_via_ipc() {
+    let wv = webview();
+
+    let created = invoke(
+        &wv,
+        "create_pod",
+        json!({
+            "name": "wiztest",
+            "image": "arch-base",
+            "memoryHighBytes": 512u64 << 20,
+            "memoryMaxBytes": 0,
+            "cpuQuotaPercent": 0,
+            "storageMaxBytes": 0,
+            "ports": Vec::<String>::new(),
+            "binds": Vec::<String>::new(),
+            "desktop": false,
+        }),
+    )
+    .expect("create_pod failed");
+    assert_eq!(created["name"], "wiztest");
+    assert_eq!(created["limits"]["memoryHighBytes"], 512u64 << 20);
+    // hermetic: desktop=false → private_users on
+    assert_eq!(created["privateUsers"], true);
+
+    let started = invoke(&wv, "start_pod", json!({"name": "wiztest"}))
+        .expect("start failed");
+    assert_eq!(started["state"], 2);
+    assert!(started["leaderPid"].as_u64().unwrap() > 0);
+
+    // start returns at machined registration — the pod's systemd is still
+    // booting. SIGRTMIN+3 mid-boot wedges systemd-shutdown (a hung
+    // (sd-chown) job even delays TerminateMachine's SIGKILL), so let the
+    // pod reach running state before exercising the stop path.
+    std::thread::sleep(std::time::Duration::from_secs(10));
+
+    let stopped = invoke(&wv, "stop_pod", json!({"name": "wiztest"}))
+        .expect("stop failed");
+    assert_eq!(stopped["state"], 3);
+
+    invoke(&wv, "destroy_pod", json!({"name": "wiztest"})).expect("destroy failed");
+    let pods = invoke(&wv, "get_pods", json!({})).unwrap();
+    assert!(
+        !pods.as_array().unwrap().iter().any(|p| p["name"] == "wiztest"),
+        "wiztest still listed: {pods:?}"
+    );
+}

@@ -6,6 +6,9 @@ Wants=systemd-machined.service
 
 [Service]
 ExecStart=/usr/local/bin/rustypodsd
+# Only the daemon's main pid belongs to systemd — on restart, leave the
+# nspawn pods (which live in this cgroup via machined scopes) alone.
+KillMode=process
 RuntimeDirectory=rustypods
 Restart=on-failure
 RestartSec=2

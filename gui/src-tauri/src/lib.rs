@@ -95,6 +95,17 @@ async fn stop_pod(rt: State<'_, Rt>, name: String) -> Result<Pod, String> {
 }
 
 #[tauri::command]
+async fn destroy_pod(rt: State<'_, Rt>, name: String) -> Result<(), String> {
+    call(&rt.0, |mut c| async move {
+        c.destroy_pod(PodRef { name })
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message().to_string())
+    })
+    .await
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn update_pod_config(
     rt: State<'_, Rt>,
@@ -117,6 +128,48 @@ async fn update_pod_config(
                 storage_max_bytes,
                 ports: ports.map(|ports| PortMappings { ports }),
                 binds: None,
+            })
+            .await
+            .map_err(|e| e.message().to_string())?
+            .into_inner();
+        Ok(with_limits(p))
+    })
+    .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn create_pod(
+    rt: State<'_, Rt>,
+    name: String,
+    image: String,
+    memory_high_bytes: u64,
+    memory_max_bytes: u64,
+    cpu_quota_percent: u32,
+    storage_max_bytes: u64,
+    ports: Vec<String>,
+    binds: Vec<String>,
+    desktop: bool,
+) -> Result<Pod, String> {
+    call(&rt.0, move |mut c| async move {
+        // Same convention as update_pod_config: limits are flattened to
+        // scalars on the IPC boundary; all-zero means "no guardrails" →
+        // leave the submessage absent.
+        let limits = (memory_high_bytes > 0 || memory_max_bytes > 0 || cpu_quota_percent > 0)
+            .then_some(Limits {
+                memory_high_bytes,
+                memory_max_bytes,
+                cpu_quota_percent,
+            });
+        let p = c
+            .create_pod(CreatePodRequest {
+                name,
+                image,
+                storage_max_bytes,
+                ports,
+                desktop,
+                binds,
+                limits,
             })
             .await
             .map_err(|e| e.message().to_string())?
@@ -215,8 +268,10 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
         .manage(WatchMap::default())
         .invoke_handler(tauri::generate_handler![
             get_pods,
+            create_pod,
             start_pod,
             stop_pod,
+            destroy_pod,
             update_pod_config,
             watch_metrics,
             unwatch_metrics,

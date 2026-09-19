@@ -140,13 +140,15 @@ pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Re
 }
 
 /// Clean shutdown (SIGRTMIN+3 → leader) → terminate → give up loudly.
+/// The poweroff grace is ~8s — long enough for systemd to unmount cleanly,
+/// short enough that `stop` doesn't stall a GUI click for 15s.
 pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
     if leader_pid(conn, name).await.is_none() {
         return Ok(());
     }
     let mgr = MachineManagerProxy::new(conn).await?;
     let _ = mgr.kill_machine(name, "leader", SIGRTMIN + 3).await;
-    for _ in 0..75 {
+    for _ in 0..40 {
         if leader_pid(conn, name).await.is_none() {
             return Ok(());
         }
@@ -154,7 +156,7 @@ pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
     }
     tracing::warn!("{name}: poweroff timeout — terminating");
     let _ = mgr.terminate_machine(name).await;
-    for _ in 0..25 {
+    for _ in 0..20 {
         if leader_pid(conn, name).await.is_none() {
             return Ok(());
         }

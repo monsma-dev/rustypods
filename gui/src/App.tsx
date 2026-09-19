@@ -674,6 +674,212 @@ function PodDetail({
   );
 }
 
+/* ---------- create pod wizard ---------- */
+
+function NewPodDialog({
+  images,
+  onClose,
+  onCreated,
+}: {
+  images: Image[];
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [image, setImage] = useState(images[0]?.name ?? "");
+  const [memHigh, setMemHigh] = useState(0);
+  const [memMax, setMemMax] = useState(0);
+  const [cpu, setCpu] = useState(0);
+  const [disk, setDisk] = useState(0);
+  const [desktop, setDesktop] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [deploying, setDeploying] = useState(false);
+
+  // Images may still be loading when the dialog opens (?newpod=1 deep link).
+  useEffect(() => {
+    if (!image && images.length > 0) setImage(images[0].name);
+  }, [images, image]);
+
+  const valid = name.trim().length > 0 && image.length > 0;
+
+  const deploy = async () => {
+    if (!valid || deploying) return;
+    setDeploying(true);
+    setErr(null);
+    try {
+      await api.createPod({
+        name: name.trim(),
+        image,
+        limits: {
+          memoryHighBytes: memHigh,
+          memoryMaxBytes: memMax,
+          cpuQuotaPercent: cpu,
+        },
+        storageMaxBytes: disk,
+        ports: [],
+        binds: [],
+        desktop,
+      });
+      // start_pod sends private_users: None — the create-time isolation
+      // choice is persisted in the pod conf and kept.
+      await api.startPod(name.trim());
+      onCreated();
+      onClose();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setDeploying(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-40" onClick={onClose}>
+      <div className="absolute inset-0 bg-black/40" />
+      <div
+        className="absolute left-1/2 top-1/2 flex max-h-[85vh] w-96 -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-white/10 bg-bg2 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <h2 className="text-sm font-bold">New Pod</h2>
+          <button
+            onClick={onClose}
+            className="rounded-lg px-2 py-1 text-sm text-muted transition-colors hover:bg-white/5"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="flex-1 space-y-5 overflow-y-auto p-4">
+          <div>
+            <label className="mb-1 block text-xs font-medium">Name</label>
+            <input
+              autoFocus
+              placeholder="my-pod"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="w-full rounded-md border border-white/10 bg-bg px-2.5 py-1.5 font-mono text-xs focus:border-accent focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium">Image</label>
+            <select
+              value={image}
+              onChange={(e) => setImage(e.target.value)}
+              className="w-full rounded-md border border-white/10 bg-bg px-2 py-1.5 text-xs focus:border-accent focus:outline-none"
+            >
+              {images.length === 0 && <option value="">(no images)</option>}
+              {images.map((i) => (
+                <option key={i.name} value={i.name}>
+                  {i.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="divide-y divide-white/5 rounded-xl border border-white/10 bg-card">
+            <LimitSlider
+              label="Memory high"
+              hint="throttle above this"
+              value={memHigh}
+              onChange={setMemHigh}
+              max={32 * GIB}
+              step={GIB / 2}
+              scale={GIB}
+              unit="GiB"
+              fmt={fmtGib}
+            />
+            <LimitSlider
+              label="Memory max"
+              hint="OOM-kill above this"
+              value={memMax}
+              onChange={setMemMax}
+              max={32 * GIB}
+              step={GIB / 2}
+              scale={GIB}
+              unit="GiB"
+              fmt={fmtGib}
+            />
+            <LimitSlider
+              label="CPU quota"
+              hint="100% = 1 core"
+              value={cpu}
+              onChange={setCpu}
+              max={800}
+              step={25}
+              scale={1}
+              unit="%"
+              fmt={(v) => `${v}%`}
+            />
+            <LimitSlider
+              label="Disk quota"
+              hint="btrfs qgroup"
+              value={disk}
+              onChange={setDisk}
+              max={100 * GIB}
+              step={GIB}
+              scale={GIB}
+              unit="GiB"
+              fmt={fmtGib}
+            />
+          </div>
+
+          <div>
+            <span className="text-xs font-medium">Isolation</span>
+            <div className="mt-1.5 grid grid-cols-2 gap-1 rounded-lg border border-white/10 bg-bg p-1">
+              {[
+                {
+                  v: false,
+                  title: "Hermetic",
+                  desc: "user namespace — pod root is not host root",
+                },
+                {
+                  v: true,
+                  title: "Desktop mode",
+                  desc: "mounts home + /tmp, shares host uids",
+                },
+              ].map((o) => (
+                <button
+                  key={o.title}
+                  onClick={() => setDesktop(o.v)}
+                  className={`rounded-md px-2.5 py-1.5 text-left transition-colors ${
+                    desktop === o.v
+                      ? "bg-accent/15 text-accent"
+                      : "text-fg/80 hover:bg-white/5"
+                  }`}
+                >
+                  <div className="text-xs font-medium">{o.title}</div>
+                  <div className="mt-0.5 text-[10px] leading-tight text-muted">
+                    {o.desc}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {err && <p className="text-xs text-err">{err}</p>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
+          <button
+            onClick={onClose}
+            className="rounded-lg px-3 py-1.5 text-xs text-muted transition-colors hover:bg-white/5"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={deploy}
+            disabled={!valid || deploying}
+            className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
+          >
+            {deploying ? "Deploying…" : "Deploy"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------- views ---------- */
 
 /** Tiny inline sparkline for datagrid cells (w=72 fixed). */
@@ -802,37 +1008,48 @@ function PodsView({
   pods,
   act,
   onOpen,
+  onNew,
 }: {
   pods: Pod[];
   act: (f: () => Promise<unknown>) => void;
   onOpen: (p: Pod) => void;
+  onNew: () => void;
 }) {
-  if (pods.length === 0) {
-    return (
-      <p className="mt-10 text-center text-xs text-muted">
-        No pods — create one with <code>rustypods create …</code>
-      </p>
-    );
-  }
   return (
-    <table className="w-full text-left text-[13px]">
-      <thead className="sticky top-0 bg-bg text-[10px] uppercase tracking-wider text-muted">
-        <tr className="border-b border-white/10">
-          <th className="px-3 py-1.5 font-medium">Pod</th>
-          <th className="px-3 py-1.5 font-medium">Status</th>
-          <th className="px-3 py-1.5 font-medium">Memory</th>
-          <th className="px-3 py-1.5 font-medium">CPU</th>
-          <th className="px-3 py-1.5 font-medium">Limits</th>
-          <th className="px-3 py-1.5 font-medium">Ports</th>
-          <th className="px-3 py-1.5 text-right font-medium"></th>
-        </tr>
-      </thead>
-      <tbody>
-        {pods.map((p) => (
-          <PodRow key={p.name} pod={p} act={act} onOpen={onOpen} />
-        ))}
-      </tbody>
-    </table>
+    <>
+      <div className="mb-2 flex items-center justify-end">
+        <button
+          onClick={onNew}
+          className="rounded-md bg-accent px-2 py-1 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+        >
+          + New Pod
+        </button>
+      </div>
+      {pods.length === 0 ? (
+        <p className="mt-10 text-center text-xs text-muted">
+          No pods — create one above or with <code>rustypods create …</code>
+        </p>
+      ) : (
+        <table className="w-full text-left text-[13px]">
+          <thead className="sticky top-0 bg-bg text-[10px] uppercase tracking-wider text-muted">
+            <tr className="border-b border-white/10">
+              <th className="px-3 py-1.5 font-medium">Pod</th>
+              <th className="px-3 py-1.5 font-medium">Status</th>
+              <th className="px-3 py-1.5 font-medium">Memory</th>
+              <th className="px-3 py-1.5 font-medium">CPU</th>
+              <th className="px-3 py-1.5 font-medium">Limits</th>
+              <th className="px-3 py-1.5 font-medium">Ports</th>
+              <th className="px-3 py-1.5 text-right font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {pods.map((p) => (
+              <PodRow key={p.name} pod={p} act={act} onOpen={onOpen} />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
   );
 }
 
@@ -1008,6 +1225,9 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(
     () => new URLSearchParams(location.search).get("detail")
   );
+  const [newPodOpen, setNewPodOpen] = useState(
+    () => new URLSearchParams(location.search).has("newpod")
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -1111,6 +1331,7 @@ export default function App() {
                 pods={pods}
                 act={act}
                 onOpen={(p) => setSelected(p.name)}
+                onNew={() => setNewPodOpen(true)}
               />
             )}
             {view === "stacks" && (
@@ -1130,6 +1351,13 @@ export default function App() {
         </main>
       </div>
 
+      {newPodOpen && (
+        <NewPodDialog
+          images={images}
+          onClose={() => setNewPodOpen(false)}
+          onCreated={refresh}
+        />
+      )}
       {selectedPod && (
         <PodDetail
           key={selectedPod.name}

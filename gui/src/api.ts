@@ -101,6 +101,45 @@ export const getDaemonInfo = async (): Promise<DaemonInfo> =>
     ? invoke<unknown>("get_daemon_info").then(DaemonInfo.fromJSON)
     : (await delay(), MOCK_INFO);
 
+export interface CreatePodSpec {
+  name: string;
+  image: string;
+  limits: Limits;
+  storageMaxBytes: number;
+  ports: string[];
+  binds: string[];
+  desktop: boolean;
+}
+
+export const createPod = async (spec: CreatePodSpec): Promise<Pod> => {
+  if (inTauri)
+    return invoke<unknown>("create_pod", {
+      name: spec.name,
+      image: spec.image,
+      memoryHighBytes: spec.limits.memoryHighBytes,
+      memoryMaxBytes: spec.limits.memoryMaxBytes,
+      cpuQuotaPercent: spec.limits.cpuQuotaPercent,
+      storageMaxBytes: spec.storageMaxBytes,
+      ports: spec.ports,
+      binds: spec.binds,
+      desktop: spec.desktop,
+    }).then(Pod.fromJSON);
+  await delay();
+  const p = Pod.fromPartial({
+    name: spec.name,
+    image: spec.image,
+    state: PodState.POD_STATE_CREATED,
+    createdUnix: Math.floor(Date.now() / 1000),
+    limits: { ...spec.limits },
+    storageMaxBytes: spec.storageMaxBytes,
+    ports: spec.ports,
+    binds: spec.binds,
+    privateUsers: !spec.desktop,
+  });
+  MOCK_PODS.push(p);
+  return p;
+};
+
 export const startPod = async (name: string): Promise<Pod> => {
   if (inTauri) return invoke<unknown>("start_pod", { name }).then(Pod.fromJSON);
   await delay();
@@ -117,6 +156,16 @@ export const stopPod = async (name: string): Promise<Pod> => {
   p.state = PodState.POD_STATE_STOPPED;
   p.leaderPid = 0;
   return p;
+};
+
+export const destroyPod = async (name: string): Promise<void> => {
+  if (inTauri) {
+    await invoke("destroy_pod", { name });
+    return;
+  }
+  await delay();
+  const i = MOCK_PODS.findIndex((p) => p.name === name);
+  if (i >= 0) MOCK_PODS.splice(i, 1);
 };
 
 export interface PodConfigUpdate {

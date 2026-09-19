@@ -193,6 +193,11 @@ export interface CreatePodRequest {
   desktop: boolean;
   /** "host[:pod][:ro]" bind mounts, applied at start. */
   binds: string[];
+  /**
+   * Resource guardrails, persisted in the conf; 0 fields = unlimited.
+   * Applied to machine-<name>.scope on every start.
+   */
+  limits?: Limits | undefined;
 }
 
 export interface ClonePodRequest {
@@ -2088,7 +2093,7 @@ export const ListPodsRequest: MessageFns<ListPodsRequest> = {
 };
 
 function createBaseCreatePodRequest(): CreatePodRequest {
-  return { name: "", image: "", storageMaxBytes: 0, ports: [], desktop: false, binds: [] };
+  return { name: "", image: "", storageMaxBytes: 0, ports: [], desktop: false, binds: [], limits: undefined };
 }
 
 export const CreatePodRequest: MessageFns<CreatePodRequest> = {
@@ -2110,6 +2115,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     }
     for (const v of message.binds) {
       writer.uint32(50).string(v!);
+    }
+    if (message.limits !== undefined) {
+      Limits.encode(message.limits, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -2175,6 +2183,14 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
             message.binds.push(reader.string());
             continue;
           }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.limits = Limits.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2199,6 +2215,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       ports: globalThis.Array.isArray(object?.ports) ? object.ports.map((e: any) => globalThis.String(e)) : [],
       desktop: isSet(object.desktop) ? globalThis.Boolean(object.desktop) : false,
       binds: globalThis.Array.isArray(object?.binds) ? object.binds.map((e: any) => globalThis.String(e)) : [],
+      limits: isSet(object.limits) ? Limits.fromJSON(object.limits) : undefined,
     };
   },
 
@@ -2222,6 +2239,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     if (message.binds?.length) {
       obj.binds = message.binds;
     }
+    if (message.limits !== undefined) {
+      obj.limits = Limits.toJSON(message.limits);
+    }
     return obj;
   },
 
@@ -2236,6 +2256,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     message.ports = object.ports?.map((e) => e) || [];
     message.desktop = object.desktop ?? false;
     message.binds = object.binds?.map((e) => e) || [];
+    message.limits = (object.limits !== undefined && object.limits !== null)
+      ? Limits.fromPartial(object.limits)
+      : undefined;
     return message;
   },
 };
