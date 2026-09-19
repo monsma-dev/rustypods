@@ -45,6 +45,8 @@ rustypods images
 rustypods create dev --image arch-base      # instant Btrfs-snapshot
 rustypods start dev --memory-high 10G --memory-max 12G --cpu 400
 rustypods ps
+rustypods config dev --memory-high 8G       # live hot-reload, geen restart
+rustypods reload dev                        # na hand-edit van conf/pods/dev.conf
 rustypods shell dev                         # eigen Exec-RPC: nsenter + host-pty
 rustypods shell dev -- cargo build          # of direct een commando (exit-code komt terug)
 echo hi | rustypods shell dev cat           # pipes werken ook
@@ -92,6 +94,11 @@ Geschreven door uid 1000 zodat host- en pod-processen als `nick` kunnen mappen.
   `TerminateMachine`/`ListMachines`) en systemd (`SetUnitProperties`,
   `StartUnit`) gaan native over één gedeelde `Connection` — geen
   `machinectl`/`systemctl`-subprocessen meer in de daemon.
+- **Config = TOML per entiteit**: `conf/pods/<naam>.conf` en
+  `conf/images/<naam>.conf` onder `/var/lib/rustypods` (géén centrale
+  state.json — die wordt eenmalig gemigreerd). Limits leesbaar als
+  `memory_high = "10.0G"`; `rustypods config` past live toe via
+  SetUnitProperties, `rustypods reload` leest een hand-edit opnieuw in.
 - **Stop-semantiek**: `stop` = `KillMachine(name, "leader", SIGRTMIN+3)`
   (clean poweroff, empirisch geverifieerd) → `TerminateMachine` als fallback.
 - **UID's**: identity mapping (geen `--private-users` default) zodat container-`nick`

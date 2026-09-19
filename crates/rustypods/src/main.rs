@@ -73,6 +73,21 @@ enum Cmd {
     Ps,
     /// Stop en verwijder een pod (Btrfs-snapshot weg).
     Destroy { name: String },
+    /// Limieten live aanpassen (schrijft conf + apply op draaiende scope).
+    Config {
+        name: String,
+        /// Soft cap, bijv. 8G — "0" = weghalen.
+        #[arg(long)]
+        memory_high: Option<String>,
+        /// Harde cap, bijv. 12G — "0" = weghalen.
+        #[arg(long)]
+        memory_max: Option<String>,
+        /// CPU-limiet in procent (0 = weghalen).
+        #[arg(long)]
+        cpu: Option<u32>,
+    },
+    /// Herlees een hand-ge-editte <pod>.conf en pas toe.
+    Reload { name: String },
     /// Live telemetrie uit de pod (rustypods-agent → daemon).
     Metrics { name: String },
     /// Shared-memory segmenten: mmap-bare files, host /dev/shm ↔ pod /run/rustypods/shm.
@@ -399,6 +414,45 @@ async fn main() -> Result<()> {
         Cmd::Destroy { name } => {
             connect(cli.socket).await?.destroy_pod(PodRef { name: name.clone() }).await?;
             println!("pod {name} vernietigd");
+        }
+        Cmd::Config { name, memory_high, memory_max, cpu } => {
+            // Ontbrekende vlaggen = huidige waarden behouden → eerst ophalen.
+            let mut c = connect(cli.socket).await?;
+            let cur = c
+                .list_pods(ListPodsRequest {})
+                .await?
+                .into_inner()
+                .pods
+                .into_iter()
+                .find(|p| p.name == name)
+                .context(format!("pod {name} niet gevonden"))?;
+            let cur = cur.limits.unwrap_or_default();
+            let lim = Limits {
+                memory_high_bytes: memory_high
+                    .as_deref()
+                    .map(parse_bytes)
+                    .transpose()?
+                    .unwrap_or(cur.memory_high_bytes),
+                memory_max_bytes: memory_max
+                    .as_deref()
+                    .map(parse_bytes)
+                    .transpose()?
+                    .unwrap_or(cur.memory_max_bytes),
+                cpu_quota_percent: cpu.unwrap_or(cur.cpu_quota_percent),
+            };
+            let p = c
+                .update_pod_config(UpdatePodConfigRequest { name, limits: Some(lim) })
+                .await?
+                .into_inner();
+            print_pod(&p);
+        }
+        Cmd::Reload { name } => {
+            let p = connect(cli.socket)
+                .await?
+                .reload_pod_config(PodRef { name })
+                .await?
+                .into_inner();
+            print_pod(&p);
         }
         Cmd::Metrics { name } => {
             let mut c = connect(cli.socket).await?;

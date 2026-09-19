@@ -79,8 +79,11 @@ fn limits_from(l: Option<Limits>) -> LimitsSpec {
 }
 
 impl Svc {
-    fn save(&self, st: &State) -> Result<()> {
-        state::save(&self.cfg.state_file(), st)
+    fn save_pod(&self, m: &PodMeta) -> Result<()> {
+        state::save_pod(&self.cfg.data_dir, m)
+    }
+    fn save_image(&self, m: &ImageMeta) -> Result<()> {
+        state::save_image(&self.cfg.data_dir, m)
     }
 
     fn pod_rootfs(&self, name: &str) -> std::path::PathBuf {
@@ -138,7 +141,7 @@ impl PodControl for Svc {
         };
         let mut st = self.st.lock().await;
         st.images.insert(name.clone(), meta.clone());
-        self.save(&st).map_err(int)?;
+        self.save_image(&meta).map_err(int)?;
         Ok(Response::new(to_image(&meta, &dest)))
     }
 
@@ -182,7 +185,7 @@ impl PodControl for Svc {
         }
         btrfs::delete(&self.cfg.images_dir().join(&name)).map_err(int)?;
         st.images.remove(&name);
-        self.save(&st).map_err(int)?;
+        state::remove_image(&self.cfg.data_dir, &name);
         Ok(Response::new(Empty {}))
     }
 
@@ -210,7 +213,7 @@ impl PodControl for Svc {
         };
         let mut st = self.st.lock().await;
         st.pods.insert(name.clone(), meta.clone());
-        self.save(&st).map_err(int)?;
+        self.save_pod(&meta).map_err(int)?;
         Ok(Response::new(to_pod(&meta, &dest, None)))
     }
 
@@ -229,7 +232,7 @@ impl PodControl for Svc {
             meta.ephemeral = req.ephemeral;
             meta.private_users = req.private_users;
             let m = meta.clone();
-            self.save(&st).map_err(int)?;
+            self.save_pod(&m).map_err(int)?;
             m
         };
         if dbus::leader_pid(&self.dbus, &name).await.is_some() {
@@ -282,8 +285,9 @@ impl PodControl for Svc {
         let mut st = self.st.lock().await;
         if let Some(m) = st.pods.get_mut(&name) {
             m.started = true;
+            let m = m.clone();
+            self.save_pod(&m).map_err(int)?;
         }
-        self.save(&st).map_err(int)?;
         let m = st.pods.get(&name).cloned().unwrap_or(meta);
         Ok(Response::new(to_pod(&m, &rootfs, leader)))
     }
@@ -322,14 +326,67 @@ impl PodControl for Svc {
         dbus::stop(&self.dbus, &name).await.map_err(int)?;
         agent::stop_listener(&self.listeners, &name).await;
         btrfs::delete(&self.pod_rootfs(&name)).map_err(int)?;
+        state::remove_pod(&self.cfg.data_dir, &name);
         agent::cleanup_pod_dirs(
             &proto::run_dir(&self.cfg.data_dir, &name),
             &proto::shm_host_dir(&name),
         );
         let mut st = self.st.lock().await;
         st.pods.remove(&name);
-        self.save(&st).map_err(int)?;
         Ok(Response::new(Empty {}))
+    }
+
+    /// `rustypods config`: conf bijwerken + direct live op de scope toepassen.
+    async fn update_pod_config(
+        &self,
+        req: Request<UpdatePodConfigRequest>,
+    ) -> Result<Response<Pod>, Status> {
+        let req = req.into_inner();
+        let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        let lim = limits_from(req.limits);
+        let meta = {
+            let mut st = self.st.lock().await;
+            let Some(m) = st.pods.get_mut(&name) else {
+                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+            };
+            m.limits = lim;
+            let m = m.clone();
+            self.save_pod(&m).map_err(int)?;
+            m
+        };
+        // Hot-apply als de pod draait — geen restart nodig.
+        if dbus::leader_pid(&self.dbus, &name).await.is_some() {
+            dbus::apply_limits(&self.dbus, &name, &meta.limits)
+                .await
+                .map_err(int)?;
+        }
+        let leader = dbus::leader_pid(&self.dbus, &name).await;
+        Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
+    }
+
+    /// `rustypods reload`: conf opnieuw van schijf (hand-edits) + apply.
+    async fn reload_pod_config(
+        &self,
+        req: Request<PodRef>,
+    ) -> Result<Response<Pod>, Status> {
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        let meta = state::load_pod(&self.cfg.data_dir, &name).map_err(int)?;
+        {
+            let mut st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} niet gevonden")));
+            }
+            st.pods.insert(name.clone(), meta.clone());
+        }
+        if dbus::leader_pid(&self.dbus, &name).await.is_some() {
+            dbus::apply_limits(&self.dbus, &name, &meta.limits)
+                .await
+                .map_err(int)?;
+        }
+        let leader = dbus::leader_pid(&self.dbus, &name).await;
+        Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
     }
 
     async fn create_shm(
@@ -572,6 +629,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         cfg.logs_dir(),
         cfg.bin_dir(),
         cfg.shm_dir(),
+        state::pods_conf_dir(&cfg.data_dir),
+        state::images_conf_dir(&cfg.data_dir),
     ] {
         std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
     }
@@ -595,7 +654,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // Wake machined (socket-activated; best effort).
     let _ = dbus::wake_machined(&dbus_conn).await;
 
-    let st = Arc::new(Mutex::new(state::load(&cfg.state_file())));
+    let st = Arc::new(Mutex::new(state::load(&cfg.data_dir)));
     let metrics: MetricsMap = Default::default();
     let listeners: ListenerMap = Default::default();
     let svc = Svc {

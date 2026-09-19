@@ -33,8 +33,10 @@ pub fn run_dir(data_dir: &std::path::Path, pod: &str) -> PathBuf {
 pub fn shm_host_dir(pod: &str) -> PathBuf {
     PathBuf::from("/dev/shm/rustypods").join(pod)
 }
-pub fn state_file(data_dir: &std::path::Path) -> PathBuf {
-    data_dir.join("state.json")
+/// Per-entity TOML confs: conf/pods/<name>.conf, conf/images/<name>.conf.
+/// Hand-editable; `rustypods reload <pod>` leest opnieuw in.
+pub fn conf_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("conf")
 }
 
 /// In-pod paths (container side of the binds).

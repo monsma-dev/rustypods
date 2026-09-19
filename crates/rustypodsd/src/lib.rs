@@ -36,8 +36,8 @@ impl Config {
     pub fn shm_dir(&self) -> PathBuf {
         rustypods_proto::shm_dir(&self.data_dir)
     }
-    pub fn state_file(&self) -> PathBuf {
-        rustypods_proto::state_file(&self.data_dir)
+    pub fn conf_dir(&self) -> PathBuf {
+        rustypods_proto::conf_dir(&self.data_dir)
     }
 }
 

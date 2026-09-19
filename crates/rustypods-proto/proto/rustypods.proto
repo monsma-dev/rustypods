@@ -17,6 +17,10 @@ service PodControl {
   rpc StopPod(PodRef) returns (Pod);
   rpc ListPods(ListPodsRequest) returns (PodList);
   rpc DestroyPod(PodRef) returns (Empty);
+  // Hot-reload limits: schrijf conf + pas direct toe op de scope (geen reboot).
+  rpc UpdatePodConfig(UpdatePodConfigRequest) returns (Pod);
+  // Herlees een hand-ge-editte conf van schijf en pas toe.
+  rpc ReloadPodConfig(PodRef) returns (Pod);
 
   rpc Exec(stream ExecChunk) returns (stream ExecChunk);
   rpc PodMetrics(PodRef) returns (stream Metric);
@@ -133,6 +137,11 @@ message ListPodsRequest {}
 message CreatePodRequest {
   string name = 1;
   string image = 2;
+}
+
+message UpdatePodConfigRequest {
+  string name = 1;
+  Limits limits = 2;
 }
 
 message StartPodRequest {
