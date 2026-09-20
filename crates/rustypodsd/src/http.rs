@@ -57,6 +57,10 @@ struct CreatePodIn {
     ports: Vec<String>,
     #[serde(default)]
     desktop: bool,
+    #[serde(default)]
+    binds: Vec<String>,
+    #[serde(default)]
+    autostart: bool,
 }
 
 /// `PATCH /v1/pods/:name` body — absent fields keep their current values.
@@ -68,8 +72,12 @@ struct UpdatePodIn {
     storage_max_bytes: Option<u64>,
     /// Absent = keep current mappings; present (even []) replaces them.
     ports: Option<Vec<String>>,
+    /// Absent = keep current binds; present (even []) replaces them.
+    binds: Option<Vec<String>>,
     snap_keep_last: Option<u32>,
     snap_max_age_secs: Option<u64>,
+    /// Absent = keep; true/false sets the boot-time autostart flag.
+    autostart: Option<bool>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -116,8 +124,9 @@ async fn create_pod(
             storage_max_bytes: b.storage_max_bytes,
             ports: b.ports,
             desktop: b.desktop,
-            binds: vec![],
+            binds: b.binds,
             limits: has_limits.then_some(limits),
+            autostart: b.autostart,
         }))
         .await
         .map_err(api_err)?
@@ -178,9 +187,10 @@ async fn update_pod(
             }),
             storage_max_bytes: b.storage_max_bytes.unwrap_or(cur.storage_max_bytes),
             ports: b.ports.map(|ports| PortMappings { ports }),
-            binds: None,
+            binds: b.binds.map(|binds| BindList { binds }),
             snap_keep_last: b.snap_keep_last,
             snap_max_age_secs: b.snap_max_age_secs,
+            autostart: b.autostart,
         }))
         .await
         .map_err(api_err)?

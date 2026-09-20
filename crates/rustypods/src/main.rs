@@ -72,6 +72,9 @@ enum Cmd {
         /// Bind mount host[:pod][:ro]; repeatable. Applied at start.
         #[arg(long)]
         bind: Vec<String>,
+        /// Boot this pod automatically whenever the daemon starts.
+        #[arg(long)]
+        autostart: bool,
     },
     /// Start a pod (nspawn --boot, machined registration).
     Start {
@@ -159,6 +162,9 @@ enum Cmd {
         /// Snapshot GC: drop commits older than this, e.g. 7d (0 = keep forever).
         #[arg(long)]
         snap_max_age: Option<String>,
+        /// Boot with the daemon: --autostart on|off.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        autostart: Option<bool>,
     },
     /// Reread a hand-edited <pod>.conf and apply it.
     Reload { name: String },
@@ -402,6 +408,9 @@ fn print_pod(p: &Pod) {
     if !p.stack.is_empty() {
         extra.push_str(&format!(" stack={}", p.stack));
     }
+    if p.autostart {
+        extra.push_str(" autostart");
+    }
     println!(
         "{:<20} {:<8} {:<8} pid={:<7} {}",
         p.name,
@@ -480,14 +489,14 @@ async fn main() -> Result<()> {
             connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
             println!("image {name} removed");
         }
-        Cmd::Create { name, image, storage_max, port, desktop, bind } => {
+        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart } => {
             let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
             if !port.is_empty() {
                 eprintln!("note: --port implies a private netns (--network-veth); the pod no longer shares host networking");
             }
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind, limits: None })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind, limits: None, autostart })
                 .await?
                 .into_inner();
             print_pod(&p);
@@ -654,7 +663,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age } => {
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -703,6 +712,7 @@ async fn main() -> Result<()> {
                         .as_deref()
                         .map(parse_duration)
                         .transpose()?,
+                    autostart,
                 })
                 .await?
                 .into_inner();
@@ -718,27 +728,96 @@ async fn main() -> Result<()> {
         }
         Cmd::Logs { name, follow } => {
             use std::io::Write;
+            use tokio::time::{Duration, Instant};
+            /// -f only: a dying stream (daemon restart, journalctl hiccup)
+            /// is no reason to exit — reconnect while the pod lives.
+            const MAX_RECONNECTS: u32 = 5;
+            let print = |data: &[u8]| -> Result<()> {
+                let mut out = std::io::stdout().lock();
+                out.write_all(data)?;
+                out.write_all(b"\n")?;
+                out.flush()?;
+                Ok(())
+            };
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            let mut s = c.stream_logs(PodRef { name }).await?.into_inner();
-            // The daemon streams backlog + follow forever. Without -f we
-            // drain the backlog and exit once the stream goes quiet.
+            let mut retries = 0u32;
             loop {
-                let next: Option<Result<Option<LogLine>, tonic::Status>> = if follow {
-                    Some(s.message().await)
-                } else {
-                    tokio::time::timeout(std::time::Duration::from_secs(1), s.message())
-                        .await
-                        .ok()
-                };
-                match next {
-                    Some(Ok(Some(l))) => {
-                        let mut out = std::io::stdout().lock();
-                        out.write_all(&l.data)?;
-                        out.write_all(b"\n")?;
-                        out.flush()?;
+                let mut s = match c.stream_logs(PodRef { name: name.clone() }).await {
+                    Ok(r) => r.into_inner(),
+                    Err(e) => {
+                        // A pod that doesn't exist will never produce logs.
+                        if !follow
+                            || e.code() == tonic::Code::NotFound
+                            || retries >= MAX_RECONNECTS
+                        {
+                            return Err(e.into());
+                        }
+                        retries += 1;
+                        eprintln!("logs: {e} — reconnecting ({retries}/{MAX_RECONNECTS})…");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if let Ok(nc) = connect(cli.socket.clone(), cli.remote.clone()).await {
+                            c = nc;
+                        }
+                        continue;
                     }
-                    Some(Ok(None)) | None => break,
-                    Some(Err(e)) => return Err(e.into()),
+                };
+                if !follow {
+                    // Bounded backlog drain: the daemon's sources
+                    // (journalctl -f, tail -F) never EOF on their own, so
+                    // instead of a per-message "quiet" heuristic cap the
+                    // TOTAL wait — 3s after the first line arrives, or 3s
+                    // overall for an empty backlog. A real stream end or
+                    // error exits immediately.
+                    let mut deadline = Instant::now() + Duration::from_secs(3);
+                    let mut first = true;
+                    loop {
+                        match tokio::time::timeout_at(deadline, s.message()).await {
+                            Ok(Ok(Some(l))) => {
+                                print(&l.data)?;
+                                if first {
+                                    first = false;
+                                    deadline = Instant::now() + Duration::from_secs(3);
+                                }
+                            }
+                            Ok(Ok(None)) | Err(_) => break,
+                            Ok(Err(e)) => return Err(e.into()),
+                        }
+                    }
+                    break;
+                }
+                loop {
+                    match s.message().await {
+                        Ok(Some(l)) => {
+                            retries = 0; // healthy stream resets the budget
+                            print(&l.data)?;
+                        }
+                        Ok(None) | Err(_) => break, // EOF or error → reconnect
+                    }
+                }
+                // Reconnect only while the pod is alive and running — a
+                // dead pod's stream ending is a normal exit, not a retry.
+                let running = c
+                    .list_pods(ListPodsRequest {})
+                    .await
+                    .map(|l| {
+                        l.into_inner()
+                            .pods
+                            .iter()
+                            .any(|p| p.name == name && p.state == PodState::Running as i32)
+                    })
+                    .unwrap_or(true); // daemon unreachable → don't guess, retry
+                if !running {
+                    break;
+                }
+                retries += 1;
+                if retries > MAX_RECONNECTS {
+                    eprintln!("logs: stream keeps dying ({MAX_RECONNECTS} retries) — giving up");
+                    break;
+                }
+                eprintln!("logs: stream ended — reconnecting ({retries}/{MAX_RECONNECTS})…");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Ok(nc) = connect(cli.socket.clone(), cli.remote.clone()).await {
+                    c = nc;
                 }
             }
         }

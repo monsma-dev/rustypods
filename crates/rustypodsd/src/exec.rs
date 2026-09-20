@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use rustypods_proto::rpc::{exec_chunk::Kind, ExecChunk, ExecExit, ExecStart};
 use tokio::io::AsyncReadExt;
@@ -27,6 +28,11 @@ type Tx = mpsc::Sender<Result<ExecChunk, tonic::Status>>;
 /// real stdin across nsenter's clobber, and the payload wrapper re-dups it
 /// back: `exec 0<&200 200<&-; …`.
 const STDIN_DUP_FD: i32 = 200;
+
+/// A payload that forks a detached child can keep the pty/pipes open after
+/// the main process exits — the drain tasks then never see EOF and the
+/// exit chunk would never ship. Bound the drain: grace 2s, send exit anyway.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// pre_exec hook: stash the real stdin on a high fd that survives nsenter's
 /// fd-0 clobber (dup2 clears CLOEXEC, so it propagates through the
@@ -412,7 +418,9 @@ async fn run_tty(
                 child.wait().await.map(|s| s.code().unwrap_or(1)).unwrap_or(1)
             }
         };
-        let _ = drained_rx.await;
+        // A detached grandchild holding the pty slave means no EIO ever —
+        // grace the drain briefly, then ship the exit chunk regardless.
+        let _ = tokio::time::timeout(DRAIN_GRACE, drained_rx).await;
         let _ = tx.send(chunk_exit(code)).await;
     });
     Ok(())
@@ -441,7 +449,7 @@ async fn run_pipe(
     let mut stderr = child.stderr.take().context("stderr")?;
 
     let tx_out = tx.clone();
-    let out_task = tokio::spawn(async move {
+    let mut out_task = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
             match stdout.read(&mut buf).await {
@@ -455,7 +463,7 @@ async fn run_pipe(
         }
     });
     let tx_err = tx.clone();
-    let err_task = tokio::spawn(async move {
+    let mut err_task = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
             match stderr.read(&mut buf).await {
@@ -492,8 +500,17 @@ async fn run_pipe(
                 child.wait().await.map(|s| s.code().unwrap_or(1)).unwrap_or(1)
             }
         };
-        let _ = out_task.await;
-        let _ = err_task.await;
+        // A detached grandchild holding the pipes open stalls both drain
+        // tasks forever — bound the wait, then abort them so their `tx`
+        // clones drop and the response stream can actually end.
+        let drained = async {
+            let _ = (&mut out_task).await;
+            let _ = (&mut err_task).await;
+        };
+        if tokio::time::timeout(DRAIN_GRACE, drained).await.is_err() {
+            out_task.abort();
+            err_task.abort();
+        }
         let _ = tx.send(chunk_exit(code)).await;
     });
     Ok(())

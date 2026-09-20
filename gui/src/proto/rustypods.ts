@@ -185,6 +185,8 @@ export interface Pod {
   snapKeepLast: number;
   /** Snapshot GC: drop commits older than this many seconds (0 = unlimited). */
   snapMaxAgeSecs: number;
+  /** Start this pod automatically whenever the daemon boots. */
+  autostart: boolean;
 }
 
 export interface PodList {
@@ -214,7 +216,11 @@ export interface CreatePodRequest {
    * Resource guardrails, persisted in the conf; 0 fields = unlimited.
    * Applied to machine-<name>.scope on every start.
    */
-  limits?: Limits | undefined;
+  limits?:
+    | Limits
+    | undefined;
+  /** Start this pod automatically whenever the daemon boots. */
+  autostart: boolean;
 }
 
 export interface ClonePodRequest {
@@ -298,7 +304,11 @@ export interface UpdatePodConfigRequest {
     | number
     | undefined;
   /** Absent = keep; 0 = clear (no age-based snapshot GC). */
-  snapMaxAgeSecs?: number | undefined;
+  snapMaxAgeSecs?:
+    | number
+    | undefined;
+  /** Absent = keep; present = set the boot-time autostart flag. */
+  autostart?: boolean | undefined;
 }
 
 export interface StartPodRequest {
@@ -1774,6 +1784,7 @@ function createBasePod(): Pod {
     privateUsers: false,
     snapKeepLast: 0,
     snapMaxAgeSecs: 0,
+    autostart: false,
   };
 }
 
@@ -1823,6 +1834,9 @@ export const Pod: MessageFns<Pod> = {
     }
     if (message.snapMaxAgeSecs !== 0) {
       writer.uint32(120).uint64(message.snapMaxAgeSecs);
+    }
+    if (message.autostart !== false) {
+      writer.uint32(128).bool(message.autostart);
     }
     return writer;
   },
@@ -1960,6 +1974,14 @@ export const Pod: MessageFns<Pod> = {
             message.snapMaxAgeSecs = longToNumber(reader.uint64());
             continue;
           }
+          case 16: {
+            if (tag !== 128) {
+              break;
+            }
+
+            message.autostart = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2013,6 +2035,7 @@ export const Pod: MessageFns<Pod> = {
         : isSet(object.snap_max_age_secs)
         ? globalThis.Number(object.snap_max_age_secs)
         : 0,
+      autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : false,
     };
   },
 
@@ -2063,6 +2086,9 @@ export const Pod: MessageFns<Pod> = {
     if (message.snapMaxAgeSecs !== 0) {
       obj.snapMaxAgeSecs = Math.round(message.snapMaxAgeSecs);
     }
+    if (message.autostart !== false) {
+      obj.autostart = message.autostart;
+    }
     return obj;
   },
 
@@ -2088,6 +2114,7 @@ export const Pod: MessageFns<Pod> = {
     message.privateUsers = object.privateUsers ?? false;
     message.snapKeepLast = object.snapKeepLast ?? 0;
     message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? 0;
+    message.autostart = object.autostart ?? false;
     return message;
   },
 };
@@ -2279,7 +2306,16 @@ export const ListPodsRequest: MessageFns<ListPodsRequest> = {
 };
 
 function createBaseCreatePodRequest(): CreatePodRequest {
-  return { name: "", image: "", storageMaxBytes: 0, ports: [], desktop: false, binds: [], limits: undefined };
+  return {
+    name: "",
+    image: "",
+    storageMaxBytes: 0,
+    ports: [],
+    desktop: false,
+    binds: [],
+    limits: undefined,
+    autostart: false,
+  };
 }
 
 export const CreatePodRequest: MessageFns<CreatePodRequest> = {
@@ -2304,6 +2340,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     }
     if (message.limits !== undefined) {
       Limits.encode(message.limits, writer.uint32(58).fork()).join();
+    }
+    if (message.autostart !== false) {
+      writer.uint32(64).bool(message.autostart);
     }
     return writer;
   },
@@ -2377,6 +2416,14 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
             message.limits = Limits.decode(reader, reader.uint32());
             continue;
           }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.autostart = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2402,6 +2449,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       desktop: isSet(object.desktop) ? globalThis.Boolean(object.desktop) : false,
       binds: globalThis.Array.isArray(object?.binds) ? object.binds.map((e: any) => globalThis.String(e)) : [],
       limits: isSet(object.limits) ? Limits.fromJSON(object.limits) : undefined,
+      autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : false,
     };
   },
 
@@ -2428,6 +2476,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     if (message.limits !== undefined) {
       obj.limits = Limits.toJSON(message.limits);
     }
+    if (message.autostart !== false) {
+      obj.autostart = message.autostart;
+    }
     return obj;
   },
 
@@ -2445,6 +2496,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     message.limits = (object.limits !== undefined && object.limits !== null)
       ? Limits.fromPartial(object.limits)
       : undefined;
+    message.autostart = object.autostart ?? false;
     return message;
   },
 };
@@ -3292,6 +3344,7 @@ function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
     binds: undefined,
     snapKeepLast: undefined,
     snapMaxAgeSecs: undefined,
+    autostart: undefined,
   };
 }
 
@@ -3317,6 +3370,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     }
     if (message.snapMaxAgeSecs !== undefined) {
       writer.uint32(56).uint64(message.snapMaxAgeSecs);
+    }
+    if (message.autostart !== undefined) {
+      writer.uint32(64).bool(message.autostart);
     }
     return writer;
   },
@@ -3390,6 +3446,14 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
             message.snapMaxAgeSecs = longToNumber(reader.uint64());
             continue;
           }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.autostart = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3423,6 +3487,7 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
         : isSet(object.snap_max_age_secs)
         ? globalThis.Number(object.snap_max_age_secs)
         : undefined,
+      autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : undefined,
     };
   },
 
@@ -3449,6 +3514,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     if (message.snapMaxAgeSecs !== undefined) {
       obj.snapMaxAgeSecs = Math.round(message.snapMaxAgeSecs);
     }
+    if (message.autostart !== undefined) {
+      obj.autostart = message.autostart;
+    }
     return obj;
   },
 
@@ -3470,6 +3538,7 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
       : undefined;
     message.snapKeepLast = object.snapKeepLast ?? undefined;
     message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? undefined;
+    message.autostart = object.autostart ?? undefined;
     return message;
   },
 };

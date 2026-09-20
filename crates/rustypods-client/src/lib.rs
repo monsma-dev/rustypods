@@ -105,6 +105,11 @@ pub async fn connect(path: PathBuf, remote: Option<String>) -> Result<PodControl
         None => "connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)".into(),
     };
     let ch = Endpoint::try_from("http://[::]:0")?
+        // Bound each call at 30s so a wedged daemon can't hang the CLI/GUI
+        // forever. tonic's timeout wraps the per-request response future —
+        // for streaming RPCs it resolves when response HEADERS arrive, so
+        // long-lived streams (logs -f, metrics, exec) are NOT cut off.
+        .timeout(std::time::Duration::from_secs(30))
         .connect_with_connector(service_fn(move |_: http::Uri| {
             let p = path.clone();
             let remote = remote.clone();

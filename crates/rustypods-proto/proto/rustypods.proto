@@ -171,6 +171,8 @@ message Pod {
   uint32 snap_keep_last = 14;
   // Snapshot GC: drop commits older than this many seconds (0 = unlimited).
   uint64 snap_max_age_secs = 15;
+  // Start this pod automatically whenever the daemon boots.
+  bool autostart = 16;
 }
 
 message PodList {
@@ -196,6 +198,8 @@ message CreatePodRequest {
   // Resource guardrails, persisted in the conf; 0 fields = unlimited.
   // Applied to machine-<name>.scope on every start.
   optional Limits limits = 7;
+  // Start this pod automatically whenever the daemon boots.
+  bool autostart = 8;
 }
 
 message ClonePodRequest {
@@ -267,6 +271,8 @@ message UpdatePodConfigRequest {
   optional uint32 snap_keep_last = 6;
   // Absent = keep; 0 = clear (no age-based snapshot GC).
   optional uint64 snap_max_age_secs = 7;
+  // Absent = keep; present = set the boot-time autostart flag.
+  optional bool autostart = 8;
 }
 
 message StartPodRequest {

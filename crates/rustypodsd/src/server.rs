@@ -91,6 +91,7 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         private_users: m.private_users,
         snap_keep_last: m.snap_keep_last,
         snap_max_age_secs: m.snap_max_age_secs,
+        autostart: m.autostart,
     }
 }
 
@@ -191,7 +192,17 @@ impl Svc {
                 "no /etc/passwd entry for uid {uid}"
             )));
         };
+        // The whole user runtime dir goes in ro — that already covers
+        // $SSH_AUTH_SOCK (unix-socket connect() works through a ro bind;
+        // verified live), the session bus, pipewire, etc. On top of that,
+        // give the rootless podman socket its own explicit ro bind for
+        // containers-in-containers parity with distrobox — skipped when
+        // podman.socket isn't running on the host.
         let mut v = vec![home, "/tmp".into(), format!("/run/user/{uid}:ro")];
+        let podman_sock = format!("/run/user/{uid}/podman/podman.sock");
+        if Path::new(&podman_sock).exists() {
+            v.push(format!("{podman_sock}:ro"));
+        }
         if Path::new("/dev/dri").exists() {
             v.push("/dev/dri:ro".into());
         }
@@ -527,6 +538,7 @@ impl PodControl for Svc {
             binds,
             snap_keep_last: 0,
             snap_max_age_secs: 0,
+            autostart: req.autostart,
         };
         let mut st = self.st.lock().await;
         st.pods.insert(name.clone(), meta.clone());
@@ -669,7 +681,7 @@ impl PodControl for Svc {
             )));
         };
         self.engine.stop(&pod).await.map_err(int)?; // rollback discards live state
-        agent::stop_listener(&self.listeners, &pod).await;
+        agent::stop_listener(&self.listeners, &self.metrics, &pod).await;
         let rootfs = self.pod_rootfs(&pod);
         let snap_path = std::path::Path::new(&snap.path);
         // The snapshot may have been GC'd or deleted since we listed it —
@@ -866,6 +878,9 @@ impl PodControl for Svc {
                         binds: vec![],
                         snap_keep_last: sp.snap_keep_last,
                         snap_max_age_secs: sp.snap_max_age_secs,
+                        // Stack lifecycle is driven by `stack start`, not
+                        // the daemon boot path.
+                        autostart: false,
                     };
                     let mut st = self.st.lock().await;
                     if st.pods.contains_key(&pname) {
@@ -939,7 +954,7 @@ impl PodControl for Svc {
                     "pod {pname} is still registered with machined — refusing to destroy stack"
                 )));
             }
-            agent::stop_listener(&self.listeners, pname).await;
+            agent::stop_listener(&self.listeners, &self.metrics, pname).await;
             self.st_delete(&self.pod_rootfs(pname)).await?;
             state::remove_pod(&self.cfg.data_dir, pname);
             agent::cleanup_pod_dirs(
@@ -1138,7 +1153,7 @@ impl PodControl for Svc {
         let leader = match self.engine.start(&spec, &meta.limits).await {
             Ok(pid) => Some(pid),
             Err(e) => {
-                agent::stop_listener(&self.listeners, &name).await;
+                agent::stop_listener(&self.listeners, &self.metrics, &name).await;
                 let _ = self.engine.stop(&name).await;
                 return Err(int(e));
             }
@@ -1216,7 +1231,7 @@ impl PodControl for Svc {
             }
         }
         self.engine.stop(&name).await.map_err(int)?;
-        agent::stop_listener(&self.listeners, &name).await;
+        agent::stop_listener(&self.listeners, &self.metrics, &name).await;
         let st = self.st.lock().await;
         let Some(m) = st.pods.get(&name) else {
             return Err(Status::not_found(format!("pod {name} not found")));
@@ -1266,7 +1281,7 @@ impl PodControl for Svc {
                 "pod {name} is still registered with machined — refusing to destroy"
             )));
         }
-        agent::stop_listener(&self.listeners, &name).await;
+        agent::stop_listener(&self.listeners, &self.metrics, &name).await;
         self.st_delete(&self.pod_rootfs(&name)).await?;
         state::remove_pod(&self.cfg.data_dir, &name);
         agent::cleanup_pod_dirs(
@@ -1349,6 +1364,10 @@ impl PodControl for Svc {
             }
             if let Some(a) = req.snap_max_age_secs {
                 m.snap_max_age_secs = a;
+            }
+            // Absent = keep the current boot flag.
+            if let Some(a) = req.autostart {
+                m.autostart = a;
             }
             let m = m.clone();
             self.save_pod(&m).map_err(int)?;
@@ -1892,15 +1911,24 @@ fn has_systemd_init(rootfs: &Path) -> bool {
 /// Resolve a payload argv[0] inside the rootfs: absolute paths checked
 /// verbatim, bare names searched in the usual container PATH dirs (same
 /// order as nspawn's built-in default). Returns the in-container path.
+/// The existence probe goes through rootfs::safe_join_if_exists — a
+/// planted '..' or a symlinked parent (e.g. `usr -> /host/usr`) must
+/// never make this stat the HOST fs.
 fn resolve_in_rootfs(rootfs: &Path, prog: &str) -> Option<String> {
+    // Leaf policy: symlink_metadata — a leaf symlink counts as existing
+    // (it resolves inside the container), and is never followed host-side.
+    let exists = |rel: &str| -> bool {
+        crate::rootfs::safe_join_if_exists(rootfs, rel)
+            .ok()
+            .flatten()
+            .map(|p| std::fs::symlink_metadata(&p).is_ok())
+            .unwrap_or(false)
+    };
     if prog.contains('/') {
-        return rootfs
-            .join(prog.trim_start_matches('/'))
-            .exists()
-            .then(|| prog.to_string());
+        return exists(prog).then(|| prog.to_string());
     }
     for d in ["usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "bin"] {
-        if rootfs.join(d).join(prog).exists() {
+        if exists(&format!("{d}/{prog}")) {
             return Some(format!("/{d}/{prog}"));
         }
     }
@@ -2126,6 +2154,43 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 agent::chown_sock_for_userns(&run_dir, leader);
             }
         }
+    }
+
+    // Autostart: pods flagged `autostart = true` in their conf get booted
+    // by the daemon itself. Sequential, detached — a slow boot must never
+    // stall serve(), and a failing pod is logged and skipped, not fatal.
+    // Goes through the real start_pod RPC so the per-pod op mutex, conf
+    // persistence and NAT wiring all behave exactly like `rustypods start`.
+    {
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            let flagged: Vec<String> = {
+                let st = svc.st.lock().await;
+                st.pods
+                    .values()
+                    .filter(|m| m.autostart)
+                    .map(|m| m.name.clone())
+                    .collect()
+            };
+            for name in flagged {
+                // Pods that survived a daemon restart are already up.
+                if svc.engine.running_pid(&name).await.is_some() {
+                    continue;
+                }
+                tracing::info!("autostart: booting pod {name}");
+                if let Err(e) = svc
+                    .start_pod(Request::new(StartPodRequest {
+                        name: name.clone(),
+                        limits: None,
+                        ephemeral: false,
+                        private_users: None,
+                    }))
+                    .await
+                {
+                    tracing::warn!("autostart {name}: {e}");
+                }
+            }
+        });
     }
 
     // REST/JSON facade (axum) for automation — bearer-token gated (token

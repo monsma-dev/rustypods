@@ -159,6 +159,7 @@ async fn update_pod_config(
                 // real 0 = clear the retention rule.
                 snap_keep_last,
                 snap_max_age_secs,
+                autostart: None, // GUI doesn't manage the boot flag (yet)
             })
             .await
             .map_err(|e| e.message().to_string())?
@@ -201,6 +202,7 @@ async fn create_pod(
                 desktop,
                 binds,
                 limits,
+                autostart: false,
             })
             .await
             .map_err(|e| e.message().to_string())?

@@ -128,11 +128,14 @@ pub fn chown_sock_for_userns(run_dir: &Path, leader: u32) {
     }
 }
 
-/// Tear down a pod's agent listener (stop/destroy).
-pub async fn stop_listener(listeners: &ListenerMap, pod: &str) {
+/// Tear down a pod's agent listener (stop/destroy) and drop its metrics
+/// watch channel — a stopped pod has no live metric source, and dropping
+/// the sender cleanly ends any PodMetrics subscribers (changed() → Err).
+pub async fn stop_listener(listeners: &ListenerMap, metrics: &MetricsMap, pod: &str) {
     if let Some(tx) = listeners.lock().await.remove(pod) {
         let _ = tx.send(());
     }
+    metrics.lock().await.remove(pod);
 }
 
 /// Latest metric for a pod, creating the watch pair if absent.

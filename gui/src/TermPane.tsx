@@ -53,7 +53,11 @@ export default function TermPane({
         us.forEach((u) => u());
       } else {
         unsubs.push(...us);
-        api.openPty(pod, term.cols, term.rows);
+        // A rejected open (pod not running, daemon down) must land IN the
+        // terminal — an unhandled rejection leaves a silent dead pane.
+        api.openPty(pod, term.cols, term.rows).catch((e) =>
+          term.write(`\r\n[exec failed: ${String(e)}]\r\n`),
+        );
       }
     });
 

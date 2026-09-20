@@ -209,6 +209,10 @@ pub struct PodMeta {
     /// Serialized as `snap_max_age = "7d"`.
     #[serde(rename = "snap_max_age", default, with = "duration_field")]
     pub snap_max_age_secs: u64,
+    /// Boot with the daemon: serve() start_pod's every flagged pod after
+    /// the state scan (failures are logged, never fatal).
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 #[derive(Debug, Default)]
@@ -468,6 +472,7 @@ fn migrate_json(data_dir: &Path) {
             binds: vec![],
             snap_keep_last: 0,
             snap_max_age_secs: 0,
+            autostart: false,
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");

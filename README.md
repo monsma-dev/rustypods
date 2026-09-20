@@ -85,7 +85,8 @@ Spec syntax is `host[:pod][:ro]` (pod path defaults to host). Anything under
 `/run/user/<uid>` its own and will `rm -rf` it during session cleanup.
 
 `create --desktop` adds the distrobox-parity preset (your home + /tmp rw,
-/run/user/<uid> + /dev/dri ro) and disables the user namespace — a shared
+/run/user/<uid> + /dev/dri + the rootless podman socket, all ro except home)
+and disables the user namespace — a shared
 home needs host-uid identity. All other new pods run with
 `--private-users=pick`: pod root is not host root (the first start chowns
 the rootfs once, cheap on btrfs). Exec'd processes additionally get their
@@ -185,6 +186,39 @@ lookup.
 Known limitation: `tty(1)` fails on path resolution (the pty fd lives in the
 host devpts); the fd itself works fully.
 
+## Dev & agent workflows
+
+Always-on dev pods can boot with the daemon — something distrobox never
+had:
+
+```bash
+rustypods create dev --image arch-base --desktop --autostart
+rustypods config dev --autostart off      # back to manual
+```
+
+For agents (Devin/Cursor-style exec layers) everything is scriptable — no
+tty needed, exit codes come back exactly:
+
+```bash
+rustypods shell dev -- cargo test         # non-tty exec; clean stdout/stderr
+rustypods logs -f dev                     # plain-text journal, auto-reconnects
+```
+
+or over REST/JSON with the bearer token in `/run/rustypods/http-token`:
+
+```bash
+curl -H "Authorization: Bearer $(cat /run/rustypods/http-token)" \
+  http://127.0.0.1:9180/v1/pods
+```
+
+Socket passthrough: `--desktop` pods already bind `/run/user/<uid>`
+read-only, which covers `$SSH_AUTH_SOCK`, the session bus and PipeWire —
+unix-socket `connect()` works fine through a read-only mount. When the
+rootless podman socket (`/run/user/<uid>/podman/podman.sock`) exists on the
+host it gets its own ro bind, so `podman` inside the pod drives the host's
+containers (distrobox parity). Client calls carry a 30s timeout — it bounds
+time-to-response only, so `-f` log/metric/exec streams are unaffected.
+
 ## Telemetry & shared memory
 
 ```bash
@@ -228,7 +262,8 @@ responses are the proto messages in camelCase JSON:
 ```
 GET    /healthz                      GET    /v1/daemon
 GET    /v1/pods                      POST   /v1/pods          {"name","image",…}
-PATCH  /v1/pods/:name                {"memory_high_bytes","ports","snap_keep_last",…}
+PATCH  /v1/pods/:name                {"memory_high_bytes","ports","binds",
+                                      "snap_keep_last","autostart",…}
 POST   /v1/pods/:name/start|stop     DELETE /v1/pods/:name
 GET    /v1/images                    GET    /v1/pods/:name/metrics
 POST   /v1/stacks   (raw stack.toml) DELETE /v1/stacks/:name
