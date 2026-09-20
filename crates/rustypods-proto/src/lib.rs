@@ -223,6 +223,25 @@ pub fn validate_bind(spec: &str) -> anyhow::Result<BindSpec> {
     })
 }
 
+/// Largest value parse_bytes/parse_duration will produce: u64 results
+/// cross a JSON/ts-proto boundary where numbers are f64 — anything past
+/// 2^53 loses integer precision (and u64::MAX breaks i64 consumers).
+const MAX_PARSED: u64 = 1 << 53;
+
+/// f64 → u64 with sanity: NaN/±inf and negatives parse as f64 but are not
+/// sizes, and the saturating `as` cast would silently turn them into 0 or
+/// u64::MAX.
+fn f64_to_u64(v: f64, mult: u64, what: &str, s: &str) -> anyhow::Result<u64> {
+    if !(v.is_finite() && v >= 0.0) {
+        anyhow::bail!("invalid {what} '{s}'");
+    }
+    let r = v * mult as f64;
+    if !(r.is_finite() && r <= MAX_PARSED as f64) {
+        anyhow::bail!("{what} '{s}' out of range (max {} )", MAX_PARSED);
+    }
+    Ok(r as u64)
+}
+
 /// Parse "10G", "512M", "1024" (bytes) into a byte count.
 pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
@@ -234,7 +253,7 @@ pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
         _ => (s, 1u64),
     };
     let v: f64 = num.parse().map_err(|_| anyhow::anyhow!("invalid size '{s}'"))?;
-    Ok((v * mult as f64) as u64)
+    f64_to_u64(v, mult, "size", s)
 }
 
 pub fn fmt_bytes(b: u64) -> String {
@@ -261,10 +280,7 @@ pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
         .trim()
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration '{s}'"))?;
-    if v < 0.0 {
-        anyhow::bail!("invalid duration '{s}'");
-    }
-    Ok((v * mult as f64) as u64)
+    f64_to_u64(v, mult, "duration", s)
 }
 
 /// Seconds back to the coarsest whole unit: 604800 → "7d", 3600 → "1h".
@@ -360,6 +376,17 @@ mod tests {
         assert_eq!(parse_bytes("512m").unwrap(), 512 << 20);
         assert_eq!(parse_bytes("1024").unwrap(), 1024);
         assert!(parse_bytes("abc").is_err());
+        // f64 parse accepts these — they must be rejected, not saturated.
+        assert!(parse_bytes("NaN").is_err());
+        assert!(parse_bytes("nan").is_err());
+        assert!(parse_bytes("inf").is_err());
+        assert!(parse_bytes("-5").is_err());
+        assert!(parse_bytes("-5G").is_err());
+        assert!(parse_bytes("1e30").is_err()); // > 2^53
+        assert!(parse_bytes("9007199T").is_err()); // 'T' isn't a suffix → parse error
+        assert_eq!(parse_bytes("9007199254740992").unwrap(), 1 << 53); // == 2^53 ok
+        assert!(parse_bytes("10000000000000000").is_err()); // 1e16 > 2^53
+        assert!(parse_bytes("").is_err());
     }
 
     #[test]
@@ -373,6 +400,12 @@ mod tests {
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("-5d").is_err());
         assert!(parse_duration("").is_err());
+        // Same f64 traps as parse_bytes: NaN/inf parse fine, and a giant
+        // multiplier can push a sane-looking number past 2^53.
+        assert!(parse_duration("NaN").is_err());
+        assert!(parse_duration("inf").is_err());
+        assert!(parse_duration("-inf").is_err());
+        assert!(parse_duration("99999999999999d").is_err());
     }
 
     #[test]

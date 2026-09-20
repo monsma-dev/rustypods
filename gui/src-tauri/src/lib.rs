@@ -36,14 +36,20 @@ struct WatchMap(Mutex<HashMap<String, tokio::task::AbortHandle>>);
 struct LogWatchMap(Mutex<HashMap<String, tokio::task::AbortHandle>>);
 
 /// One live exec session: `stdin` feeds the bidi stream, `abort` kills the
-/// task that owns the outbound stream (and with it the gRPC call).
+/// task that owns the outbound stream (and with it the gRPC call). `id`
+/// is a per-session generation: the exec task's exit path removes the map
+/// entry only if it's still THIS session — otherwise a re-opened pty
+/// would be unregistered by the corpse it replaced.
 struct PtySession {
+    id: u64,
     stdin: mpsc::Sender<ExecChunk>,
     abort: tokio::task::AbortHandle,
 }
 
 /// Active exec/PTY sessions keyed by pod name.
 type PtyMap = Arc<Mutex<HashMap<String, PtySession>>>;
+
+static PTY_SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 async fn call<T, F, Fut>(rt: &tokio::runtime::Runtime, f: F) -> Result<T, String>
 where
@@ -391,6 +397,7 @@ async fn open_pty<R: tauri::Runtime>(
     let exit_ev = format!("pty-exit-{pod}");
     let map2 = map.inner().clone();
     let pod2 = pod.clone();
+    let session_id = PTY_SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let task = rt.0.spawn(async move {
         let setup = async {
             let mut c = connect(PathBuf::from(SOCKET_PATH), None)
@@ -433,13 +440,23 @@ async fn open_pty<R: tauri::Runtime>(
                 _ => {}
             }
         }
-        map2.lock().unwrap().remove(&pod2);
+        // Remove only if the map still holds THIS session — a newer
+        // open_pty for the same pod may already have replaced us.
+        let mut m = map2.lock().unwrap();
+        if m.get(&pod2).map(|s| s.id) == Some(session_id) {
+            m.remove(&pod2);
+        }
     });
     match setup_rx.await {
         Ok(Ok(())) => {
-            map.lock()
-                .unwrap()
-                .insert(pod, PtySession { stdin: tx, abort: task.abort_handle() });
+            map.lock().unwrap().insert(
+                pod,
+                PtySession {
+                    id: session_id,
+                    stdin: tx,
+                    abort: task.abort_handle(),
+                },
+            );
             Ok(())
         }
         Ok(Err(e)) => Err(e),

@@ -41,7 +41,9 @@ function useMetrics(pod: string, active: boolean): Metric[] {
       .onMetrics(pod, (m) => {
         if (!dead) setSamples((s) => [...s.slice(-29), m]);
       })
-      .then((u) => (un = u));
+      // The listen() promise can resolve after cleanup ran — then the
+      // unsubscribe fn must be invoked immediately or it leaks.
+      .then((u) => (dead ? u() : (un = u)));
     api.watchMetrics(pod);
     return () => {
       dead = true;
@@ -339,7 +341,7 @@ function MetricsSection({ pod, lean }: { pod: Pod; lean: boolean }) {
       .onMetrics(pod.name, (m) => {
         if (!dead) setSamples((s) => [...s.slice(-59), m]);
       })
-      .then((u) => (un = u));
+      .then((u) => (dead ? u() : (un = u)));
     api.watchMetrics(pod.name);
     return () => {
       dead = true;

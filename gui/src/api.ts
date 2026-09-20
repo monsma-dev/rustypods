@@ -242,7 +242,16 @@ export const updatePodConfig = async (u: PodConfigUpdate): Promise<Pod> => {
 
 // ---- live metrics (daemon stream → "pod-metrics" Tauri event) ----
 
+// watch_metrics opens ONE daemon stream per pod in the Tauri backend —
+// the PodRow sparkline and the PodDetail MetricsSection both subscribe,
+// and an unwatch kills the shared stream for everyone. Refcount so the
+// backend watch lives until the LAST subscriber unsubscribes.
+const metricsWatchers = new Map<string, number>();
+
 export const watchMetrics = async (name: string): Promise<void> => {
+  const n = (metricsWatchers.get(name) ?? 0) + 1;
+  metricsWatchers.set(name, n);
+  if (n > 1) return;
   if (inTauri) {
     await invoke("watch_metrics", { name });
     return;
@@ -251,6 +260,12 @@ export const watchMetrics = async (name: string): Promise<void> => {
 };
 
 export const unwatchMetrics = async (name: string): Promise<void> => {
+  const n = (metricsWatchers.get(name) ?? 0) - 1;
+  if (n > 0) {
+    metricsWatchers.set(name, n);
+    return;
+  }
+  metricsWatchers.delete(name);
   if (inTauri) {
     await invoke("unwatch_metrics", { name });
     return;

@@ -73,10 +73,12 @@ pub async fn spawn_listener(
     }
     let listener = UnixListener::bind(&sock)
         .with_context(|| format!("bind {}", sock.display()))?;
-    // Pod-side processes must be able to connect: world-writable socket on a
-    // daemon-owned dir (single-user box; peer is by definition this pod).
+    // 0660 root:root: the in-pod agent connects as container root; other
+    // pod-side processes can't open the socket to spoof metrics. For a
+    // userns pod (--private-users) container root is a host SUBUID — the
+    // caller must chown_sock_for_userns() once the leader pid is known.
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666))?;
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660))?;
 
     let (tx, rx) = oneshot::channel::<()>();
     listeners.lock().await.insert(pod.to_string(), tx);
@@ -102,6 +104,28 @@ pub async fn spawn_listener(
         tracing::info!("agent listener {pod_name} stopped");
     });
     Ok(())
+}
+
+/// For a userns pod, re-own `<run_dir>/agent.sock` to the kuid/kgid that
+/// container uid/gid 0 map to (first line of the leader's {u,g}id_map) —
+/// the socket is root:root 0660 and would otherwise be unreachable for
+/// the in-pod agent. Pods on the identity map (private_users=false) map
+/// 0→0: nothing to do.
+pub fn chown_sock_for_userns(run_dir: &Path, leader: u32) {
+    let mapped = |kind: &str| -> Option<u32> {
+        let m = std::fs::read_to_string(format!("/proc/{leader}/{kind}_map")).ok()?;
+        m.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+    };
+    let (Some(uid), Some(gid)) = (mapped("uid"), mapped("gid")) else {
+        return;
+    };
+    if uid == 0 {
+        return; // identity map — container root IS host root
+    }
+    let sock = run_dir.join("agent.sock");
+    if let Err(e) = std::os::unix::fs::chown(&sock, Some(uid), Some(gid)) {
+        tracing::warn!("chown {} for userns pod: {e}", sock.display());
+    }
 }
 
 /// Tear down a pod's agent listener (stop/destroy).

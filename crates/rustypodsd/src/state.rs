@@ -162,6 +162,13 @@ pub struct ImageMeta {
     pub working_dir: String,
 }
 
+/// A missing `private_users` key must mean ON: serde's default(false)
+/// would silently drop userns isolation on a hand-edited conf. Explicit
+/// `private_users = false` (stack members, desktop pods) still parses.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
     pub name: String,
@@ -171,7 +178,7 @@ pub struct PodMeta {
     pub limits: LimitsSpec,
     #[serde(default)]
     pub ephemeral: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub private_users: bool,
     #[serde(default)]
     pub started: bool,
@@ -223,11 +230,27 @@ fn image_conf(data_dir: &Path, name: &str) -> PathBuf {
     images_conf_dir(data_dir).join(format!("{name}.conf"))
 }
 
-/// Atomic-ish write: tmp file + rename.
+/// Atomic-ish write: tmp file + fsync + rename (+ dir sync so the rename
+/// itself survives a crash).
 fn write_conf(path: &Path, body: &str) -> Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("conf.tmp");
-    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(body.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    // Best-effort dir fsync: on some filesystems a rename isn't durable
+    // without it. Failure is non-fatal (e.g. read-only dirs in tests).
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -246,27 +269,79 @@ pub fn remove_image(data_dir: &Path, name: &str) {
     let _ = std::fs::remove_file(image_conf(data_dir, name));
 }
 
-/// Read a single conf (hand edit → `rustypods reload <pod>`).
+/// Conf sanity beyond TOML parsing — applied at boot (scan) and on
+/// `reload` (load_pod). `stem` is the conf filename without ".conf"; the
+/// embedded name must match it so a copied/stale file can't register a
+/// pod under a name its filename doesn't claim.
+///
+/// `check_binds` gates the validate_bind pass: it canonicalizes the host
+/// path, which requires it to exist — at boot a conf's bind (e.g.
+/// /run/user/<uid>) may legitimately not exist yet, and dropping the pod
+/// from state would hide its rootfs entirely. start_pod re-validates
+/// binds anyway, so boot-time skips are fail-safe.
+fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Result<()> {
+    rustypods_proto::validate_name(&m.name)?;
+    if m.name != stem {
+        anyhow::bail!("conf name '{}' does not match filename '{}.conf'", m.name, stem);
+    }
+    if m.net_index > 255 {
+        anyhow::bail!("net_index {} out of range (pool is 1..=255)", m.net_index);
+    }
+    // The stack name feeds netns/veth names that get truncated at BYTE
+    // 12 (net::stack_peer/veth_name) — a multibyte value would panic
+    // mid-char. validate_name is ASCII-only.
+    if !m.stack.is_empty() {
+        rustypods_proto::validate_name(&m.stack)
+            .with_context(|| format!("invalid stack name '{}'", m.stack))?;
+    }
+    for spec in &m.ports {
+        rustypods_proto::validate_port(spec)
+            .with_context(|| format!("invalid port '{spec}'"))?;
+    }
+    if check_binds {
+        for spec in &m.binds {
+            rustypods_proto::validate_bind(spec)
+                .with_context(|| format!("invalid bind '{spec}'"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a single conf (hand edit → `rustypods reload <pod>`). Unlike the
+/// boot-time scan this also checks bind specs — a reload is explicit and
+/// its error surfaces to the user, while the in-memory state is kept.
 pub fn load_pod(data_dir: &Path, name: &str) -> Result<PodMeta> {
     let p = pod_conf(data_dir, name);
     let s = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
-    toml::from_str(&s).with_context(|| format!("parse {}", p.display()))
+    let m: PodMeta = toml::from_str(&s).with_context(|| format!("parse {}", p.display()))?;
+    check_pod_meta(&m, name, true).with_context(|| format!("invalid {}", p.display()))?;
+    Ok(m)
 }
 
-fn scan<T: for<'de> Deserialize<'de>>(dir: &Path, out: &mut BTreeMap<String, T>, name_of: fn(&T) -> &str) {
+fn scan<T: for<'de> Deserialize<'de>>(
+    dir: &Path,
+    out: &mut BTreeMap<String, T>,
+    name_of: fn(&T) -> &str,
+    check: fn(&T, &str) -> Result<()>,
+) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("conf") {
             continue;
         }
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
         match std::fs::read_to_string(&p)
             .ok()
             .and_then(|s| toml::from_str::<T>(&s).ok())
         {
             Some(m) => {
-                if rustypods_proto::validate_name(name_of(&m)).is_err() {
-                    tracing::warn!("conf {} skipped (invalid name)", p.display());
+                if let Err(e) = check(&m, &stem) {
+                    tracing::warn!("conf {} skipped ({e:#})", p.display());
                     continue;
                 }
                 out.insert(name_of(&m).to_string(), m);
@@ -276,13 +351,29 @@ fn scan<T: for<'de> Deserialize<'de>>(dir: &Path, out: &mut BTreeMap<String, T>,
     }
 }
 
+fn check_image_meta(m: &ImageMeta, stem: &str) -> Result<()> {
+    rustypods_proto::validate_name(&m.name)?;
+    if m.name != stem {
+        anyhow::bail!("conf name '{}' does not match filename '{}.conf'", m.name, stem);
+    }
+    Ok(())
+}
+
 pub fn load(data_dir: &Path) -> State {
     migrate_json(data_dir);
     let mut st = State::default();
-    scan(&pods_conf_dir(data_dir), &mut st.pods, |m: &PodMeta| m.name.as_str());
-    scan(&images_conf_dir(data_dir), &mut st.images, |m: &ImageMeta| {
-        m.name.as_str()
-    });
+    scan(
+        &pods_conf_dir(data_dir),
+        &mut st.pods,
+        |m: &PodMeta| m.name.as_str(),
+        |m, stem| check_pod_meta(m, stem, false),
+    );
+    scan(
+        &images_conf_dir(data_dir),
+        &mut st.images,
+        |m: &ImageMeta| m.name.as_str(),
+        check_image_meta,
+    );
     st
 }
 
@@ -307,7 +398,8 @@ struct LegacyPod {
     limits: LegacyLimits,
     #[serde(default)]
     ephemeral: bool,
-    #[serde(default)]
+    // Same fail-open as PodMeta: absent = userns on, never silently off.
+    #[serde(default = "default_true")]
     private_users: bool,
 }
 #[derive(Deserialize)]
@@ -333,6 +425,11 @@ fn migrate_json(data_dir: &Path) {
         return;
     };
     for (name, i) in &old.images {
+        // The name lands in a filename — never trust it unvalidated.
+        if rustypods_proto::validate_name(&i.name).is_err() {
+            tracing::warn!("migrate: skipping image '{name}' — invalid name '{}'", i.name);
+            continue;
+        }
         let m = ImageMeta {
             name: i.name.clone(),
             source: i.source.clone(),
@@ -347,6 +444,10 @@ fn migrate_json(data_dir: &Path) {
         }
     }
     for (name, p) in &old.pods {
+        if rustypods_proto::validate_name(&p.name).is_err() {
+            tracing::warn!("migrate: skipping pod '{name}' — invalid name '{}'", p.name);
+            continue;
+        }
         let m = PodMeta {
             name: p.name.clone(),
             image: p.image.clone(),

@@ -2002,6 +2002,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "zbus",

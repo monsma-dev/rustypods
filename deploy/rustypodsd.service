@@ -13,5 +13,37 @@ RuntimeDirectory=rustypods
 Restart=on-failure
 RestartSec=2
 
+# Hardening — the daemon manages nspawn pods, not the kernel. Deliberately
+# NOT set (each breaks real functionality):
+#   ProtectKernelTunables — daemon writes /proc/sys ip_forward/route_localnet
+#   ProtectControlGroups  — exec path writes cgroup.procs
+#   ProtectHome           — desktop pods bind the user's home
+#   UMask=0077            — run dirs must stay 0755 for userns pods
+#   PrivateMounts         — `ip netns` bind-mounts into /run/netns
+#   RestrictSUIDSGID      — breaks su/setuid binaries inside pods
+#   ProtectSystem=strict  — /var/lib/rustypods must stay writable
+#   LockPersonality       — verified live (2026-09-20): its seccomp filter is
+#                           inherited by nspawn/pod init; every sandboxed pod
+#                           service (journald, networkd, logind…) then fails
+#                           exec with status=228/SECCOMP
+#   PrivateTmp            — verified live: nspawn resolves --bind sources in
+#                           the daemon's mountns, so --bind /tmp (desktop pods'
+#                           X11 socket dir) would mount the private tmpfs, not
+#                           the host's /tmp
+#   RestrictAddressFamilies — verified live: the seccomp socket() filter is
+#                           inherited by every pod process; systemd-networkd
+#                           inside pods then can't open AF_PACKET (LLDP/DHCP)
+#                           → host0 never gets its address → NAT dead. Any
+#                           allowlist will keep breaking pod payloads.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RemoveIPC=true
+
 [Install]
 WantedBy=multi-user.target

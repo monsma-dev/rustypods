@@ -14,6 +14,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use oci_client::client::{ClientConfig, ClientProtocol};
@@ -131,6 +132,61 @@ fn write_machine_id(dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// RAII guard for pull/import temp files staged next to a rootfs: unlinks
+/// the file on drop, on every exit path. Names are `.{prefix}<tag>-<pid>-
+/// <nanos>` so concurrent pulls of the same digest never share a path, and
+/// the fixed `.<prefix>` prefix lets `sweep_tmpfiles` recognize SIGKILL
+/// leftovers at daemon start.
+pub(crate) struct TmpGuard {
+    path: PathBuf,
+}
+
+impl TmpGuard {
+    pub(crate) fn new(dir: &Path, prefix: &str, tag: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        Self {
+            path: dir.join(format!(".{prefix}{tag}-{}-{nanos:x}", std::process::id())),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Startup sweep: `.layer-*`/`.export-*` temp files staged in `images_dir`
+/// outlive a SIGKILL'd pull/import. TmpGuard covers every orderly exit;
+/// this clears the crash leftovers.
+pub(crate) fn sweep_tmpfiles(images_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(images_dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(".layer-") || name.starts_with(".export-")) {
+            continue;
+        }
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            continue;
+        }
+        match std::fs::remove_file(e.path()) {
+            Ok(()) => tracing::info!("swept stale tmpfile {}", e.path().display()),
+            Err(err) => tracing::warn!("tmp sweep {}: {err}", e.path().display()),
+        }
+    }
+}
+
 /// Fetch one layer blob to a temp file next to `dest` (same fs, cheap),
 /// then decompress+untar it on a blocking thread. `pull_blob` verifies the
 /// blob against the layer digest itself.
@@ -151,28 +207,29 @@ async fn pull_layer(
     if !is_sha256_digest(&layer.digest) {
         bail!("{image}: layer digest '{}' is not sha256:<64 lowercase hex>", layer.digest);
     }
-    let tmp = dest
-        .parent()
-        .unwrap_or(dest)
-        .join(format!(".layer-{}", layer.digest.replace(':', "-")));
-    let res = async {
+    let guard = TmpGuard::new(
+        dest.parent().unwrap_or(dest),
+        "layer-",
+        &layer.digest.replace(':', "-"),
+    );
+    let tmp = guard.path().to_path_buf();
+    async {
         let mut f = tokio::fs::File::create(&tmp)
             .await
             .with_context(|| format!("create {}", tmp.display()))?;
         client.pull_blob(image, layer, &mut f).await?;
         anyhow::Ok(())
     }
-    .await;
-    if let Err(e) = res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("pulling layer {}", layer.digest));
-    }
+    .await
+    .with_context(|| format!("pulling layer {}", layer.digest))?;
     let tmp2 = tmp.clone();
     let dest2 = dest.to_path_buf();
     let mt = layer.media_type.clone();
-    let res = tokio::task::spawn_blocking(move || unpack_layer(&tmp2, &mt, &dest2)).await;
-    let _ = std::fs::remove_file(&tmp);
-    res.context("untar task")?
+    // `guard` is still live here — its Drop removes the temp file once
+    // this fn returns, whatever the unpack outcome.
+    tokio::task::spawn_blocking(move || unpack_layer(&tmp2, &mt, &dest2))
+        .await
+        .context("untar task")?
         .with_context(|| format!("unpacking layer {}", layer.digest))
 }
 

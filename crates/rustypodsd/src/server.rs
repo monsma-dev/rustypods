@@ -606,12 +606,28 @@ impl PodControl for Svc {
         }
         let slug = slugify(&req.label);
         let ts = state::now_unix();
-        let id = if slug.is_empty() {
+        // Snapshot ids carry only second precision — two same-label
+        // commits inside one second would collide on the dir name, and a
+        // btrfs clone into an existing dir fails. Suffix -2, -3, … until
+        // the name is free.
+        let base = if slug.is_empty() {
             ts.to_string()
         } else {
             format!("{ts}-{slug}")
         };
+        let mut id = base.clone();
+        for n in 2..=99u32 {
+            if !self.snaps_dir(&pod).join(&id).exists() {
+                break;
+            }
+            id = format!("{base}-{n}");
+        }
         let dst = self.snaps_dir(&pod).join(&id);
+        if dst.exists() {
+            return Err(Status::already_exists(format!(
+                "snapshot id '{id}' already exists — wait a second and retry"
+            )));
+        }
         std::fs::create_dir_all(dst.parent().unwrap()).map_err(int)?;
         self.st_clone(&self.pod_rootfs(&pod), &dst).await?;
         Ok(Response::new(Snapshot {
@@ -1127,6 +1143,14 @@ impl PodControl for Svc {
                 return Err(int(e));
             }
         };
+        // agent.sock is root:root 0660 — in a userns pod the in-pod agent's
+        // "root" is a host subuid and couldn't connect; re-own the socket
+        // to the kuid container-uid-0 maps to.
+        if meta.private_users {
+            if let Some(pid) = leader {
+                agent::chown_sock_for_userns(&spec.run_dir, pid);
+            }
+        }
         // Btrfs qgroup cap: quota accounting doesn't survive a remount, so
         // re-enable + re-apply on every start.
         if meta.storage_max_bytes > 0 {
@@ -1565,8 +1589,11 @@ impl PodControl for Svc {
         let mut rx = agent::latest_rx(&self.metrics, &name).await;
         let (tx, out) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
+            // The watch channel's initial value is Metric::default() until
+            // the agent's first push — don't stream a bogus all-zero
+            // sample (ts_unix_ms == 0 marks it synthetic).
             let first = rx.borrow().clone();
-            if tx.send(Ok(first)).await.is_err() {
+            if first.ts_unix_ms > 0 && tx.send(Ok(first)).await.is_err() {
                 return;
             }
             loop {
@@ -1655,15 +1682,15 @@ impl PodControl for Svc {
             let Some(stdout) = child.stdout.take() else {
                 return;
             };
-            use tokio::io::AsyncBufReadExt;
-            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut line = Vec::with_capacity(4096);
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
+                match read_log_line(&mut reader, &mut line).await {
+                    Ok(true) => {
                         if tx
                             .send(Ok(LogLine {
                                 ts_unix_ms: now_unix_ms(),
-                                data: line.into_bytes(),
+                                data: std::mem::take(&mut line),
                             }))
                             .await
                             .is_err()
@@ -1671,7 +1698,7 @@ impl PodControl for Svc {
                             break; // client gone — kill_on_drop reaps the child
                         }
                     }
-                    Ok(None) => break,
+                    Ok(false) => break,
                     Err(e) => {
                         let _ = tx.send(Err(int(e))).await;
                         break;
@@ -1680,6 +1707,64 @@ impl PodControl for Svc {
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// Per-line cap for stream_logs: BufReader::lines() buffers a whole line
+/// unbounded — a pod emitting one giant unterminated line would grow
+/// daemon RAM without limit. Longer lines are emitted truncated with a
+/// marker, and the remainder up to the newline is discarded.
+const LOG_LINE_MAX: usize = 64 << 10;
+const TRUNCATED_MARK: &[u8] = b" [truncated]";
+
+/// Read one line (the '\n' is consumed but not included) into `out`,
+/// capped at LOG_LINE_MAX. Returns Ok(false) only on clean EOF before any
+/// byte; a final unterminated line still returns Ok(true).
+async fn read_log_line<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    out: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    use tokio::io::AsyncBufReadExt;
+    out.clear();
+    // true once the cap was hit: discard everything up to the line's '\n'.
+    let mut skipping = false;
+    loop {
+        let buf = r.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(!out.is_empty());
+        }
+        if skipping {
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    let n = i + 1;
+                    r.consume(n);
+                    return Ok(true);
+                }
+                None => {
+                    let n = buf.len();
+                    r.consume(n);
+                }
+            }
+            continue;
+        }
+        let budget = LOG_LINE_MAX - out.len();
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(i) if i <= budget => {
+                out.extend_from_slice(&buf[..i]);
+                let n = i + 1;
+                r.consume(n);
+                return Ok(true);
+            }
+            _ => {
+                let take = budget.min(buf.len());
+                out.extend_from_slice(&buf[..take]);
+                r.consume(take);
+                if out.len() >= LOG_LINE_MAX {
+                    out.extend_from_slice(TRUNCATED_MARK);
+                    skipping = true;
+                }
+            }
+        }
     }
 }
 
@@ -1764,10 +1849,11 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         .stdout(Stdio::piped())
         .spawn()
         .context("runuser podman export")?;
-    let tmp = dest
-        .parent()
-        .unwrap_or(dest)
-        .join(format!(".export-{}", std::process::id()));
+    // TmpGuard: unique .export-<container>-<pid>-<nanos> name, unlinked on
+    // scope exit — concurrent imports can't collide and nothing leaks on
+    // the error paths below (SIGKILL leftovers → serve()'s tmp sweep).
+    let guard = oci::TmpGuard::new(dest.parent().unwrap_or(dest), "export-", container);
+    let tmp = guard.path().to_path_buf();
     // Drain the export stream to the temp file — podman blocks on a full
     // pipe if we wait first, so copy before checking the exit status.
     let copy_res = exp
@@ -1783,18 +1869,15 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         });
     let s_exp = exp.wait()?;
     if let Err(e) = copy_res {
-        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     if !s_exp.success() {
-        let _ = std::fs::remove_file(&tmp);
         bail!("podman export '{container}' failed — does the box exist? (podman ps -a)");
     }
-    let res = std::fs::File::open(&tmp)
+    std::fs::File::open(&tmp)
         .with_context(|| format!("open {}", tmp.display()))
-        .and_then(|f| oci::unpack_tar(f, dest));
-    let _ = std::fs::remove_file(&tmp);
-    res.with_context(|| format!("extracting export into {}", dest.display()))
+        .and_then(|f| oci::unpack_tar(f, dest))
+        .with_context(|| format!("extracting export into {}", dest.display()))
 }
 
 /// Does the rootfs carry a systemd init? Checked on the pod rootfs at
@@ -1945,6 +2028,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
     ] {
         std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
     }
+    // SIGKILL'd pulls/imports leave .layer-*/.export-* blobs behind.
+    oci::sweep_tmpfiles(&cfg.images_dir());
     // /dev/shm is world-writable (1777): the SHM subtree root must be a
     // real root-owned 0700 dir, or any local user could plant symlinks the
     // daemon (running as root) would follow during create_shm/start_pod —
@@ -2020,17 +2105,25 @@ pub async fn serve(cfg: Config) -> Result<()> {
     };
 
     // Daemon restarted while pods kept running → rebind their agent channels.
-    let running: Vec<String> = {
+    let running: Vec<(String, bool)> = {
         let guard = st.lock().await;
-        guard.pods.keys().cloned().collect()
+        guard
+            .pods
+            .values()
+            .map(|m| (m.name.clone(), m.private_users))
+            .collect()
     };
-    for name in running {
+    for (name, userns) in running {
         let run_dir = proto::run_dir(&cfg.data_dir, &name);
-        if engine.running_pid(&name).await.is_some() {
+        if let Some(leader) = engine.running_pid(&name).await {
             if let Err(e) =
                 agent::spawn_listener(&run_dir, &name, metrics.clone(), listeners.clone()).await
             {
                 tracing::warn!("agent-listener {name}: {e:#}");
+            }
+            // Same as start_pod: hand agent.sock to the mapped kuid.
+            if userns && leader > 0 {
+                agent::chown_sock_for_userns(&run_dir, leader);
             }
         }
     }
@@ -2100,6 +2193,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let incoming = ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
     tracing::info!("rustypodsd listening on {}", cfg.socket.display());
     Server::builder()
+        // The socket admits uid 0 and the allowed uid — both can spawn
+        // streaming RPCs (journalctl/tail/nsenter). Cap in-flight requests
+        // per connection and across the whole server so one chatty client
+        // can't exhaust the subprocess/desc budget.
+        .concurrency_limit_per_connection(32)
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256))
         .add_service(PodControlServer::new(svc))
         .serve_with_incoming_shutdown(incoming, async {
             let _ = tokio::signal::ctrl_c().await;

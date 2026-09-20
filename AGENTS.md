@@ -64,9 +64,12 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
   payload is its child (`/proc/<pid>/task/<pid>/children`). Cgroup moves and
   metrics must target the CHILD, not the nsenter pid.
 - `machine-<pod>.scope` and `payload/` have `subtree_control` on →
-  `cgroup.procs` writes fail with EBUSY (no-internal-process). Create a leaf
-  `machine-<pod>.scope/rustypods-exec` and write there — exec'd processes
-  then DO fall under the pod's MemoryHigh/CPUQuota.
+  `cgroup.procs` writes fail with EBUSY (no-internal-process). exec.rs
+  sidesteps this entirely: `nsenter --cgroup --join-cgroup` joins the
+  leader's cgroup atomically at setns time — exec'd processes land in
+  `machine-<pod>.scope/payload/init.scope` (verified live, 2026-09) and DO
+  fall under the pod's MemoryHigh/CPUQuota. No host-side leaf cgroup is
+  created anymore.
 - `nsenter --wd=<path>` resolves against the host mountns before setns →
   `getcwd` fails in the container. Don't use it; `cd $HOME` in the login
   shell wrapper instead.
