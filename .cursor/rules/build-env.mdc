@@ -1,0 +1,15 @@
+---
+description: Build environment — RustyPods dev pod (self-hosting builds)
+alwaysApply: true
+---
+
+RustyPods builds inside its own `dev` pod (dogfooding) — not on the host, not in the podman/distrobox `arch` box.
+
+```bash
+rustypods start dev   # usually already up (autostart)
+rustypods shell dev -- bash -lc 'cd ~/Projects/rustypods && set -o pipefail && RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build && cargo test'
+```
+
+- `shell` has no `-w` flag — `cd` inside the command; always `set -o pipefail` when piping cargo output.
+- Bootstrap fallback if the daemon itself is broken: `podman exec -u nick -w /home/nick/Projects/rustypods arch bash -lc …`.
+- protoc is vendored via `protoc-bin-vendored`; after editing `crates/rustypods-proto/proto/rustypods.proto` run `gui/scripts/gen-proto.sh` (works inside the pod).

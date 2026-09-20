@@ -2,14 +2,21 @@
 
 ## Build env
 
-Host has **no Rust toolchain**. Build inside the `arch` distrobox:
+Host has **no Rust toolchain**. Build inside the `dev` pod — rustypods
+dogfoods itself (`dev` runs the `arch-base` image imported from the old
+distrobox, `/home/nick` bound rw, autostart on):
 
 ```bash
-podman start arch   # if needed
-podman exec -u nick -w /home/nick/Projects/rustypods arch bash -lc \
-  'set -o pipefail; RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build && cargo test'
+rustypods start dev   # usually already up (autostart)
+rustypods shell dev -- bash -lc \
+  'cd ~/Projects/rustypods && set -o pipefail && \
+   RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build && cargo test'
 # or: bash scripts/build.sh  (release build + tests)
 ```
+
+No `-w` flag on `shell` — `cd` inside the command. If the daemon itself
+is broken (bootstrap problem), fall back to the podman distrobox `arch`:
+`podman exec -u nick -w /home/nick/Projects/rustypods arch bash -lc …`.
 
 `protoc` is vendored via `protoc-bin-vendored` — no system protobuf needed.
 
