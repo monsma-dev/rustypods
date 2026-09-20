@@ -1,6 +1,7 @@
 //! tonic server on a Unix socket. Peer credentials gate access:
 //! uid 0 or Config::allowed_uid may connect; everyone else is dropped.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command as SyncCommand, Stdio};
 use std::sync::Arc;
@@ -35,6 +36,10 @@ pub struct Svc {
     engine: Arc<dyn RuntimeEngine>,
     /// How rootfs trees are cloned/capped — btrfs CoW or reflink fallback.
     storage: Arc<dyn StorageDriver>,
+    /// Per-pod op serializer: start/stop/destroy/commit/clone/rollback and
+    /// stack member ops must never interleave on the same pod name. Entries
+    /// are never evicted — keyed by ≤32-char pod names, a few bytes each.
+    ops: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// Hard cap on a single SHM segment — the file lives on /dev/shm (tmpfs),
@@ -193,6 +198,48 @@ impl Svc {
         Ok(v)
     }
 
+    /// Per-pod op lock, held for the whole duration of a stateful op on
+    /// `name`. `stack:<name>` keys serialize stack-level apply/destroy.
+    async fn pod_op(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let m = {
+            let mut ops = self.ops.lock().await;
+            ops.entry(name.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        m.lock_owned().await
+    }
+
+    /// Storage/net helpers spawn subprocesses (btrfs, cp, rm, ip, nft) —
+    /// never let them block the async executor; hop to the blocking pool.
+    async fn blocking<T, F>(f: F) -> Result<T, Status>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| int(anyhow::anyhow!("blocking task: {e}")))?
+            .map_err(int)
+    }
+
+    async fn st_create(&self, path: &Path) -> Result<(), Status> {
+        let (s, p) = (self.storage.clone(), path.to_path_buf());
+        Self::blocking(move || s.create_rootfs(&p)).await
+    }
+    async fn st_clone(&self, src: &Path, dst: &Path) -> Result<(), Status> {
+        let (s, a, b) = (
+            self.storage.clone(),
+            src.to_path_buf(),
+            dst.to_path_buf(),
+        );
+        Self::blocking(move || s.clone_rootfs(&a, &b)).await
+    }
+    async fn st_delete(&self, path: &Path) -> Result<(), Status> {
+        let (s, p) = (self.storage.clone(), path.to_path_buf());
+        Self::blocking(move || s.delete_rootfs(&p)).await
+    }
+
     /// <data>/snapshots/<pod>/ — one subvolume per commit.
     fn snaps_dir(&self, pod: &str) -> std::path::PathBuf {
         self.cfg.data_dir.join("snapshots").join(pod)
@@ -248,7 +295,7 @@ impl Svc {
         for m in pods {
             for (i, s) in self.snapshots(&m.name).iter().enumerate() {
                 if snapshot_expired(i, s.created_unix, m.snap_keep_last, m.snap_max_age_secs, now) {
-                    match self.storage.delete_rootfs(Path::new(&s.path)) {
+                    match self.st_delete(Path::new(&s.path)).await {
                         Ok(()) => tracing::info!("gc: deleted snapshot {} of pod {}", s.id, m.name),
                         Err(e) => {
                             tracing::warn!("gc: snapshot {} of pod {}: {e:#}", s.id, m.name)
@@ -271,7 +318,8 @@ impl Svc {
                 running.insert(m.name.clone());
             }
         }
-        net::rebuild_nat(pods.iter(), &running);
+        // `nft -f -` is a subprocess — off the executor.
+        let _ = tokio::task::spawn_blocking(move || net::rebuild_nat(pods.iter(), &running)).await;
     }
 }
 
@@ -313,18 +361,18 @@ impl PodControl for Svc {
             )));
         };
         proto::validate_unix_user(&user).map_err(bad)?;
-        self.storage.create_rootfs(&dest).map_err(int)?;
+        self.st_create(&dest).await?;
         let d = dest.clone();
         let cont = req.distrobox.clone();
         let res = tokio::task::spawn_blocking(move || import_distrobox(&user, &cont, &d)).await;
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                let _ = self.storage.delete_rootfs(&dest);
+                let _ = self.st_delete(&dest).await;
                 return Err(int(e));
             }
             Err(je) => {
-                let _ = self.storage.delete_rootfs(&dest);
+                let _ = self.st_delete(&dest).await;
                 return Err(int(anyhow::anyhow!("task: {je}")));
             }
         }
@@ -358,11 +406,11 @@ impl PodControl for Svc {
         if dest.exists() {
             return Err(Status::already_exists(format!("image {name} already exists")));
         }
-        self.storage.create_rootfs(&dest).map_err(int)?;
+        self.st_create(&dest).await?;
         let cfg = match oci::pull(&req.reference, &dest).await {
             Ok(c) => c,
             Err(e) => {
-                let _ = self.storage.delete_rootfs(&dest);
+                let _ = self.st_delete(&dest).await;
                 return Err(int(e));
             }
         };
@@ -415,15 +463,16 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
-        let mut st = self.st.lock().await;
-        if st.pods.values().any(|p| p.image == name) {
-            return Err(Status::failed_precondition(format!(
-                "image {name} is still in use by a pod"
-            )));
+        {
+            let st = self.st.lock().await;
+            if st.pods.values().any(|p| p.image == name) {
+                return Err(Status::failed_precondition(format!(
+                    "image {name} is still in use by a pod"
+                )));
+            }
         }
-        self.storage
-            .delete_rootfs(&self.cfg.images_dir().join(&name))
-            .map_err(int)?;
+        self.st_delete(&self.cfg.images_dir().join(&name)).await?;
+        let mut st = self.st.lock().await;
         st.images.remove(&name);
         state::remove_image(&self.cfg.data_dir, &name);
         Ok(Response::new(Empty {}))
@@ -432,6 +481,7 @@ impl PodControl for Svc {
     async fn create_pod(&self, req: Request<CreatePodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        let _op = self.pod_op(&name).await;
         let image = proto::validate_name(&req.image).map_err(bad)?.to_string();
         let img_dir = self.cfg.images_dir().join(&image);
         if !img_dir.is_dir() {
@@ -459,7 +509,7 @@ impl PodControl for Svc {
                 }
             }
         }
-        self.storage.clone_rootfs(&img_dir, &dest).map_err(int)?;
+        self.st_clone(&img_dir, &dest).await?;
         let meta = PodMeta {
             name: name.clone(),
             image,
@@ -492,6 +542,19 @@ impl PodControl for Svc {
         let req = req.into_inner();
         let src = proto::validate_name(&req.source).map_err(bad)?.to_string();
         let dest = proto::validate_name(&req.dest).map_err(bad)?.to_string();
+        // Lock both names, sorted — unordered acquisition would let
+        // `clone a→b` racing `clone b→a` deadlock.
+        let (first, second) = if src <= dest {
+            (src.clone(), dest.clone())
+        } else {
+            (dest.clone(), src.clone())
+        };
+        let _g1 = self.pod_op(&first).await;
+        let _g2 = if second != first {
+            Some(self.pod_op(&second).await)
+        } else {
+            None
+        };
         let meta = {
             let st = self.st.lock().await;
             let Some(m) = st.pods.get(&src) else {
@@ -506,9 +569,7 @@ impl PodControl for Svc {
         if dst_root.exists() {
             return Err(Status::already_exists(format!("pod {dest} already exists")));
         }
-        self.storage
-            .clone_rootfs(&self.pod_rootfs(&src), &dst_root)
-            .map_err(int)?;
+        self.st_clone(&self.pod_rootfs(&src), &dst_root).await?;
         let meta = PodMeta {
             name: dest.clone(),
             created_unix: state::now_unix(),
@@ -533,6 +594,7 @@ impl PodControl for Svc {
     async fn commit_pod(&self, req: Request<CommitPodRequest>) -> Result<Response<Snapshot>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        let _op = self.pod_op(&pod).await;
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&pod) {
@@ -551,7 +613,7 @@ impl PodControl for Svc {
         };
         let dst = self.snaps_dir(&pod).join(&id);
         std::fs::create_dir_all(dst.parent().unwrap()).map_err(int)?;
-        self.storage.clone_rootfs(&self.pod_rootfs(&pod), &dst).map_err(int)?;
+        self.st_clone(&self.pod_rootfs(&pod), &dst).await?;
         Ok(Response::new(Snapshot {
             id,
             pod,
@@ -567,6 +629,7 @@ impl PodControl for Svc {
     async fn rollback_pod(&self, req: Request<RollbackPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        let _op = self.pod_op(&pod).await;
         if !req.snapshot.is_empty() {
             proto::validate_snapshot_id(&req.snapshot).map_err(bad)?;
         }
@@ -615,24 +678,24 @@ impl PodControl for Svc {
         // Leftovers from a crashed earlier rollback — clear before staging.
         for p in [&staging, &backup] {
             if p.exists() || p.is_symlink() {
-                self.storage.delete_rootfs(p).map_err(int)?;
+                self.st_delete(p).await?;
             }
         }
-        self.storage.clone_rootfs(snap_path, &staging).map_err(int)?;
+        self.st_clone(snap_path, &staging).await?;
         if let Err(e) = std::fs::rename(&rootfs, &backup) {
-            let _ = self.storage.delete_rootfs(&staging);
+            let _ = self.st_delete(&staging).await;
             return Err(int(e));
         }
         if let Err(e) = std::fs::rename(&staging, &rootfs) {
             // Swap half-done: try to put the original back before reporting.
             let restore_err = std::fs::rename(&backup, &rootfs).err();
-            let _ = self.storage.delete_rootfs(&staging);
+            let _ = self.st_delete(&staging).await;
             return Err(int(match restore_err {
                 Some(r) => anyhow::anyhow!("{e:#}; restore also failed: {r:#}"),
                 None => e.into(),
             }));
         }
-        self.storage.delete_rootfs(&backup).map_err(int)?;
+        self.st_delete(&backup).await?;
         {
             let mut st = self.st.lock().await;
             if let Some(m) = st.pods.get_mut(&pod) {
@@ -666,13 +729,14 @@ impl PodControl for Svc {
     async fn delete_snapshot(&self, req: Request<SnapshotRef>) -> Result<Response<Empty>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        let _op = self.pod_op(&pod).await;
         proto::validate_snapshot_id(&req.id).map_err(bad)?;
         // Guard: the id may only ever resolve inside this pod's snap dir.
         let path = self.snaps_dir(&pod).join(&req.id);
         if !path.starts_with(self.snaps_dir(&pod)) || !path.exists() {
             return Err(Status::not_found(format!("snapshot '{}' not found", req.id)));
         }
-        self.storage.delete_rootfs(&path).map_err(int)?;
+        self.st_delete(&path).await?;
         Ok(Response::new(Empty {}))
     }
 
@@ -694,6 +758,11 @@ impl PodControl for Svc {
             })
             .map_err(bad)?
         };
+        // Serialize the whole apply per stack name — two concurrent applies
+        // of the same stack could otherwise compute different net indexes
+        // and split the members across /30 pairs. The `stack:` prefix keeps
+        // this key distinct from a pod literally named after the stack.
+        let _stack_op = self.pod_op(&format!("stack:{}", def.name)).await;
         // Host-port policy vs everything OUTSIDE this stack before any
         // state changes (stack::parse already deduped within the stack).
         {
@@ -722,48 +791,78 @@ impl PodControl for Svc {
         for (member, sp) in &def.pods {
             let pname = stack::member_name(&def.name, member);
             let rootfs = self.pod_rootfs(&pname);
-            let meta = {
-                let mut st = self.st.lock().await;
-                match st.pods.get_mut(&pname) {
-                    Some(m) => {
-                        m.ports = sp.ports.clone();
-                        m.limits = sp.limits;
-                        m.storage_max_bytes = sp.storage_max_bytes;
-                        m.stack = def.name.clone();
-                        m.net_index = idx;
-                        m.snap_keep_last = sp.snap_keep_last;
-                        m.snap_max_age_secs = sp.snap_max_age_secs;
-                        m.clone()
+            let _member_op = self.pod_op(&pname).await;
+            // Check existence under the state lock — but never clone a
+            // rootfs holding it: the reflink-fallback cp can copy gigabytes.
+            let existing = {
+                let st = self.st.lock().await;
+                match st.pods.get(&pname) {
+                    Some(m) if m.stack.is_empty() => {
+                        return Err(Status::failed_precondition(format!(
+                            "pod {pname} already exists as a standalone pod — \
+                             destroy it before applying stack {}",
+                            def.name
+                        )));
                     }
-                    None => {
-                        self.storage
-                            .clone_rootfs(&self.cfg.images_dir().join(&sp.image), &rootfs)
-                            .map_err(int)?;
-                        let m = PodMeta {
-                            name: pname.clone(),
-                            image: sp.image.clone(),
-                            created_unix: state::now_unix(),
-                            limits: sp.limits,
-                            ephemeral: false,
-                            // Stacks join a pre-made netns via
-                            // --network-namespace-path; setns() needs
-                            // CAP_SYS_ADMIN in its owning userns
-                            // (init_user_ns), which a pick-userns child
-                            // never has — so stack members run without
-                            // userns. Standalone `create` pods do get it.
-                            private_users: false,
-                            started: false,
-                            storage_max_bytes: sp.storage_max_bytes,
-                            ports: sp.ports.clone(),
-                            net_index: idx,
-                            stack: def.name.clone(),
-                            binds: vec![],
-                            snap_keep_last: sp.snap_keep_last,
-                            snap_max_age_secs: sp.snap_max_age_secs,
-                        };
-                        st.pods.insert(pname.clone(), m.clone());
-                        m
+                    Some(m) if m.stack != def.name => {
+                        return Err(Status::failed_precondition(format!(
+                            "pod {pname} belongs to stack '{}' — refusing to \
+                             adopt it into '{}'",
+                            m.stack, def.name
+                        )));
                     }
+                    other => other.cloned(),
+                }
+            };
+            let meta = match existing {
+                Some(mut m) => {
+                    m.ports = sp.ports.clone();
+                    m.limits = sp.limits;
+                    m.storage_max_bytes = sp.storage_max_bytes;
+                    m.stack = def.name.clone();
+                    m.net_index = idx;
+                    m.snap_keep_last = sp.snap_keep_last;
+                    m.snap_max_age_secs = sp.snap_max_age_secs;
+                    self.st.lock().await.pods.insert(pname.clone(), m.clone());
+                    m
+                }
+                None => {
+                    self.st_clone(&self.cfg.images_dir().join(&sp.image), &rootfs)
+                        .await?;
+                    let m = PodMeta {
+                        name: pname.clone(),
+                        image: sp.image.clone(),
+                        created_unix: state::now_unix(),
+                        limits: sp.limits,
+                        ephemeral: false,
+                        // Stacks join a pre-made netns via
+                        // --network-namespace-path; setns() needs
+                        // CAP_SYS_ADMIN in its owning userns
+                        // (init_user_ns), which a pick-userns child
+                        // never has — so stack members run without
+                        // userns. Standalone `create` pods do get it.
+                        private_users: false,
+                        started: false,
+                        storage_max_bytes: sp.storage_max_bytes,
+                        ports: sp.ports.clone(),
+                        net_index: idx,
+                        stack: def.name.clone(),
+                        binds: vec![],
+                        snap_keep_last: sp.snap_keep_last,
+                        snap_max_age_secs: sp.snap_max_age_secs,
+                    };
+                    let mut st = self.st.lock().await;
+                    if st.pods.contains_key(&pname) {
+                        // Only possible if an op skipped the per-pod lock —
+                        // drop the freshly cloned rootfs and bail cleanly.
+                        drop(st);
+                        let _ = self.st_delete(&rootfs).await;
+                        return Err(Status::already_exists(format!(
+                            "pod {pname} was created concurrently — re-apply the stack"
+                        )));
+                    }
+                    st.pods.insert(pname.clone(), m.clone());
+                    m
                 }
             };
             self.save_pod(&meta).map_err(int)?;
@@ -771,8 +870,13 @@ impl PodControl for Svc {
         }
         // Fail loudly at apply-time if netns/veth wiring doesn't work —
         // better here than on the first `stack start`.
-        net::ensure_stack_net(&def.name, idx).map_err(int)?;
+        {
+            let name = def.name.clone();
+            Self::blocking(move || net::ensure_stack_net(&name, idx)).await?;
+        }
         net::ensure_ip_forward().map_err(int)?;
+        // Members' ports/net_index may have changed — rebuild the DNAT table.
+        self.sync_nat().await;
         let pods = out
             .iter()
             .map(|m| to_pod(m, &self.pod_rootfs(&m.name), None))
@@ -789,6 +893,10 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        // Serialize against apply_stack and per-pod ops: take the stack key
+        // FIRST — an in-flight apply must finish before we enumerate members
+        // (a member added after listing would escape teardown).
+        let _stack_op = self.pod_op(&format!("stack:{name}")).await;
         let members: Vec<String> = {
             let st = self.st.lock().await;
             st.pods
@@ -800,6 +908,14 @@ impl PodControl for Svc {
         if members.is_empty() {
             return Err(Status::not_found(format!("stack {name} not found")));
         }
+        // Every member's op lock too, in sorted order (ordered acquisition).
+        let mut sorted = members.clone();
+        sorted.sort();
+        sorted.dedup();
+        let mut _guards = Vec::with_capacity(sorted.len());
+        for n in &sorted {
+            _guards.push(self.pod_op(n).await);
+        }
         for pname in &members {
             self.engine.stop(pname).await.map_err(int)?;
             if self.engine.registered(pname).await.map_err(int)? {
@@ -808,7 +924,7 @@ impl PodControl for Svc {
                 )));
             }
             agent::stop_listener(&self.listeners, pname).await;
-            self.storage.delete_rootfs(&self.pod_rootfs(pname)).map_err(int)?;
+            self.st_delete(&self.pod_rootfs(pname)).await?;
             state::remove_pod(&self.cfg.data_dir, pname);
             agent::cleanup_pod_dirs(
                 &proto::run_dir(&self.cfg.data_dir, pname),
@@ -817,7 +933,12 @@ impl PodControl for Svc {
             let mut st = self.st.lock().await;
             st.pods.remove(pname);
         }
-        net::teardown_stack_net(&name);
+        let n = name.clone();
+        let _ = Self::blocking(move || {
+            net::teardown_stack_net(&n);
+            Ok(())
+        })
+        .await;
         self.sync_nat().await;
         Ok(Response::new(Empty {}))
     }
@@ -825,6 +946,7 @@ impl PodControl for Svc {
     async fn start_pod(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        let _op = self.pod_op(&name).await;
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
@@ -846,7 +968,10 @@ impl PodControl for Svc {
             if !lim.is_empty() {
                 meta.limits = lim;
             }
-            meta.ephemeral = req.ephemeral;
+            // Sticky: only ever SET via `start -x`. A later plain start
+            // (restart, GUI, REST — all send ephemeral:false) must not
+            // silently clear a previously requested ephemeral pod.
+            meta.ephemeral |= req.ephemeral;
             // Absent = keep the conf value (a bare `start` must not flip it).
             if let Some(pu) = req.private_users {
                 meta.private_users = pu;
@@ -897,9 +1022,13 @@ impl PodControl for Svc {
                 ))
             })?;
             if !chdir.is_empty() {
-                // Docker semantics: a configured WorkingDir is created if absent.
-                std::fs::create_dir_all(rootfs.join(chdir.trim_start_matches('/')))
-                    .map_err(int)?;
+                // Docker semantics: a configured WorkingDir is created if
+                // absent. Normalize first — '..' would escape the rootfs
+                // entirely — then create without following image-planted
+                // symlinks (rootfs helpers).
+                if let Some(rel) = crate::rootfs::normalize_rel(&chdir).map_err(bad)? {
+                    crate::rootfs::mkdir_in_rootfs(&rootfs, &rel).map_err(int)?;
+                }
             }
         } else if !has_systemd_init(&rootfs) {
             return Err(Status::failed_precondition(format!(
@@ -932,21 +1061,14 @@ impl PodControl for Svc {
             Some(self.cfg.allowed_uid),
             Some(self.cfg.allowed_uid),
         );
-        agent::spawn_listener(
-            &run_dir,
-            &name,
-            self.metrics.clone(),
-            self.listeners.clone(),
-        )
-        .await
-        .map_err(int)?;
         // Networking is wired BEFORE spawn: stack members join a pre-made
         // netns (nspawn opens the path at exec), standalone port-pods get
-        // their static host0 config written into the rootfs.
+        // their static host0 config written into the rootfs. Everything
+        // fallible happens BEFORE the agent listener is spawned — an early
+        // return here must not leak a listener task + its stale socket.
         let netns = if meta.stack.is_empty() {
             if !meta.ports.is_empty() {
                 if meta.net_index == 0 {
-                    agent::stop_listener(&self.listeners, &name).await;
                     return Err(Status::failed_precondition(
                         "port pool exhausted (255 port-mapped pods max)",
                     ));
@@ -956,17 +1078,30 @@ impl PodControl for Svc {
             None
         } else {
             if meta.net_index == 0 {
-                agent::stop_listener(&self.listeners, &name).await;
                 return Err(Status::failed_precondition(
                     "port pool exhausted (255 port-mapped pods max)",
                 ));
             }
-            net::ensure_stack_net(&meta.stack, meta.net_index).map_err(int)?;
+            {
+                let stack = meta.stack.clone();
+                let idx = meta.net_index;
+                Self::blocking(move || net::ensure_stack_net(&stack, idx)).await?;
+            }
             if let Err(e) = net::ensure_ip_forward() {
                 tracing::warn!("ip_forward: {e:#}");
             }
             Some(net::netns_path(&meta.stack))
         };
+        // Last fallible step before spawn: the agent listener. From here on
+        // the only failure path is engine.start below, which stops it.
+        agent::spawn_listener(
+            &run_dir,
+            &name,
+            self.metrics.clone(),
+            self.listeners.clone(),
+        )
+        .await
+        .map_err(int)?;
         let log = self.cfg.logs_dir().join(format!("{name}.log"));
         let spec = StartSpec {
             name: name.clone(),
@@ -995,7 +1130,7 @@ impl PodControl for Svc {
         // Btrfs qgroup cap: quota accounting doesn't survive a remount, so
         // re-enable + re-apply on every start.
         if meta.storage_max_bytes > 0 {
-            if let Err(e) = self.apply_storage_cap(&meta) {
+            if let Err(e) = self.apply_storage_cap(&meta).await {
                 tracing::warn!("storage cap {name}: {e:#}");
             }
         }
@@ -1029,7 +1164,10 @@ impl PodControl for Svc {
                         running.insert(m.name.clone());
                     }
                 }
-                net::rebuild_nat(pods.iter(), &running);
+                // `nft -f -` is a subprocess — off the executor.
+                let _ =
+                    tokio::task::spawn_blocking(move || net::rebuild_nat(pods.iter(), &running))
+                        .await;
             });
         }
         let mut st = self.st.lock().await;
@@ -1046,6 +1184,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        let _op = self.pod_op(&name).await;
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
@@ -1065,9 +1204,15 @@ impl PodControl for Svc {
     }
 
     async fn list_pods(&self, _req: Request<ListPodsRequest>) -> Result<Response<PodList>, Status> {
-        let st = self.st.lock().await;
+        // Clone the metas and DROP the state lock before the machined
+        // lookups — a D-Bus await under the global lock stalls every other
+        // RPC touching state.
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods.values().cloned().collect()
+        };
         let mut out = Vec::new();
-        for m in st.pods.values() {
+        for m in &pods {
             out.push(to_pod(
                 m,
                 &self.pod_rootfs(&m.name),
@@ -1082,6 +1227,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        let _op = self.pod_op(&name).await;
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
@@ -1097,7 +1243,7 @@ impl PodControl for Svc {
             )));
         }
         agent::stop_listener(&self.listeners, &name).await;
-        self.storage.delete_rootfs(&self.pod_rootfs(&name)).map_err(int)?;
+        self.st_delete(&self.pod_rootfs(&name)).await?;
         state::remove_pod(&self.cfg.data_dir, &name);
         agent::cleanup_pod_dirs(
             &proto::run_dir(&self.cfg.data_dir, &name),
@@ -1116,12 +1262,16 @@ impl PodControl for Svc {
         let snaps = self.snaps_dir(&name);
         if let Ok(rd) = std::fs::read_dir(&snaps) {
             for e in rd.flatten() {
-                let _ = self.storage.delete_rootfs(&e.path());
+                let _ = self.st_delete(&e.path()).await;
             }
             let _ = std::fs::remove_dir(&snaps);
         }
         if let Some(stack) = orphan_netns {
-            net::teardown_stack_net(&stack);
+            let _ = Self::blocking(move || {
+                net::teardown_stack_net(&stack);
+                Ok(())
+            })
+            .await;
         }
         self.sync_nat().await;
         Ok(Response::new(Empty {}))
@@ -1134,6 +1284,7 @@ impl PodControl for Svc {
     ) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        let _op = self.pod_op(&name).await;
         let lim = limits_from(req.limits);
         if let Some(pm) = &req.ports {
             for spec in &pm.ports {
@@ -1183,7 +1334,7 @@ impl PodControl for Svc {
         if self.engine.running_pid(&name).await.is_some() {
             self.engine.apply_limits(&name, &meta.limits).await.map_err(int)?;
         }
-        self.apply_storage_cap(&meta).map_err(int)?;
+        self.apply_storage_cap(&meta).await.map_err(int)?;
         if ports_changed {
             self.sync_nat().await;
         }
@@ -1199,6 +1350,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        let _op = self.pod_op(&name).await;
         let meta = state::load_pod(&self.cfg.data_dir, &name).map_err(int)?;
         for spec in &meta.ports {
             proto::validate_port(spec).map_err(bad)?;
@@ -1217,7 +1369,7 @@ impl PodControl for Svc {
         if self.engine.running_pid(&name).await.is_some() {
             self.engine.apply_limits(&name, &meta.limits).await.map_err(int)?;
         }
-        self.apply_storage_cap(&meta).map_err(int)?;
+        self.apply_storage_cap(&meta).await.map_err(int)?;
         let leader = self.engine.running_pid(&name).await;
         Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
     }
@@ -1590,12 +1742,19 @@ fn snapshot_expired(idx: usize, created_unix: u64, keep_last: u32, max_age: u64,
 }
 
 /// Rootless podman lives in the user's store — root can't reach it, so the
-/// export runs as that user and tar (as root) writes the real uids.
+/// export runs as that user. The tarball is staged to a temp file next to
+/// `dest` (same fs — same pattern as oci::pull_layer) and then fed to the
+/// in-tree hardened untar (`oci::unpack_tar`): normalized paths, no device
+/// nodes, symlink-safe whiteout handling — strictly stronger than piping
+/// into GNU `tar -x`.
 fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
     let uid_out = SyncCommand::new("id")
         .args(["-u", user])
         .output()
         .context("id -u")?;
+    if !uid_out.status.success() {
+        bail!("id -u {user} failed: {}", String::from_utf8_lossy(&uid_out.stderr).trim());
+    }
     let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
     let mut exp = SyncCommand::new("runuser")
         .args(["-u", user, "--"])
@@ -1605,21 +1764,37 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         .stdout(Stdio::piped())
         .spawn()
         .context("runuser podman export")?;
-    let mut tar = SyncCommand::new("tar")
-        .args(["-x", "-C"])
-        .arg(dest)
-        .stdin(exp.stdout.take().context("export stdout")?)
-        .spawn()
-        .context("tar")?;
+    let tmp = dest
+        .parent()
+        .unwrap_or(dest)
+        .join(format!(".export-{}", std::process::id()));
+    // Drain the export stream to the temp file — podman blocks on a full
+    // pipe if we wait first, so copy before checking the exit status.
+    let copy_res = exp
+        .stdout
+        .take()
+        .context("export stdout")
+        .and_then(|mut out| {
+            let mut f = std::fs::File::create(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            std::io::copy(&mut out, &mut f)
+                .map(|_| ())
+                .context("reading podman export stream")
+        });
     let s_exp = exp.wait()?;
-    let s_tar = tar.wait()?;
+    if let Err(e) = copy_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if !s_exp.success() {
+        let _ = std::fs::remove_file(&tmp);
         bail!("podman export '{container}' failed — does the box exist? (podman ps -a)");
     }
-    if !s_tar.success() {
-        bail!("tar extract into {} failed", dest.display());
-    }
-    Ok(())
+    let res = std::fs::File::open(&tmp)
+        .with_context(|| format!("open {}", tmp.display()))
+        .and_then(|f| oci::unpack_tar(f, dest));
+    let _ = std::fs::remove_file(&tmp);
+    res.with_context(|| format!("extracting export into {}", dest.display()))
 }
 
 /// Does the rootfs carry a systemd init? Checked on the pod rootfs at
@@ -1666,7 +1841,8 @@ fn slugify(s: &str) -> String {
 /// caller sites decide whether failure is fatal (config apply) or a warning
 /// (pod start).
 impl Svc {
-    fn apply_storage_cap(&self, meta: &PodMeta) -> Result<()> {
+    /// Quota calls spawn `btrfs` subprocesses — off the async executor.
+    async fn apply_storage_cap(&self, meta: &PodMeta) -> Result<()> {
         if !self.storage.supports_quota() && meta.storage_max_bytes > 0 {
             bail!(
                 "storage_max needs btrfs — driver '{}' doesn't support quotas",
@@ -1676,8 +1852,13 @@ impl Svc {
         if !self.storage.supports_quota() {
             return Ok(());
         }
-        self.storage
-            .apply_quota(&self.cfg.pods_dir().join(&meta.name), meta.storage_max_bytes)
+        let s = self.storage.clone();
+        let path = self.cfg.pods_dir().join(&meta.name);
+        let bytes = meta.storage_max_bytes;
+        match tokio::task::spawn_blocking(move || s.apply_quota(&path, bytes)).await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("blocking task: {e}")),
+        }
     }
 }
 
@@ -1686,6 +1867,10 @@ impl Svc {
 /// `container_id` = the distrobox name — host wrappers in ~/.local/bin check
 /// CONTAINER_ID and exec the local binary directly when it matches.
 fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
+    // All rootfs access goes through the symlink-safe helpers: an image
+    // with `etc -> /host/etc` planted must fail here, never let these
+    // deletes/writes land on the host.
+    use crate::rootfs as rfs;
     for rel in [
         "etc/hostname",
         "etc/hosts",
@@ -1695,18 +1880,18 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
         "usr/bin/distrobox-export",
         "usr/bin/distrobox-host-exec",
     ] {
-        let p = root.join(rel);
-        if p.exists() || p.is_symlink() {
-            let _ = std::fs::remove_file(&p);
-        }
+        rfs::remove_in_rootfs(root, rel)?;
     }
     // Empty machine-id = uninitialized → container generates its own.
-    std::fs::write(root.join("etc/machine-id"), b"")?;
-    let _ = std::fs::remove_dir_all(root.join("run/host"));
-    if let Ok(rd) = std::fs::read_dir(root.join("etc/profile.d")) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().contains("distrobox") {
-                let _ = std::fs::remove_file(e.path());
+    rfs::write_in_rootfs(root, "etc/machine-id", b"", None)?;
+    rfs::remove_in_rootfs(root, "run/host")?;
+    // Read-only enumeration — never list host dirs through a symlink.
+    if let Some(profile_d) = rfs::safe_join_if_exists(root, "etc/profile.d")? {
+        if let Ok(rd) = std::fs::read_dir(&profile_d) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().contains("distrobox") {
+                    let _ = std::fs::remove_file(e.path());
+                }
             }
         }
     }
@@ -1714,31 +1899,37 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
     // matching the source box name makes them exec the real /usr/bin binary.
     // Fallback for unset CONTAINER_ID: a shim at the absolute path the
     // wrappers call, stripping "-n <box> --" and exec'ing the payload.
-    let mut envf = std::fs::read_to_string(root.join("etc/environment")).unwrap_or_default();
+    let mut envf = rfs::safe_join(root, "etc/environment")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
     if !envf.contains("CONTAINER_ID=") {
         envf.push_str(&format!("CONTAINER_ID={container_id}\n"));
-        std::fs::write(root.join("etc/environment"), envf)?;
+        rfs::write_in_rootfs(root, "etc/environment", envf.as_bytes(), None)?;
     }
-    let shim = root.join("usr/bin/distrobox-enter");
-    std::fs::write(
-        &shim,
-        "#!/bin/sh\n# rustypods shim: inside an nspawn pod, exec the payload directly.\nwhile [ $# -gt 0 ]; do [ \"$1\" = \"--\" ] && { shift; break; }; shift; done\nexec \"$@\"\n",
+    rfs::write_in_rootfs(
+        root,
+        "usr/bin/distrobox-enter",
+        "#!/bin/sh\n# rustypods shim: inside an nspawn pod, exec the payload directly.\nwhile [ $# -gt 0 ]; do [ \"$1\" = \"--\" ] && { shift; break; }; shift; done\nexec \"$@\"\n"
+            .as_bytes(),
+        Some(0o755),
     )?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
 
     // In-pod telemetry agent: enabled unit, binary comes via the ro-bind of
     // /var/lib/rustypods/bin → /run/rustypods/bin at pod start.
-    let unit_dir = root.join("etc/systemd/system");
-    let wants_dir = unit_dir.join("multi-user.target.wants");
-    std::fs::create_dir_all(&wants_dir)?;
-    std::fs::write(
-        unit_dir.join("rustypods-agent.service"),
-        "[Unit]\nDescription=RustyPods in-pod telemetry agent\nAfter=local-fs.target\n\n[Service]\nExecStart=/run/rustypods/bin/rustypods-agent\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+    rfs::mkdir_in_rootfs(root, "etc/systemd/system/multi-user.target.wants")?;
+    rfs::write_in_rootfs(
+        root,
+        "etc/systemd/system/rustypods-agent.service",
+        "[Unit]\nDescription=RustyPods in-pod telemetry agent\nAfter=local-fs.target\n\n[Service]\nExecStart=/run/rustypods/bin/rustypods-agent\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
+            .as_bytes(),
+        None,
     )?;
-    let link = wants_dir.join("rustypods-agent.service");
-    let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink("../rustypods-agent.service", &link)?;
+    rfs::symlink_in_rootfs(
+        root,
+        "etc/systemd/system/multi-user.target.wants/rustypods-agent.service",
+        Path::new("../rustypods-agent.service"),
+    )?;
     Ok(())
 }
 
@@ -1807,7 +1998,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
             .await
             .context("connecting to system D-Bus")?,
     });
-    let storage = storage::detect(&cfg.data_dir);
+    // `detect` probes the fs with `stat -f` — a subprocess; off the
+    // executor even though nothing is serving yet.
+    let dd = cfg.data_dir.clone();
+    let storage = tokio::task::spawn_blocking(move || storage::detect(&dd))
+        .await
+        .context("storage detect task")?;
     engine.init().await?;
 
     let st = Arc::new(Mutex::new(state::load(&cfg.data_dir)));
@@ -1820,6 +2016,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         listeners: listeners.clone(),
         engine: engine.clone(),
         storage,
+        ops: Default::default(),
     };
 
     // Daemon restarted while pods kept running → rebind their agent channels.

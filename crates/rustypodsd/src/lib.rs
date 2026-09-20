@@ -4,6 +4,7 @@ pub mod exec;
 pub mod http;
 pub mod net;
 pub mod oci;
+pub mod rootfs;
 pub mod runtime;
 pub mod server;
 pub mod stack;

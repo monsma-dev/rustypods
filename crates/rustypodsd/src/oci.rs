@@ -32,6 +32,26 @@ pub struct ImageConfig {
     pub working_dir: String,
 }
 
+/// Pull-time resource caps — the manifest and blobs are
+/// registry-controlled, so nothing may grow unbounded:
+/// - layer count: absurd counts mean thousands of blobs+untar passes;
+/// - per-layer COMPRESSED size: refused before the blob is even fetched;
+/// - per-layer DECOMPRESSED size: a gzip bomb gets truncated mid-stream.
+const MAX_LAYERS: usize = 512;
+const MAX_LAYER_BLOB: i64 = 16 << 30;
+const MAX_LAYER_DECOMPRESSED: u64 = 8 << 30;
+
+/// A layer digest must be `sha256:<64 lowercase hex>` — anything else is
+/// not a real OCI digest and could carry '/' or '..' into the temp-file
+/// path derived from it.
+fn is_sha256_digest(d: &str) -> bool {
+    d.len() == 7 + 64
+        && d.starts_with("sha256:")
+        && d.as_bytes()[7..]
+            .iter()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Default image name for `pull` without --name: "<repo-basename>-<tag>",
 /// slugged into a valid pod/image name. "node:20-alpine" → "node-20-alpine",
 /// "ghcr.io/org/tool:v1" → "tool-v1".
@@ -73,8 +93,22 @@ pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
         .await
         .with_context(|| format!("pulling manifest for {image}"))?;
     tracing::info!("{image}: manifest {digest}, {} layer(s)", manifest.layers.len());
+    if manifest.layers.len() > MAX_LAYERS {
+        bail!(
+            "{image}: {} layers exceeds the {MAX_LAYERS}-layer cap",
+            manifest.layers.len()
+        );
+    }
     let cfg = parse_config(&config_json);
     for layer in &manifest.layers {
+        if layer.size > MAX_LAYER_BLOB {
+            bail!(
+                "{image}: layer {} is {} bytes compressed (> {} GiB cap)",
+                layer.digest,
+                layer.size,
+                MAX_LAYER_BLOB >> 30
+            );
+        }
         pull_layer(&client, &image, layer, dest).await?;
     }
     write_machine_id(dest)?;
@@ -82,32 +116,16 @@ pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
 }
 
 /// Same convention as sanitize_rootfs: an empty etc/machine-id marks the
-/// rootfs uninitialized so the container generates its own. But `etc` may
-/// be an image-planted symlink (e.g. `etc -> /host/dir`): only write when
-/// it resolves to a real directory *inside* the rootfs — never follow the
-/// link out and clobber a host file.
+/// rootfs uninitialized so the container generates its own. `etc` may be an
+/// image-planted symlink (e.g. `etc -> /host/dir`): the rootfs helpers
+/// refuse to resolve through it — warn and skip rather than clobber a host
+/// file (or fail the pull — the image is still usable).
 fn write_machine_id(dest: &Path) -> Result<()> {
-    let etc = dest.join("etc");
-    let real_dir = match std::fs::symlink_metadata(&etc) {
-        // Absent → create a real dir ourselves (create_dir_all can't plant
-        // a symlink at the final component; a symlinked earlier component
-        // is caught by the canonicalize check below).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(&etc)
-            .and_then(|_| std::fs::symlink_metadata(&etc))
-            .map(|m| m.is_dir())
-            .unwrap_or(false),
-        Ok(md) => md.is_dir(),
-        Err(_) => false,
-    };
-    let inside_dest = matches!(
-        (etc.canonicalize(), dest.canonicalize()),
-        (Ok(e), Ok(d)) if e.starts_with(&d)
-    );
-    if real_dir && inside_dest {
-        std::fs::write(etc.join("machine-id"), b"")?;
-    } else {
+    let res = crate::rootfs::mkdir_in_rootfs(dest, "etc")
+        .and_then(|_| crate::rootfs::write_in_rootfs(dest, "etc/machine-id", b"", None));
+    if let Err(e) = res {
         tracing::warn!(
-            "image 'etc' is a symlink or escapes the rootfs — skipping machine-id write"
+            "image 'etc' is a symlink or escapes the rootfs — skipping machine-id write ({e:#})"
         );
     }
     Ok(())
@@ -128,6 +146,11 @@ async fn pull_layer(
         layer.media_type,
         layer.size
     );
+    // The digest lands in the temp filename — a '/' or '..' in a malicious
+    // descriptor would escape the images dir.
+    if !is_sha256_digest(&layer.digest) {
+        bail!("{image}: layer digest '{}' is not sha256:<64 lowercase hex>", layer.digest);
+    }
     let tmp = dest
         .parent()
         .unwrap_or(dest)
@@ -167,7 +190,18 @@ fn unpack_layer(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
     } else {
         bail!("unsupported layer media type '{media_type}'");
     };
-    unpack_tar(reader, dest)
+    // Decompressed cap (gzip-bomb guard): a layer growing past the cap is
+    // cut mid-stream — the untar then fails on the truncated entry — and a
+    // fully-drained reader means the stream hit the cap exactly.
+    let mut limited = reader.take(MAX_LAYER_DECOMPRESSED + 1);
+    unpack_tar(&mut limited, dest)?;
+    if limited.limit() == 0 {
+        bail!(
+            "layer decompresses past {} GiB — refusing (possible decompression bomb)",
+            MAX_LAYER_DECOMPRESSED >> 30
+        );
+    }
+    Ok(())
 }
 
 /// Normalize a tar entry path to an in-tree relative path: `.` is dropped,
@@ -210,7 +244,9 @@ fn remove_children(dir: &Path) {
 
 /// Stream-untar one layer into `dest`, applying whiteouts. Entry order in
 /// the tar is preserved (whiteouts land where the spec puts them).
-fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
+/// crate-visible: the distrobox import routes its export stream through
+/// the same hardened untar.
+pub(crate) fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
     let mut ar = tar::Archive::new(reader);
     // Keep recorded uids/modes — only meaningful (and only permitted) when
     // the daemon runs as root; a rootless run just gets extractor-owned files.
@@ -536,6 +572,19 @@ mod tests {
             b""
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn digest_validation() {
+        let good = format!("sha256:{}", "a".repeat(64));
+        assert!(is_sha256_digest(&good));
+        assert!(is_sha256_digest(&format!("sha256:{}", "0123456789abcdef".repeat(4))));
+        assert!(!is_sha256_digest("sha256:abc")); // too short
+        assert!(!is_sha256_digest(&format!("sha256:{}", "A".repeat(64)))); // uppercase
+        assert!(!is_sha256_digest(&format!("sha512:{}", "a".repeat(64))));
+        // The attack: '/' or '..' must never reach the tmp filename.
+        assert!(!is_sha256_digest("sha256:../../etc/cron.d/x"));
+        assert!(!is_sha256_digest(&format!("sha256:{}/x", "a".repeat(62))));
     }
 
     #[test]

@@ -40,24 +40,28 @@ pub fn alloc_index(pods: &BTreeMap<String, PodMeta>) -> u32 {
 /// Static host0 config inside the pod rootfs. Written to
 /// etc/systemd/network/80-container-host0.network — an /etc file of the same
 /// name cleanly overrides the stock /usr/lib one. Also enables networkd.
+/// All writes go through crate::rootfs: an image-planted `etc -> /host`
+/// symlink must fail, never redirect writes onto the host.
 pub fn write_pod_network(rootfs: &Path, idx: u32) -> Result<()> {
-    let dir = rootfs.join("etc/systemd/network");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join("80-container-host0.network"),
+    use crate::rootfs as rfs;
+    rfs::mkdir_in_rootfs(rootfs, "etc/systemd/network")?;
+    rfs::write_in_rootfs(
+        rootfs,
+        "etc/systemd/network/80-container-host0.network",
         format!(
             "[Match]\nName=host0\n\n[Network]\nAddress={}/30\nGateway={}\n",
             pod_ip(idx),
             host_ip(idx)
-        ),
+        )
+        .as_bytes(),
+        None,
     )?;
     // Enable systemd-networkd (service + its socket) in the pod.
     for wants in [
         "etc/systemd/system/multi-user.target.wants",
         "etc/systemd/system/sockets.target.wants",
     ] {
-        let d = rootfs.join(wants);
-        std::fs::create_dir_all(&d)?;
+        rfs::mkdir_in_rootfs(rootfs, wants)?;
     }
     let units = [
         (
@@ -70,13 +74,20 @@ pub fn write_pod_network(rootfs: &Path, idx: u32) -> Result<()> {
         ),
     ];
     for (link, target) in units {
-        let p = rootfs.join("etc/systemd/system").join(link);
-        let _ = std::fs::remove_file(&p);
-        let _ = std::os::unix::fs::symlink(target, &p);
+        // The target is an in-container path — stored verbatim, never
+        // resolved on the host.
+        rfs::symlink_in_rootfs(
+            rootfs,
+            format!("etc/systemd/system/{link}"),
+            Path::new(target),
+        )?;
     }
     Ok(())
 }
 
+/// Blocking subprocess — the sync callers of this are themselves invoked
+/// via `tokio::task::spawn_blocking` (or run on a dedicated thread), so it
+/// never sits on the async executor.
 fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let out = Command::new(cmd)
         .args(args)
@@ -87,6 +98,19 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
     } else {
         bail!("{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim())
     }
+}
+
+/// `run` on the blocking pool — for the one async caller
+/// (configure_host_veth) that can't itself be wrapped in spawn_blocking
+/// because it interleaves `ip` calls with async sleeps.
+async fn run_async(cmd: &'static str, args: &[&str]) -> Result<()> {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run(cmd, &refs)
+    })
+    .await
+    .context("blocking task")?
 }
 
 // --- stacks: one shared netns per stack (the K8s pod model) -----------------
@@ -168,11 +192,12 @@ pub async fn configure_host_veth(pod: &str, idx: u32) -> Result<()> {
     if !Path::new(&sys).exists() {
         bail!("veth {veth} never appeared");
     }
-    run("ip", &["link", "set", &veth, "up"])?;
-    run(
+    run_async("ip", &["link", "set", &veth, "up"]).await?;
+    run_async(
         "ip",
         &["addr", "replace", &format!("{}/30", host_ip(idx)), "dev", &veth],
-    )?;
+    )
+    .await?;
     // Replies to localhost-DNAT'd flows arrive with a 127/8 source — dropped
     // as martian unless the receiving iface allows it.
     let _ = std::fs::write(
