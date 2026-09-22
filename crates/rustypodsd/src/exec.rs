@@ -248,6 +248,14 @@ pub fn exec_argv(
         }
         a.push(kv.clone().into());
     }
+    // workdir rides in the environment, not the sh -c string — no quoting
+    // edge cases on spaces/single quotes in the path.
+    if !start.workdir.is_empty() {
+        if !start.workdir.starts_with('/') {
+            anyhow::bail!("workdir must be an absolute in-container path");
+        }
+        a.push(format!("RUSTYPODS_WORKDIR={}", start.workdir).into());
+    }
     // Restore the real stdin (see STDIN_DUP_FD), then run the payload.
     // `sh -c '…' name args…` puts name in $0 and the rest in $@.
     if start.argv.is_empty() {
@@ -255,7 +263,7 @@ pub fn exec_argv(
         a.push("/bin/sh".into());
         a.push("-c".into());
         a.push(
-            format!("exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; cd \"$HOME\" && exec \"$0\" \"$@\"")
+            format!("exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; cd \"${{RUSTYPODS_WORKDIR:-$HOME}}\" && exec \"$0\" \"$@\"")
                 .into(),
         );
         a.push(shell.into());
@@ -263,7 +271,14 @@ pub fn exec_argv(
     } else {
         a.push("/bin/sh".into());
         a.push("-c".into());
-        a.push(format!("exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; exec \"$0\" \"$@\"").into());
+        a.push(
+            format!(
+                "exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; \
+                 if [ -n \"$RUSTYPODS_WORKDIR\" ]; then cd \"$RUSTYPODS_WORKDIR\" || exit 1; fi; \
+                 exec \"$0\" \"$@\""
+            )
+            .into(),
+        );
         a.extend(start.argv.iter().map(OsString::from));
     }
     Ok(a)
@@ -530,6 +545,7 @@ mod tests {
             rows: 0,
             cols: 0,
             env: vec!["TERM=xterm".into()],
+            workdir: String::new(),
         }
     }
 

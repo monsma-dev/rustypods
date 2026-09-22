@@ -104,6 +104,7 @@ enum Cmd {
     /// Restart with the persisted limits.
     Restart { name: String },
     /// List pods.
+    #[command(visible_alias = "ls", alias = "list")]
     Ps,
     /// Stop and remove a pod (Btrfs snapshot gone).
     Destroy { name: String },
@@ -184,14 +185,35 @@ enum Cmd {
         sub: ShmCmd,
     },
     /// Shell into a running pod (native Exec RPC: nsenter + host pty).
+    #[command(visible_alias = "exec")]
     Shell {
         name: String,
         /// Log in as this container user (default: $USER).
         #[arg(long)]
         user: Option<String>,
+        /// In-container working directory (absolute path).
+        #[arg(short, long)]
+        workdir: Option<String>,
+        /// Fail if any stage of a pipeline fails: exports SHELLOPTS=pipefail
+        /// into the payload so `bash -lc 'cargo build | tail'` can't hide a
+        /// build error behind tail's exit 0. Only effective for bash.
+        #[arg(long)]
+        strict: bool,
         /// Command instead of an interactive shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
+    },
+    /// Copy files/dirs between host and pod. Exactly one side must be a
+    /// `pod:/abs/path` — the other is a host path. Streams via tar/cat over
+    /// the Exec RPC; needs `tar` in the image for directory transfers.
+    Cp {
+        /// Source: host path or `pod:/abs/path`.
+        src: String,
+        /// Destination: host path or `pod:/abs/path`.
+        dst: String,
+        /// Container user for the remote side (default: $USER).
+        #[arg(long)]
+        user: Option<String>,
     },
 }
 
@@ -237,6 +259,8 @@ async fn shell_exec(
     remote: Option<String>,
     name: String,
     user: Option<String>,
+    workdir: Option<String>,
+    strict: bool,
     cmd: Vec<String>,
 ) -> Result<()> {
     use rustypods_proto::rpc::exec_chunk::Kind;
@@ -253,6 +277,11 @@ async fn shell_exec(
             env.push(format!("{k}={v}"));
         }
     }
+    if strict {
+        // bash imports SHELLOPTS at startup — any bash in the payload
+        // (including `bash -lc 'a | b'`) then runs with pipefail on.
+        env.push("SHELLOPTS=pipefail".into());
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<ExecChunk>(32);
     tx.send(ExecChunk {
         kind: Some(Kind::Start(ExecStart {
@@ -263,6 +292,7 @@ async fn shell_exec(
             rows,
             cols,
             env,
+            workdir: workdir.unwrap_or_default(),
         })),
     })
     .await?;
@@ -335,6 +365,347 @@ async fn shell_exec(
     stdin_task.abort();
     drop(raw); // restore termios before exit
     std::process::exit(code);
+}
+
+// ── cp ──────────────────────────────────────────────────────────────────────
+
+/// `pod:/abs/path` → (pod, path). Host paths (anything without a bare
+/// `name:` prefix) return None.
+fn split_pod_path(s: &str) -> Result<Option<(String, String)>> {
+    let Some((name, path)) = s.split_once(':') else {
+        return Ok(None);
+    };
+    if name.is_empty() || name.contains('/') {
+        return Ok(None); // host path containing ':'
+    }
+    if !path.starts_with('/') {
+        anyhow::bail!("pod path must be absolute: '{s}'");
+    }
+    Ok(Some((name.to_string(), path.to_string())))
+}
+
+/// Open an Exec stream: sends Start, returns the stdin channel + response.
+async fn exec_open(
+    sock: &std::path::Path,
+    remote: &Option<String>,
+    start: ExecStart,
+) -> Result<(
+    tokio::sync::mpsc::Sender<ExecChunk>,
+    tonic::Streaming<ExecChunk>,
+)> {
+    use rustypods_proto::rpc::exec_chunk::Kind;
+    use tokio_stream::wrappers::ReceiverStream;
+    let (tx, rx) = tokio::sync::mpsc::channel::<ExecChunk>(32);
+    tx.send(ExecChunk {
+        kind: Some(Kind::Start(start)),
+    })
+    .await?;
+    let mut c = connect(sock.to_path_buf(), remote.clone()).await?;
+    let inbound = c.exec(ReceiverStream::new(rx)).await?.into_inner();
+    Ok((tx, inbound))
+}
+
+/// Drain an exec stream: collects stderr, returns (exit_code, stderr).
+async fn exec_wait(inbound: &mut tonic::Streaming<ExecChunk>) -> Result<(i32, String)> {
+    use rustypods_proto::rpc::exec_chunk::Kind;
+    let mut code = 1;
+    let mut err = String::new();
+    while let Some(m) = inbound.message().await? {
+        match m.kind {
+            Some(Kind::Stderr(b)) => err.push_str(&String::from_utf8_lossy(&b)),
+            Some(Kind::Exit(e)) => {
+                code = e.code;
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok((code, err))
+}
+
+fn cp_start(pod: &str, user: &str, argv: Vec<String>) -> ExecStart {
+    ExecStart {
+        pod: pod.to_string(),
+        user: user.to_string(),
+        argv,
+        tty: false,
+        rows: 0,
+        cols: 0,
+        env: vec![],
+        workdir: String::new(),
+    }
+}
+
+/// Remote `[ -d path ]` probe — exit 0 = directory.
+async fn pod_is_dir(
+    sock: &std::path::Path,
+    remote: &Option<String>,
+    pod: &str,
+    user: &str,
+    path: &str,
+) -> Result<bool> {
+    let (tx, mut inbound) = exec_open(
+        sock,
+        remote,
+        cp_start(
+            pod,
+            user,
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "[ -d \"$1\" ]".into(),
+                "sh".into(),
+                path.into(),
+            ],
+        ),
+    )
+    .await?;
+    drop(tx); // no stdin needed
+    let (code, _) = exec_wait(&mut inbound).await?;
+    Ok(code == 0)
+}
+
+/// Stream local bytes into the exec's stdin. Tar spawns host-side
+/// `tar -C <cwd> -cf - <base>`; File streams the file directly.
+enum Producer {
+    File(std::path::PathBuf),
+    Tar {
+        cwd: std::path::PathBuf,
+        base: std::ffi::OsString,
+    },
+}
+
+impl Producer {
+    async fn stream(self, tx: tokio::sync::mpsc::Sender<ExecChunk>) -> Result<()> {
+        use rustypods_proto::rpc::exec_chunk::Kind;
+        use tokio::io::AsyncReadExt;
+        let (mut reader, mut child): (
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            Option<tokio::process::Child>,
+        ) = match self {
+            Producer::File(p) => (Box::pin(tokio::fs::File::open(&p).await?), None),
+            Producer::Tar { cwd, base } => {
+                let mut child = tokio::process::Command::new("tar")
+                    .args(["-C"])
+                    .arg(&cwd)
+                    .args(["-cf", "-"])
+                    .arg(&base)
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .context("spawn host tar")?;
+                let out = child.stdout.take().context("tar stdout")?;
+                (Box::pin(out), Some(child))
+            }
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx
+                        .send(ExecChunk {
+                            kind: Some(Kind::Stdin(buf[..n].to_vec())),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        // tx drop → outbound stream ends → daemon closes remote stdin (EOF).
+        drop(tx);
+        if let Some(c) = child.as_mut() {
+            let st = c.wait().await?;
+            if !st.success() {
+                anyhow::bail!("host tar failed: {st}");
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn cp_to_pod(
+    sock: PathBuf,
+    remote: Option<String>,
+    pod: &str,
+    user: &str,
+    src: &std::path::Path,
+    dst: &str,
+) -> Result<()> {
+    let meta = std::fs::metadata(src)
+        .with_context(|| format!("{}: no such file or directory", src.display()))?;
+    let dst_is_dir = pod_is_dir(&sock, &remote, pod, user, dst).await?;
+    let base = src
+        .file_name()
+        .context("source has no file name")?
+        .to_os_string();
+    // Relative paths like `file.txt` have an empty parent — tar needs ".".
+    let parent = src
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+
+    let (argv, producer) = if dst_is_dir {
+        // File or dir → extract inside the remote dir.
+        (
+            vec!["tar".into(), "-C".into(), dst.into(), "-xf".into(), "-".into()],
+            Producer::Tar { cwd: parent, base },
+        )
+    } else {
+        if meta.is_dir() {
+            anyhow::bail!(
+                "{dst}: not an existing directory in the pod — create it first or end the path with /"
+            );
+        }
+        // Single file → plain copy with rename semantics.
+        (
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "sh".into(),
+                dst.into(),
+            ],
+            Producer::File(src.to_path_buf()),
+        )
+    };
+
+    let (tx, mut inbound) = exec_open(&sock, &remote, cp_start(pod, user, argv)).await?;
+    let prod = tokio::spawn(producer.stream(tx));
+    let (code, err) = exec_wait(&mut inbound).await?;
+    prod.await??;
+    if code != 0 {
+        anyhow::bail!("cp: remote exited {code}: {}", err.trim());
+    }
+    Ok(())
+}
+
+async fn cp_from_pod(
+    sock: PathBuf,
+    remote: Option<String>,
+    pod: &str,
+    user: &str,
+    src: &str,
+    dst: &std::path::Path,
+) -> Result<()> {
+    use rustypods_proto::rpc::exec_chunk::Kind;
+    use std::io::Write;
+    use tokio::io::AsyncWriteExt;
+
+    let src_is_dir = pod_is_dir(&sock, &remote, pod, user, src).await?;
+    let base = std::path::Path::new(src)
+        .file_name()
+        .context("source has no file name")?
+        .to_string_lossy()
+        .to_string();
+
+    if src_is_dir {
+        // tar stream → extract on the host into dst (created if missing).
+        std::fs::create_dir_all(dst)
+            .with_context(|| format!("create {}", dst.display()))?;
+        let parent = std::path::Path::new(src)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".into());
+        let (tx, mut inbound) = exec_open(
+            &sock,
+            &remote,
+            cp_start(
+                pod,
+                user,
+                vec!["tar".into(), "-C".into(), parent, "-cf".into(), "-".into(), base],
+            ),
+        )
+        .await?;
+        drop(tx);
+        let mut tar = tokio::process::Command::new("tar")
+            .args(["-C"])
+            .arg(dst)
+            .args(["-xf", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("spawn host tar")?;
+        let mut tin = tar.stdin.take().context("tar stdin")?;
+        let mut err = String::new();
+        let mut code = 1;
+        while let Some(m) = inbound.message().await? {
+            match m.kind {
+                Some(Kind::Stdout(b)) => tin.write_all(&b).await?,
+                Some(Kind::Stderr(b)) => err.push_str(&String::from_utf8_lossy(&b)),
+                Some(Kind::Exit(e)) => {
+                    code = e.code;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        drop(tin);
+        let st = tar.wait().await?;
+        if code != 0 {
+            anyhow::bail!("cp: remote exited {code}: {}", err.trim());
+        }
+        if !st.success() {
+            anyhow::bail!("cp: host tar failed: {st}");
+        }
+    } else {
+        // Single file → cat; dst is a dir → keep basename, else rename.
+        let target = if dst.is_dir() { dst.join(&base) } else { dst.to_path_buf() };
+        let (tx, mut inbound) = exec_open(
+            &sock,
+            &remote,
+            cp_start(pod, user, vec!["cat".into(), src.into()]),
+        )
+        .await?;
+        drop(tx);
+        let mut f = std::fs::File::create(&target)
+            .with_context(|| format!("create {}", target.display()))?;
+        let mut err = String::new();
+        let mut code = 1;
+        while let Some(m) = inbound.message().await? {
+            match m.kind {
+                Some(Kind::Stdout(b)) => f.write_all(&b)?,
+                Some(Kind::Stderr(b)) => err.push_str(&String::from_utf8_lossy(&b)),
+                Some(Kind::Exit(e)) => {
+                    code = e.code;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if code != 0 {
+            let _ = std::fs::remove_file(&target);
+            anyhow::bail!("cp: remote exited {code}: {}", err.trim());
+        }
+        println!("{} → {}", src, target.display());
+    }
+    Ok(())
+}
+
+async fn cp_cmd(
+    sock: PathBuf,
+    remote: Option<String>,
+    src: String,
+    dst: String,
+    user: Option<String>,
+) -> Result<()> {
+    let src_pod = split_pod_path(&src)?;
+    let dst_pod = split_pod_path(&dst)?;
+    let user = user.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "root".into());
+    match (src_pod, dst_pod) {
+        (Some((pod, sp)), None) => {
+            cp_from_pod(sock, remote, &pod, &user, &sp, &PathBuf::from(&dst)).await
+        }
+        (None, Some((pod, dp))) => {
+            cp_to_pod(sock, remote, &pod, &user, &PathBuf::from(&src), &dp).await
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pod-to-pod copy not supported — copy via the host")
+        }
+        (None, None) => anyhow::bail!("one side must be `pod:/abs/path`"),
+    }
 }
 
 fn term_size() -> (u32, u32) {
@@ -425,8 +796,17 @@ fn print_pod(p: &Pod) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Shell { name, user, cmd } => {
-            shell_exec(cli.socket, cli.remote, name, user, cmd).await?;
+        Cmd::Shell {
+            name,
+            user,
+            workdir,
+            strict,
+            cmd,
+        } => {
+            shell_exec(cli.socket, cli.remote, name, user, workdir, strict, cmd).await?;
+        }
+        Cmd::Cp { src, dst, user } => {
+            cp_cmd(cli.socket, cli.remote, src, dst, user).await?;
         }
         Cmd::Ping => {
             let i = connect(cli.socket.clone(), cli.remote.clone()).await?.ping(PingRequest {}).await?.into_inner();

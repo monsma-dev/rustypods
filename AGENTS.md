@@ -8,13 +8,18 @@ distrobox, `/home/nick` bound rw, autostart on):
 
 ```bash
 rustypods start dev   # usually already up (autostart)
-rustypods shell dev -- bash -lc \
-  'cd ~/Projects/rustypods && set -o pipefail && \
+rustypods exec dev -w ~/Projects/rustypods -- bash -lc \
+  'set -o pipefail && \
    RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build && cargo test'
 # or: bash scripts/build.sh  (release build + tests)
 ```
 
-No `-w` flag on `shell` — `cd` inside the command. If the daemon itself
+`shell` aliases: `exec`; `-w/--workdir` sets the in-container cwd
+(absolute path, daemon-side `cd` before exec). `--strict` exports
+`SHELLOPTS=pipefail` so `bash -lc 'cargo build | tail'` can't hide a
+failure — still keep `set -o pipefail` for non-bash payloads.
+`rustypods cp <src> <dst>` copies host↔pod via tar/cat over Exec
+(`pod:/abs/path` on exactly one side). If the daemon itself
 is broken (bootstrap problem), fall back to the podman distrobox `arch`:
 `podman exec -u nick -w /home/nick/Projects/rustypods arch bash -lc …`.
 

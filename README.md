@@ -55,7 +55,11 @@ rustypods config dev --storage-max 20G      # btrfs qgroup cap, hot-applied
 rustypods reload dev                        # after hand-editing conf/pods/dev.conf
 rustypods shell dev                         # native Exec RPC: nsenter + host pty
 rustypods shell dev -- cargo build          # or run a command (exit code comes back)
+rustypods exec dev -w ~/Projects/repo -- cargo build   # exec alias + workdir
+rustypods exec --strict dev -- bash -lc 'cargo build | tail'  # pipefail on
 echo hi | rustypods shell dev cat           # pipes work too
+rustypods cp app.conf dev:/etc/app/         # copy host→pod (dirs via tar)
+rustypods cp dev:/var/log/app.log ./        # and pod→host
 rustypods stop dev
 rustypods clone dev dev-test              # instant CoW clone (snapshot + fresh net identity)
 rustypods commit dev "pre-upgrade"        # instant rootfs snapshot — the time machine

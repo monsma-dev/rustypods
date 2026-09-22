@@ -350,6 +350,11 @@ export interface ExecStart {
   cols: number;
   /** "K=V", TERM etc. */
   env: string[];
+  /**
+   * Absolute in-container cwd for the payload; empty = $HOME (login shell)
+   * or the inherited cwd (argv mode).
+   */
+  workdir: string;
 }
 
 export interface WinSize {
@@ -3827,7 +3832,7 @@ export const ExecChunk: MessageFns<ExecChunk> = {
 };
 
 function createBaseExecStart(): ExecStart {
-  return { pod: "", user: "", argv: [], tty: false, rows: 0, cols: 0, env: [] };
+  return { pod: "", user: "", argv: [], tty: false, rows: 0, cols: 0, env: [], workdir: "" };
 }
 
 export const ExecStart: MessageFns<ExecStart> = {
@@ -3852,6 +3857,9 @@ export const ExecStart: MessageFns<ExecStart> = {
     }
     for (const v of message.env) {
       writer.uint32(58).string(v!);
+    }
+    if (message.workdir !== "") {
+      writer.uint32(66).string(message.workdir);
     }
     return writer;
   },
@@ -3925,6 +3933,14 @@ export const ExecStart: MessageFns<ExecStart> = {
             message.env.push(reader.string());
             continue;
           }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.workdir = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3946,6 +3962,7 @@ export const ExecStart: MessageFns<ExecStart> = {
       rows: isSet(object.rows) ? globalThis.Number(object.rows) : 0,
       cols: isSet(object.cols) ? globalThis.Number(object.cols) : 0,
       env: globalThis.Array.isArray(object?.env) ? object.env.map((e: any) => globalThis.String(e)) : [],
+      workdir: isSet(object.workdir) ? globalThis.String(object.workdir) : "",
     };
   },
 
@@ -3972,6 +3989,9 @@ export const ExecStart: MessageFns<ExecStart> = {
     if (message.env?.length) {
       obj.env = message.env;
     }
+    if (message.workdir !== "") {
+      obj.workdir = message.workdir;
+    }
     return obj;
   },
 
@@ -3987,6 +4007,7 @@ export const ExecStart: MessageFns<ExecStart> = {
     message.rows = object.rows ?? 0;
     message.cols = object.cols ?? 0;
     message.env = object.env?.map((e) => e) || [];
+    message.workdir = object.workdir ?? "";
     return message;
   },
 };

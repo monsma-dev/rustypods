@@ -309,6 +309,9 @@ message ExecStart {
   uint32 rows = 5;
   uint32 cols = 6;
   repeated string env = 7; // "K=V", TERM etc.
+  // Absolute in-container cwd for the payload; empty = $HOME (login shell)
+  // or the inherited cwd (argv mode).
+  string workdir = 8;
 }
 
 message WinSize {

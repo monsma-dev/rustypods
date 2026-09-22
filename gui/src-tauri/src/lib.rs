@@ -385,6 +385,7 @@ async fn open_pty<R: tauri::Runtime>(
             rows,
             cols,
             env: vec!["TERM=xterm-256color".into(), "COLORTERM=truecolor".into()],
+            workdir: String::new(),
         })),
     })
     .await
