@@ -46,6 +46,8 @@ impl StorageDriver for FallbackDriver {
         if !path.exists() {
             return Ok(());
         }
+        // rm -rf crosses mount points — never run it under a live mount.
+        super::refuse_if_mounted(path)?;
         run("rm", &[OsStr::new("-rf"), path.as_os_str()])
     }
 

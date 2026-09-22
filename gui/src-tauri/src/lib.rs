@@ -295,7 +295,7 @@ async fn watch_metrics<R: tauri::Runtime>(
             }
         }
     });
-    let mut w = watches.0.lock().unwrap();
+    let mut w = watches.0.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(old) = w.insert(name, task.abort_handle()) {
         old.abort();
     }
@@ -304,7 +304,7 @@ async fn watch_metrics<R: tauri::Runtime>(
 
 #[tauri::command]
 async fn unwatch_metrics(watches: State<'_, WatchMap>, name: String) -> Result<(), String> {
-    if let Some(h) = watches.0.lock().unwrap().remove(&name) {
+    if let Some(h) = watches.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&name) {
         h.abort();
     }
     Ok(())
@@ -342,7 +342,7 @@ async fn watch_logs<R: tauri::Runtime>(
             }
         }
     });
-    let mut w = watches.0.lock().unwrap();
+    let mut w = watches.0.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(old) = w.insert(name, task.abort_handle()) {
         old.abort();
     }
@@ -351,7 +351,7 @@ async fn watch_logs<R: tauri::Runtime>(
 
 #[tauri::command]
 async fn unwatch_logs(watches: State<'_, LogWatchMap>, name: String) -> Result<(), String> {
-    if let Some(h) = watches.0.lock().unwrap().remove(&name) {
+    if let Some(h) = watches.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&name) {
         h.abort();
     }
     Ok(())
@@ -372,7 +372,7 @@ async fn open_pty<R: tauri::Runtime>(
     cols: u32,
     rows: u32,
 ) -> Result<(), String> {
-    if let Some(old) = map.lock().unwrap().remove(&pod) {
+    if let Some(old) = map.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod) {
         old.abort.abort();
     }
     let (tx, rx) = mpsc::channel::<ExecChunk>(32);
@@ -447,14 +447,14 @@ async fn open_pty<R: tauri::Runtime>(
         }
         // Remove only if the map still holds THIS session — a newer
         // open_pty for the same pod may already have replaced us.
-        let mut m = map2.lock().unwrap();
+        let mut m = map2.lock().unwrap_or_else(|e| e.into_inner());
         if m.get(&pod2).map(|s| s.id) == Some(session_id) {
             m.remove(&pod2);
         }
     });
     match setup_rx.await {
         Ok(Ok(())) => {
-            map.lock().unwrap().insert(
+            map.lock().unwrap_or_else(|e| e.into_inner()).insert(
                 pod,
                 PtySession {
                     id: session_id,
@@ -473,7 +473,7 @@ async fn open_pty<R: tauri::Runtime>(
 /// writes silently — the UI tears itself down on `pty-exit-*` anyway.
 #[tauri::command]
 async fn write_pty(map: State<'_, PtyMap>, pod: String, data: Vec<u8>) -> Result<(), String> {
-    let tx = map.lock().unwrap().get(&pod).map(|s| s.stdin.clone());
+    let tx = map.lock().unwrap_or_else(|e| e.into_inner()).get(&pod).map(|s| s.stdin.clone());
     if let Some(tx) = tx {
         let _ = tx
             .send(ExecChunk {
@@ -487,7 +487,7 @@ async fn write_pty(map: State<'_, PtyMap>, pod: String, data: Vec<u8>) -> Result
 /// xterm.js resize → TIOCSWINSZ on the pod-side PTY.
 #[tauri::command]
 async fn resize_pty(map: State<'_, PtyMap>, pod: String, cols: u32, rows: u32) -> Result<(), String> {
-    let tx = map.lock().unwrap().get(&pod).map(|s| s.stdin.clone());
+    let tx = map.lock().unwrap_or_else(|e| e.into_inner()).get(&pod).map(|s| s.stdin.clone());
     if let Some(tx) = tx {
         let _ = tx
             .send(ExecChunk {
@@ -502,7 +502,7 @@ async fn resize_pty(map: State<'_, PtyMap>, pod: String, cols: u32, rows: u32) -
 /// last stdin sender also closes the daemon-side child stdin.
 #[tauri::command]
 async fn close_pty(map: State<'_, PtyMap>, pod: String) -> Result<(), String> {
-    if let Some(s) = map.lock().unwrap().remove(&pod) {
+    if let Some(s) = map.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod) {
         s.abort.abort();
     }
     Ok(())

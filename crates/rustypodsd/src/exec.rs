@@ -69,7 +69,15 @@ fn chunk_exit(code: i32) -> Result<ExecChunk, tonic::Status> {
 fn image_bin(rootfs: &Path, name: &str) -> Option<String> {
     ["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin", "usr/local/sbin"]
         .iter()
-        .find(|d| rootfs.join(d).join(name).exists())
+        .find(|d| {
+            // safe_join_if_exists refuses symlinked intermediates; the leaf
+            // check is symlink_metadata (not exists()) so an absolute leaf
+            // symlink can't be resolved against the HOST fs.
+            matches!(
+                crate::rootfs::safe_join_if_exists(rootfs, format!("{d}/{name}")),
+                Ok(Some(p)) if p.symlink_metadata().is_ok()
+            )
+        })
         .map(|d| format!("/{d}/{name}"))
 }
 
@@ -77,7 +85,12 @@ fn image_bin(rootfs: &Path, name: &str) -> Option<String> {
 /// or a hardlink to the same inode? BusyBox's setpriv lacks --bounding-set
 /// and --reuid entirely, so it counts as "no usable setpriv".
 fn is_busybox_applet(rootfs: &Path, path: &str) -> bool {
-    let f = rootfs.join(path.trim_start_matches('/'));
+    let Some(f) = crate::rootfs::safe_join_if_exists(rootfs, path.trim_start_matches('/'))
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
     if std::fs::read_link(&f)
         .map(|t| t.file_name() == Some(std::ffi::OsStr::new("busybox")))
         .unwrap_or(false)
@@ -85,8 +98,15 @@ fn is_busybox_applet(rootfs: &Path, path: &str) -> bool {
         return true;
     }
     use std::os::unix::fs::MetadataExt;
-    let bb = rootfs.join("bin/busybox");
-    match (std::fs::metadata(&f), std::fs::metadata(&bb)) {
+    let Some(bb) = crate::rootfs::safe_join_if_exists(rootfs, "bin/busybox")
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    // symlink_metadata for the leaf: symlinks were handled above, and
+    // following one could stat a host file.
+    match (f.symlink_metadata(), std::fs::metadata(&bb)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
@@ -135,7 +155,16 @@ fn locale_available(rootfs: &Path, loc: &str) -> bool {
 
 /// name → (uid, gid, home, shell), parsed from the image's own /etc/passwd.
 pub fn passwd_entry(rootfs: &Path, user: &str) -> Option<(u32, u32, String, String)> {
-    let text = std::fs::read_to_string(rootfs.join("etc/passwd")).ok()?;
+    let p = crate::rootfs::safe_join_if_exists(rootfs, "etc/passwd")
+        .ok()
+        .flatten()?;
+    // The leaf must be a real file — an image-planted `passwd` symlink
+    // (e.g. etc -> /host/etc covered by safe_join, but a leaf
+    // `passwd -> /etc/passwd`) would make the daemon read a host file.
+    if !p.symlink_metadata().ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(p).ok()?;
     for line in text.lines() {
         let f: Vec<&str> = line.split(':').collect();
         if f.len() >= 7 && f[0] == user {
@@ -435,6 +464,14 @@ async fn run_tty(
     let reader_file = master_file.try_clone()?;
 
     // Reader: blocking pty reads → stdout chunks; signals drain via oneshot.
+    //
+    // KNOWN RESIDUAL (L5): this is a std::thread doing a blocking read —
+    // unlike the pipe-mode drain tasks below it can't be aborted. If a
+    // detached in-pod grandchild keeps the pty slave open, EIO never
+    // arrives and this thread parks in read() forever (holding reader_file
+    // + a tx_r sender, so the gRPC stream never fully closes server-side).
+    // Bounded by the server's global concurrency cap per leaked session,
+    // but repeats accumulate fds+threads for the daemon's lifetime.
     let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
     let tx_r = tx.clone();
     std::thread::spawn(move || {

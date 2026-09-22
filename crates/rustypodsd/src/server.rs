@@ -234,6 +234,18 @@ impl Svc {
         m.lock_owned().await
     }
 
+    /// Non-blocking pod_op — None while another op holds the lock. For GC:
+    /// a busy pod is skipped this sweep rather than stalling the loop.
+    async fn try_pod_op(&self, name: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let m = {
+            let mut ops = self.ops.lock().await;
+            ops.entry(name.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        m.try_lock_owned().ok()
+    }
+
     /// Storage/net helpers spawn subprocesses (btrfs, cp, rm, ip, nft) —
     /// never let them block the async executor; hop to the blocking pool.
     async fn blocking<T, F>(f: F) -> Result<T, Status>
@@ -317,6 +329,12 @@ impl Svc {
         };
         let now = state::now_unix();
         for m in pods {
+            // Serialize against commit/rollback/delete_snapshot on the same
+            // pod — they mutate snapshots/<pod>/ concurrently. A busy pod
+            // just waits for the next sweep.
+            let Some(_op) = self.try_pod_op(&m.name).await else {
+                continue;
+            };
             for (i, s) in self.snapshots(&m.name).iter().enumerate() {
                 if snapshot_expired(i, s.created_unix, m.snap_keep_last, m.snap_max_age_secs, now) {
                     match self.st_delete(Path::new(&s.path)).await {
@@ -536,7 +554,12 @@ impl PodControl for Svc {
         if !req.cmd.is_empty() {
             proto::validate_argv(&req.cmd).map_err(bad)?;
         }
-        self.st_clone(&img_dir, &dest).await?;
+        if let Err(e) = self.st_clone(&img_dir, &dest).await {
+            // A partial dest (fallback cp died mid-copy) would wedge the
+            // name on "already exists" forever — clean it like pull/import.
+            let _ = self.st_delete(&dest).await;
+            return Err(e);
+        }
         let meta = PodMeta {
             name: name.clone(),
             image,
@@ -571,6 +594,13 @@ impl PodControl for Svc {
         let req = req.into_inner();
         let src = proto::validate_name(&req.source).map_err(bad)?.to_string();
         let dest = proto::validate_name(&req.dest).map_err(bad)?.to_string();
+        // Source must exist before we touch the append-only ops map.
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&src) {
+                return Err(Status::not_found(format!("pod {src} not found")));
+            }
+        }
         // Lock both names, sorted — unordered acquisition would let
         // `clone a→b` racing `clone b→a` deadlock.
         let (first, second) = if src <= dest {
@@ -598,7 +628,12 @@ impl PodControl for Svc {
         if dst_root.exists() {
             return Err(Status::already_exists(format!("pod {dest} already exists")));
         }
-        self.st_clone(&self.pod_rootfs(&src), &dst_root).await?;
+        if let Err(e) = self.st_clone(&self.pod_rootfs(&src), &dst_root).await {
+            // Same partial-dest cleanup as create/pull — a half-copied
+            // rootfs must not wedge the dest name.
+            let _ = self.st_delete(&dst_root).await;
+            return Err(e);
+        }
         let meta = PodMeta {
             name: dest.clone(),
             created_unix: state::now_unix(),
@@ -623,13 +658,13 @@ impl PodControl for Svc {
     async fn commit_pod(&self, req: Request<CommitPodRequest>) -> Result<Response<Snapshot>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
-        let _op = self.pod_op(&pod).await;
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&pod) {
                 return Err(Status::not_found(format!("pod {pod} not found")));
             }
         }
+        let _op = self.pod_op(&pod).await;
         if self.engine.running_pid(&pod).await.is_some() {
             tracing::warn!("commit on running pod {pod} — snapshot is atomic but mid-write state is live");
         }
@@ -674,10 +709,6 @@ impl PodControl for Svc {
     async fn rollback_pod(&self, req: Request<RollbackPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
-        let _op = self.pod_op(&pod).await;
-        if !req.snapshot.is_empty() {
-            proto::validate_snapshot_id(&req.snapshot).map_err(bad)?;
-        }
         let meta = {
             let st = self.st.lock().await;
             st.pods.get(&pod).cloned()
@@ -685,6 +716,10 @@ impl PodControl for Svc {
         let Some(meta) = meta else {
             return Err(Status::not_found(format!("pod {pod} not found")));
         };
+        let _op = self.pod_op(&pod).await;
+        if !req.snapshot.is_empty() {
+            proto::validate_snapshot_id(&req.snapshot).map_err(bad)?;
+        }
         let snaps = self.snapshots(&pod);
         let snap = if req.snapshot.is_empty() {
             snaps.first().cloned()
@@ -774,6 +809,12 @@ impl PodControl for Svc {
     async fn delete_snapshot(&self, req: Request<SnapshotRef>) -> Result<Response<Empty>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&pod) {
+                return Err(Status::not_found(format!("pod {pod} not found")));
+            }
+        }
         let _op = self.pod_op(&pod).await;
         proto::validate_snapshot_id(&req.id).map_err(bad)?;
         // Guard: the id may only ever resolve inside this pod's snap dir.
@@ -873,8 +914,14 @@ impl PodControl for Svc {
                     m
                 }
                 None => {
-                    self.st_clone(&self.cfg.images_dir().join(&sp.image), &rootfs)
-                        .await?;
+                    if let Err(e) = self
+                        .st_clone(&self.cfg.images_dir().join(&sp.image), &rootfs)
+                        .await
+                    {
+                        // Partial clone must not wedge the member name.
+                        let _ = self.st_delete(&rootfs).await;
+                        return Err(e);
+                    }
                     let m = PodMeta {
                         name: pname.clone(),
                         image: sp.image.clone(),
@@ -943,6 +990,13 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        // Cheap membership check before touching the append-only ops map.
+        {
+            let st = self.st.lock().await;
+            if !st.pods.values().any(|m| m.stack == name) {
+                return Err(Status::not_found(format!("stack {name} not found")));
+            }
+        }
         // Serialize against apply_stack and per-pod ops: take the stack key
         // FIRST — an in-flight apply must finish before we enumerate members
         // (a member added after listing would escape teardown).
@@ -990,19 +1044,29 @@ impl PodControl for Svc {
         })
         .await;
         self.sync_nat().await;
+        // Evict op-lock entries for the destroyed members and the stack key —
+        // the pods are gone, so ops stays bounded by live pod names. Held
+        // guards keep working on their (now orphaned) Arc harmlessly.
+        {
+            let mut ops = self.ops.lock().await;
+            ops.remove(&format!("stack:{name}"));
+            for pname in &members {
+                ops.remove(pname);
+            }
+        }
         Ok(Response::new(Empty {}))
     }
 
     async fn start_pod(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
-        let _op = self.pod_op(&name).await;
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
                 return Err(Status::not_found(format!("pod {name} not found")));
             }
         }
+        let _op = self.pod_op(&name).await;
         if self.engine.running_pid(&name).await.is_some() {
             return Err(Status::failed_precondition(format!(
                 "pod {name} is already running"
@@ -1254,13 +1318,13 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
-        let _op = self.pod_op(&name).await;
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
                 return Err(Status::not_found(format!("pod {name} not found")));
             }
         }
+        let _op = self.pod_op(&name).await;
         self.engine.stop(&name).await.map_err(int)?;
         agent::stop_listener(&self.listeners, &self.metrics, &name).await;
         let st = self.st.lock().await;
@@ -1297,13 +1361,15 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
-        let _op = self.pod_op(&name).await;
+        // Cheap existence check BEFORE pod_op: ops is an append-only map,
+        // so RPCs on never-existing names must not grow it.
         {
             let st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
                 return Err(Status::not_found(format!("pod {name} not found")));
             }
         }
+        let _op = self.pod_op(&name).await;
         self.engine.stop(&name).await.map_err(int)?;
         // Never delete the rootfs of a pod machined still knows about —
         // a failed/busy bus must not look like "pod is gone".
@@ -1344,6 +1410,12 @@ impl PodControl for Svc {
             .await;
         }
         self.sync_nat().await;
+        // The pod is gone for good — drop its op-lock entry so ops stays
+        // bounded by live pod names. Guard must drop first: removing while
+        // locked is harmless (the guard just holds a dead Arc), but
+        // explicit order keeps it obvious.
+        drop(_op);
+        self.ops.lock().await.remove(&name);
         Ok(Response::new(Empty {}))
     }
 
@@ -1354,6 +1426,12 @@ impl PodControl for Svc {
     ) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            }
+        }
         let _op = self.pod_op(&name).await;
         let lim = limits_from(req.limits);
         if let Some(pm) = &req.ports {
@@ -1434,6 +1512,12 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            }
+        }
         let _op = self.pod_op(&name).await;
         let meta = state::load_pod(&self.cfg.data_dir, &name).map_err(int)?;
         for spec in &meta.ports {
@@ -1941,9 +2025,17 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
 /// start: distrobox imports have it, OCI-pulled images don't (they run
 /// non-boot via their recorded entrypoint/cmd instead).
 fn has_systemd_init(rootfs: &Path) -> bool {
+    // Same leaf policy as resolve_in_rootfs: symlinked intermediates are
+    // refused (no host-fs stat), a leaf symlink counts as existing.
     ["usr/lib/systemd/systemd", "lib/systemd/systemd", "sbin/init"]
         .iter()
-        .any(|p| rootfs.join(p).exists())
+        .any(|p| {
+            crate::rootfs::safe_join_if_exists(rootfs, p)
+                .ok()
+                .flatten()
+                .map(|p| std::fs::symlink_metadata(&p).is_ok())
+                .unwrap_or(false)
+        })
 }
 
 /// Resolve a payload argv[0] inside the rootfs: absolute paths checked

@@ -249,13 +249,21 @@ export const updatePodConfig = async (u: PodConfigUpdate): Promise<Pod> => {
 const metricsWatchers = new Map<string, number>();
 
 export const watchMetrics = async (name: string): Promise<void> => {
-  const n = (metricsWatchers.get(name) ?? 0) + 1;
-  metricsWatchers.set(name, n);
-  if (n > 1) return;
-  if (inTauri) {
-    await invoke("watch_metrics", { name });
+  const n = metricsWatchers.get(name) ?? 0;
+  if (n > 0) {
+    metricsWatchers.set(name, n + 1);
     return;
   }
+  // First subscriber: invoke BEFORE bumping the refcount. If the invoke
+  // rejects (daemon down), the map must stay empty — a phantom count
+  // would make every later call early-return without ever re-opening
+  // the backend stream.
+  if (inTauri) {
+    await invoke("watch_metrics", { name });
+    metricsWatchers.set(name, 1);
+    return;
+  }
+  metricsWatchers.set(name, 1);
   mockWatch(name);
 };
 

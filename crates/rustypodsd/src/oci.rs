@@ -345,7 +345,11 @@ pub(crate) fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
             }
             if name == ".wh..opq" {
                 remove_children(&parent);
-            } else if !name.is_empty() {
+            } else if name.is_empty() || name == "." || name == ".." {
+                // `.wh..` / `.wh...` would resolve to the parent itself or
+                // to dest/.. — the whole images dir. Never a valid whiteout.
+                tracing::warn!("skipping malformed whiteout {}", rel.display());
+            } else {
                 remove_path(&parent.join(name));
             }
             continue;
@@ -599,6 +603,51 @@ mod tests {
         );
         // The whiteout marker itself must not linger inside the rootfs.
         assert!(!dest.join("d/.wh.victim").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Malformed whiteout basenames must never escape: `.wh..` resolves to
+    /// the whiteout's own parent and `.wh...` to the parent's parent — at
+    /// layer root that is `dest/..`, the whole images dir.
+    #[test]
+    fn whiteout_dotdot_basenames_cannot_escape() {
+        let base = std::env::temp_dir().join(format!("rp-oci-whdd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dest = base.join("rootfs");
+        let sibling = base.join("other-image");
+        std::fs::create_dir_all(dest.join("x")).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("marker"), b"m").unwrap();
+        std::fs::write(dest.join("keep"), b"k").unwrap();
+        std::fs::write(dest.join("x/file"), b"f").unwrap();
+
+        let mut t = tar::Builder::new(Vec::new());
+        for p in [".wh...", ".wh..", "x/.wh..."] {
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_entry_type(tar::EntryType::Regular);
+            hdr.set_mode(0o644);
+            hdr.set_size(0);
+            hdr.set_cksum();
+            t.append_data(&mut hdr, p, std::io::empty()).unwrap();
+        }
+        let layer = t.into_inner().unwrap();
+        unpack_tar(&layer[..], &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read(sibling.join("marker")).unwrap(),
+            b"m",
+            ".wh... escaped dest and deleted a sibling image"
+        );
+        assert!(dest.is_dir(), ".wh.. removed the rootfs itself");
+        assert_eq!(
+            std::fs::read(dest.join("keep")).unwrap(),
+            b"k",
+            "whiteout removed an unrelated rootfs entry"
+        );
+        assert!(
+            dest.join("x/file").exists(),
+            "x/.wh... must not delete x's parent chain"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

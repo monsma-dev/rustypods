@@ -117,6 +117,13 @@ pub fn chown_sock_for_userns(run_dir: &Path, leader: u32) {
         m.lines().next()?.split_whitespace().nth(1)?.parse().ok()
     };
     let (Some(uid), Some(gid)) = (mapped("uid"), mapped("gid")) else {
+        // Usually the leader exited before we read /proc — the socket then
+        // stays root:root 0660 and the in-pod agent can't connect, so
+        // metrics stay absent until the next start. Loud, not silent.
+        tracing::warn!(
+            "userns map for leader {leader} unreadable ({}); skipping agent.sock chown — pod metrics may be unavailable",
+            run_dir.display()
+        );
         return;
     };
     if uid == 0 {

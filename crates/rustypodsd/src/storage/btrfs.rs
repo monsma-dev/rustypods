@@ -111,16 +111,30 @@ impl StorageDriver for BtrfsDriver {
         if !path.exists() {
             return Ok(());
         }
-        // Succeeds for subvolumes; plain dirs fall through to rm -rf.
-        if run(
-            "btrfs",
-            &[OsStr::new("subvolume"), OsStr::new("delete"), path.as_os_str()],
-        )
-        .is_ok()
-        {
+        super::refuse_if_mounted(path)?;
+        // rm -rf is legitimate only for plain dirs — `subvolume delete`
+        // tells those apart by name in stderr ("not a subvolume"). Any
+        // other failure (EBUSY on a live/mounted tree, EPERM, send in
+        // progress) must propagate: falling back to rm -rf there would
+        // recurse through whatever is still mounted.
+        let out = Command::new("btrfs")
+            .args([OsStr::new("subvolume"), OsStr::new("delete"), path.as_os_str()])
+            .output()
+            .context("running btrfs")?;
+        if out.status.success() {
             return Ok(());
         }
-        run("rm", &[OsStr::new("-rf"), path.as_os_str()])
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let not_subvol = stderr.contains("not a subvolume")
+            || stderr.contains("Not a Btrfs subvolume");
+        if not_subvol {
+            return run("rm", &[OsStr::new("-rf"), path.as_os_str()]);
+        }
+        bail!(
+            "btrfs subvolume delete {}: {}",
+            path.display(),
+            stderr.trim()
+        )
     }
 
     fn apply_quota(&self, path: &Path, bytes: u64) -> Result<()> {
