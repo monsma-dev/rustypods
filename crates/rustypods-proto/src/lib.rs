@@ -242,6 +242,18 @@ fn f64_to_u64(v: f64, mult: u64, what: &str, s: &str) -> anyhow::Result<u64> {
     Ok(r as u64)
 }
 
+/// Validate a payload argv (pod cmd override): non-empty vec, argv[0]
+/// non-empty, no NUL bytes anywhere (they'd truncate at exec).
+pub fn validate_argv(argv: &[String]) -> anyhow::Result<()> {
+    if argv.is_empty() || argv[0].is_empty() {
+        anyhow::bail!("invalid cmd — argv[0] must be non-empty");
+    }
+    if argv.iter().any(|a| a.contains('\0')) {
+        anyhow::bail!("invalid cmd — argv entries may not contain NUL bytes");
+    }
+    Ok(())
+}
+
 /// Parse "10G", "512M", "1024" (bytes) into a byte count.
 pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
@@ -359,6 +371,14 @@ mod tests {
         assert!(validate_bind("/bin/bash").is_err());
         assert!(validate_bind("/bin/bash:ro").unwrap().ro);
         assert!(validate_bind("/root").is_err());
+    }
+
+    #[test]
+    fn argv_validation() {
+        assert!(validate_argv(&["sleep".into(), "infinity".into()]).is_ok());
+        assert!(validate_argv(&[]).is_err());
+        assert!(validate_argv(&["".into()]).is_err());
+        assert!(validate_argv(&["sh".into(), "a\0b".into()]).is_err());
     }
 
     #[test]

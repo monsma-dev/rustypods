@@ -92,7 +92,20 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         snap_keep_last: m.snap_keep_last,
         snap_max_age_secs: m.snap_max_age_secs,
         autostart: m.autostart,
+        cmd: m.cmd.clone(),
     }
+}
+
+/// Payload (non-boot) pods: a conf-level cmd override always wins and
+/// forces payload mode even on boot-capable images; otherwise an OCI
+/// image's recorded entrypoint/cmd decides.
+fn is_payload_pod(st: &State, m: &PodMeta) -> bool {
+    !m.cmd.is_empty()
+        || st
+            .images
+            .get(&m.image)
+            .map(|im| !im.entrypoint.is_empty() || !im.cmd.is_empty())
+            .unwrap_or(false)
 }
 
 fn limits_from(l: Option<Limits>) -> LimitsSpec {
@@ -520,6 +533,9 @@ impl PodControl for Svc {
                 }
             }
         }
+        if !req.cmd.is_empty() {
+            proto::validate_argv(&req.cmd).map_err(bad)?;
+        }
         self.st_clone(&img_dir, &dest).await?;
         let meta = PodMeta {
             name: name.clone(),
@@ -539,6 +555,7 @@ impl PodControl for Svc {
             snap_keep_last: 0,
             snap_max_age_secs: 0,
             autostart: req.autostart,
+            cmd: req.cmd.clone(),
         };
         let mut st = self.st.lock().await;
         st.pods.insert(name.clone(), meta.clone());
@@ -851,6 +868,7 @@ impl PodControl for Svc {
                     m.net_index = idx;
                     m.snap_keep_last = sp.snap_keep_last;
                     m.snap_max_age_secs = sp.snap_max_age_secs;
+                    m.cmd = sp.cmd.clone();
                     self.st.lock().await.pods.insert(pname.clone(), m.clone());
                     m
                 }
@@ -876,6 +894,7 @@ impl PodControl for Svc {
                         net_index: idx,
                         stack: def.name.clone(),
                         binds: vec![],
+                        cmd: sp.cmd.clone(),
                         snap_keep_last: sp.snap_keep_last,
                         snap_max_age_secs: sp.snap_max_age_secs,
                         // Stack lifecycle is driven by `stack start`, not
@@ -1030,16 +1049,28 @@ impl PodControl for Svc {
         }
         // Boot vs payload: OCI-pulled images record their entrypoint/cmd and
         // have no systemd → nspawn execs the payload directly (non-boot).
+        // A conf-level cmd is a FULL override of the image entrypoint+cmd
+        // and forces payload mode even on boot-capable images (env and
+        // working_dir still come from the image when it's an OCI image).
         // Anything else must carry a real init or it can't be started.
         let (mut payload, env, chdir) = {
             let st = self.st.lock().await;
-            match st.images.get(&meta.image) {
-                Some(im) if !im.entrypoint.is_empty() || !im.cmd.is_empty() => {
-                    let mut p = im.entrypoint.clone();
-                    p.extend(im.cmd.iter().cloned());
-                    (Some(p), im.env.clone(), im.working_dir.clone())
-                }
-                _ => (None, Vec::new(), String::new()),
+            if is_payload_pod(&st, &meta) {
+                let im = st.images.get(&meta.image);
+                let p = if !meta.cmd.is_empty() {
+                    meta.cmd.clone()
+                } else {
+                    let mut p = im.map(|i| i.entrypoint.clone()).unwrap_or_default();
+                    p.extend(im.map(|i| i.cmd.clone()).unwrap_or_default());
+                    p
+                };
+                (
+                    Some(p),
+                    im.map(|i| i.env.clone()).unwrap_or_default(),
+                    im.map(|i| i.working_dir.clone()).unwrap_or_default(),
+                )
+            } else {
+                (None, Vec::new(), String::new())
             }
         };
         if let Some(p) = &mut payload {
@@ -1342,6 +1373,11 @@ impl PodControl for Svc {
                 proto::validate_bind(spec).map_err(bad)?;
             }
         }
+        if let Some(cl) = &req.cmd {
+            if !cl.argv.is_empty() {
+                proto::validate_argv(&cl.argv).map_err(bad)?;
+            }
+        }
         let ports_changed = req.ports.is_some();
         let meta = {
             let mut st = self.st.lock().await;
@@ -1356,6 +1392,11 @@ impl PodControl for Svc {
             // Applied at the next start, not live.
             if let Some(bl) = req.binds {
                 m.binds = bl.binds;
+            }
+            // Same: payload override takes effect on the next start;
+            // present-but-empty clears it.
+            if let Some(cl) = req.cmd {
+                m.cmd = cl.argv;
             }
             // Snapshot retention: persisted only — the GC sweep applies it.
             // Absent = keep, 0 clears.
@@ -1646,10 +1687,7 @@ impl PodControl for Svc {
             let Some(m) = st.pods.get(&name) else {
                 return Err(Status::not_found(format!("pod {name} not found")));
             };
-            st.images
-                .get(&m.image)
-                .map(|im| im.entrypoint.is_empty() && im.cmd.is_empty())
-                .unwrap_or(true)
+            !is_payload_pod(&st, m)
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let log_path = self.cfg.logs_dir().join(format!("{name}.log"));

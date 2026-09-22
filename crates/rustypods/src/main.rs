@@ -75,6 +75,10 @@ enum Cmd {
         /// Boot this pod automatically whenever the daemon starts.
         #[arg(long)]
         autostart: bool,
+        /// Payload command override, e.g. --cmd sleep infinity — replaces
+        /// the image's entrypoint+cmd and forces non-boot mode.
+        #[arg(long, num_args = 1.., value_delimiter = None)]
+        cmd: Vec<String>,
     },
     /// Start a pod (nspawn --boot, machined registration).
     Start {
@@ -166,6 +170,13 @@ enum Cmd {
         /// Boot with the daemon: --autostart on|off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         autostart: Option<bool>,
+        /// Payload command override, e.g. --cmd sleep infinity — replaces
+        /// the whole override (applied at the next start).
+        #[arg(long, num_args = 1.., value_delimiter = None, conflicts_with = "clear_cmd")]
+        cmd: Vec<String>,
+        /// Remove the payload command override (applied at the next start).
+        #[arg(long)]
+        clear_cmd: bool,
     },
     /// Reread a hand-edited <pod>.conf and apply it.
     Reload { name: String },
@@ -776,6 +787,9 @@ fn print_pod(p: &Pod) {
     if !p.ports.is_empty() {
         extra.push_str(&format!(" ports=[{}]", p.ports.join(",")));
     }
+    if !p.cmd.is_empty() {
+        extra.push_str(&format!(" cmd={}", p.cmd.join(" ")));
+    }
     if !p.stack.is_empty() {
         extra.push_str(&format!(" stack={}", p.stack));
     }
@@ -834,7 +848,12 @@ async fn main() -> Result<()> {
         }
         Cmd::Pull { reference, name } => {
             println!("pulling {reference} (this can take a while)...");
-            let img = connect(cli.socket.clone(), cli.remote.clone())
+            // Pulls routinely outlast the default 30s call bound.
+            let img = rustypods_client::connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                std::time::Duration::from_secs(600),
+            )
                 .await?
                 .pull_image(PullImageRequest {
                     reference,
@@ -854,7 +873,11 @@ async fn main() -> Result<()> {
             let name = name.unwrap_or_else(|| format!("{from_distrobox}-base"));
             let user = user.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "nick".into()));
             println!("exporting: {from_distrobox} → {name} (this can take a while)...");
-            let img = connect(cli.socket.clone(), cli.remote.clone())
+            let img = rustypods_client::connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                std::time::Duration::from_secs(600),
+            )
                 .await?
                 .import_image(ImportImageRequest {
                     name: name.clone(),
@@ -869,14 +892,14 @@ async fn main() -> Result<()> {
             connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
             println!("image {name} removed");
         }
-        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart } => {
+        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, cmd } => {
             let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
             if !port.is_empty() {
                 eprintln!("note: --port implies a private netns (--network-veth); the pod no longer shares host networking");
             }
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind, limits: None, autostart })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind, limits: None, autostart, cmd })
                 .await?
                 .into_inner();
             print_pod(&p);
@@ -1043,7 +1066,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart } => {
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, cmd, clear_cmd } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -1080,6 +1103,13 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            let cmd = if clear_cmd {
+                Some(CmdList { argv: vec![] })
+            } else if !cmd.is_empty() {
+                Some(CmdList { argv: cmd })
+            } else {
+                None
+            };
             let p = c
                 .update_pod_config(UpdatePodConfigRequest {
                     name,
@@ -1087,6 +1117,7 @@ async fn main() -> Result<()> {
                     storage_max_bytes,
                     ports: None,
                     binds,
+                    cmd,
                     snap_keep_last: snap_keep,
                     snap_max_age_secs: snap_max_age
                         .as_deref()

@@ -92,8 +92,11 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
   `open_cgroup_procs()` declares `int cgroup_fd = 0` (not -1), so
   `open_target_fd` close()s stdin and /proc/<pid>/cgroup lands on it —
   every exec'd payload reads instant EOF and exits 0 with no output.
-  exec.rs works around it: `pre_exec` dup2(0→200) + payload wrapper
-  `exec 0<&200 200<&-`. Fixed upstream (`= -1`), not yet released.
+  exec.rs works around it: `pre_exec` dup2(0→9) + payload wrapper
+  `exec 0<&9 9<&-`. Fixed upstream (`= -1`), not yet released.
+  The dup fd MUST be single-digit: the wrapper runs under the image's
+  /bin/sh and dash (Debian) rejects fd >9 in redirections
+  ("Bad fd number" — broke `shell` on every Debian-family image).
 
 ## Port forwarding (net.rs)
 

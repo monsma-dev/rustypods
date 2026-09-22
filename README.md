@@ -208,6 +208,19 @@ rustypods shell dev -- cargo test         # non-tty exec; clean stdout/stderr
 rustypods logs -f dev                     # plain-text journal, auto-reconnects
 ```
 
+OCI images without an init exit immediately — use `--cmd sleep infinity`
+to keep a dev pod alive:
+
+```bash
+rustypods pull debian:forky
+rustypods create kde-dev --image debian-forky --desktop --cmd sleep infinity
+rustypods start kde-dev                 # payload pod; logs via console log
+```
+
+The override replaces the image's entrypoint+cmd and forces non-boot mode;
+change it later with `rustypods config <pod> --cmd …` / `--clear-cmd`
+(applied at the next start).
+
 or over REST/JSON with the bearer token in `/run/rustypods/http-token`:
 
 ```bash

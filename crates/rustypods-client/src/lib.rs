@@ -100,16 +100,26 @@ fn ssh_pipe(dest: &str, sock: &PathBuf) -> std::io::Result<Conn> {
 
 /// Connect to the daemon — local UDS, or remote via `ssh … socat`.
 pub async fn connect(path: PathBuf, remote: Option<String>) -> Result<PodControlClient<Channel>> {
+    connect_timeout(path, remote, std::time::Duration::from_secs(30)).await
+}
+
+/// `connect` with a caller-chosen per-request bound — image pulls can
+/// legitimately outlast the default 30s on slow links.
+pub async fn connect_timeout(
+    path: PathBuf,
+    remote: Option<String>,
+    timeout: std::time::Duration,
+) -> Result<PodControlClient<Channel>> {
     let err_hint = match &remote {
         Some(d) => format!("connecting to rustypodsd via {d} — ssh up? socat installed remotely?"),
         None => "connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)".into(),
     };
     let ch = Endpoint::try_from("http://[::]:0")?
-        // Bound each call at 30s so a wedged daemon can't hang the CLI/GUI
+        // Bound each call so a wedged daemon can't hang the CLI/GUI
         // forever. tonic's timeout wraps the per-request response future —
         // for streaming RPCs it resolves when response HEADERS arrive, so
         // long-lived streams (logs -f, metrics, exec) are NOT cut off.
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .connect_with_connector(service_fn(move |_: http::Uri| {
             let p = path.clone();
             let remote = remote.clone();

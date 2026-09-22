@@ -173,6 +173,10 @@ message Pod {
   uint64 snap_max_age_secs = 15;
   // Start this pod automatically whenever the daemon boots.
   bool autostart = 16;
+  // Per-pod payload override: replaces the image's entrypoint+cmd and
+  // forces non-boot mode, even on boot-capable images (e.g.
+  // ["sleep", "infinity"] to keep a bare OCI image alive as a dev pod).
+  repeated string cmd = 17;
 }
 
 message PodList {
@@ -200,6 +204,8 @@ message CreatePodRequest {
   optional Limits limits = 7;
   // Start this pod automatically whenever the daemon boots.
   bool autostart = 8;
+  // Per-pod payload override (see Pod.cmd); empty = image default.
+  repeated string cmd = 9;
 }
 
 message ClonePodRequest {
@@ -256,6 +262,11 @@ message BindList {
   repeated string binds = 1;
 }
 
+message CmdList {
+  // Full desired payload argv, replaces current. Empty = clear override.
+  repeated string argv = 1;
+}
+
 message UpdatePodConfigRequest {
   string name = 1;
   Limits limits = 2;
@@ -273,6 +284,9 @@ message UpdatePodConfigRequest {
   optional uint64 snap_max_age_secs = 7;
   // Absent = keep; present = set the boot-time autostart flag.
   optional bool autostart = 8;
+  // Absent = keep; present (even empty) = replace the payload override.
+  // Takes effect on the next pod start.
+  optional CmdList cmd = 9;
 }
 
 message StartPodRequest {

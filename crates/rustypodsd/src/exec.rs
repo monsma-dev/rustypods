@@ -26,8 +26,9 @@ type Tx = mpsc::Sender<Result<ExecChunk, tonic::Status>>;
 /// instant EOF) while stdout/stderr survive. Fixed upstream to `= -1`, but
 /// the hosts we run on are buggy. pre_exec() dup2(0 → STDIN_DUP_FD) preserves
 /// real stdin across nsenter's clobber, and the payload wrapper re-dups it
-/// back: `exec 0<&200 200<&-; …`.
-const STDIN_DUP_FD: i32 = 200;
+/// back: `exec 0<&9 9<&-; …`. The fd must be single-digit: POSIX sh (dash,
+/// Debian's /bin/sh) rejects fd numbers >9 in redirections.
+const STDIN_DUP_FD: i32 = 9;
 
 /// A payload that forks a detached child can keep the pty/pipes open after
 /// the main process exits — the drain tasks then never see EOF and the
@@ -39,7 +40,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// nsenter→setpriv→env→sh exec chain).
 fn preserve_stdin() -> std::io::Result<()> {
     // SAFETY: dup2 only touches fds; called in pre_exec where fd 0 is the
-    // child's real stdin and fd 200 is free in a fresh exec'd process.
+    // child's real stdin and fd 9 is free in a fresh exec'd process.
     if unsafe { libc::dup2(0, STDIN_DUP_FD) } < 0 {
         return Err(std::io::Error::last_os_error());
     }

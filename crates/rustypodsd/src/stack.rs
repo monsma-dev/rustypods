@@ -49,6 +49,10 @@ pub struct StackPod {
     /// Snapshot GC: drop commits older than this, e.g. "7d" (0 = unlimited).
     #[serde(rename = "snap_max_age", default, with = "crate::state::duration_field")]
     pub snap_max_age_secs: u64,
+    /// Payload override for this member — replaces the image
+    /// entrypoint+cmd and forces non-boot mode.
+    #[serde(default)]
+    pub cmd: Vec<String>,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.
@@ -78,6 +82,10 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
             .with_context(|| format!("pods.{member}: invalid image name"))?;
         if !image_exists(&p.image) {
             bail!("pods.{member}: image '{}' not found", p.image);
+        }
+        if !p.cmd.is_empty() {
+            rustypods_proto::validate_argv(&p.cmd)
+                .with_context(|| format!("pods.{member}: invalid cmd"))?;
         }
         for spec in &p.ports {
             rustypods_proto::validate_port(spec).with_context(|| format!("pods.{member}"))?;

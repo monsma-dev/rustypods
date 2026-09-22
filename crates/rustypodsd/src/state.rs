@@ -202,6 +202,10 @@ pub struct PodMeta {
     /// "host[:pod][:ro]" bind mounts, applied at start.
     #[serde(default)]
     pub binds: Vec<String>,
+    /// Per-pod payload override: replaces the image's entrypoint+cmd and
+    /// forces non-boot mode, even on boot-capable images.
+    #[serde(default)]
+    pub cmd: Vec<String>,
     /// Snapshot GC: keep at most this many commits (0 = unlimited).
     #[serde(default)]
     pub snap_keep_last: u32,
@@ -307,6 +311,9 @@ fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Result<()> {
             rustypods_proto::validate_bind(spec)
                 .with_context(|| format!("invalid bind '{spec}'"))?;
         }
+    }
+    if !m.cmd.is_empty() {
+        rustypods_proto::validate_argv(&m.cmd).context("invalid cmd")?;
     }
     Ok(())
 }
@@ -470,6 +477,7 @@ fn migrate_json(data_dir: &Path) {
             net_index: 0,
             stack: String::new(),
             binds: vec![],
+            cmd: vec![],
             snap_keep_last: 0,
             snap_max_age_secs: 0,
             autostart: false,

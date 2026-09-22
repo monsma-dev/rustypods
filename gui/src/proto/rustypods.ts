@@ -187,6 +187,12 @@ export interface Pod {
   snapMaxAgeSecs: number;
   /** Start this pod automatically whenever the daemon boots. */
   autostart: boolean;
+  /**
+   * Per-pod payload override: replaces the image's entrypoint+cmd and
+   * forces non-boot mode, even on boot-capable images (e.g.
+   * ["sleep", "infinity"] to keep a bare OCI image alive as a dev pod).
+   */
+  cmd: string[];
 }
 
 export interface PodList {
@@ -221,6 +227,8 @@ export interface CreatePodRequest {
     | undefined;
   /** Start this pod automatically whenever the daemon boots. */
   autostart: boolean;
+  /** Per-pod payload override (see Pod.cmd); empty = image default. */
+  cmd: string[];
 }
 
 export interface ClonePodRequest {
@@ -278,6 +286,11 @@ export interface BindList {
   binds: string[];
 }
 
+export interface CmdList {
+  /** Full desired payload argv, replaces current. Empty = clear override. */
+  argv: string[];
+}
+
 export interface UpdatePodConfigRequest {
   name: string;
   limits?:
@@ -308,7 +321,14 @@ export interface UpdatePodConfigRequest {
     | number
     | undefined;
   /** Absent = keep; present = set the boot-time autostart flag. */
-  autostart?: boolean | undefined;
+  autostart?:
+    | boolean
+    | undefined;
+  /**
+   * Absent = keep; present (even empty) = replace the payload override.
+   * Takes effect on the next pod start.
+   */
+  cmd?: CmdList | undefined;
 }
 
 export interface StartPodRequest {
@@ -1790,6 +1810,7 @@ function createBasePod(): Pod {
     snapKeepLast: 0,
     snapMaxAgeSecs: 0,
     autostart: false,
+    cmd: [],
   };
 }
 
@@ -1842,6 +1863,9 @@ export const Pod: MessageFns<Pod> = {
     }
     if (message.autostart !== false) {
       writer.uint32(128).bool(message.autostart);
+    }
+    for (const v of message.cmd) {
+      writer.uint32(138).string(v!);
     }
     return writer;
   },
@@ -1987,6 +2011,14 @@ export const Pod: MessageFns<Pod> = {
             message.autostart = reader.bool();
             continue;
           }
+          case 17: {
+            if (tag !== 138) {
+              break;
+            }
+
+            message.cmd.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2041,6 +2073,9 @@ export const Pod: MessageFns<Pod> = {
         ? globalThis.Number(object.snap_max_age_secs)
         : 0,
       autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : false,
+      cmd: globalThis.Array.isArray(object?.cmd)
+        ? object.cmd.map((e: any) => globalThis.String(e))
+        : [],
     };
   },
 
@@ -2094,6 +2129,9 @@ export const Pod: MessageFns<Pod> = {
     if (message.autostart !== false) {
       obj.autostart = message.autostart;
     }
+    if (message.cmd?.length) {
+      obj.cmd = message.cmd;
+    }
     return obj;
   },
 
@@ -2120,6 +2158,7 @@ export const Pod: MessageFns<Pod> = {
     message.snapKeepLast = object.snapKeepLast ?? 0;
     message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? 0;
     message.autostart = object.autostart ?? false;
+    message.cmd = object.cmd?.map((e) => e) || [];
     return message;
   },
 };
@@ -2320,6 +2359,7 @@ function createBaseCreatePodRequest(): CreatePodRequest {
     binds: [],
     limits: undefined,
     autostart: false,
+    cmd: [],
   };
 }
 
@@ -2348,6 +2388,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     }
     if (message.autostart !== false) {
       writer.uint32(64).bool(message.autostart);
+    }
+    for (const v of message.cmd) {
+      writer.uint32(74).string(v!);
     }
     return writer;
   },
@@ -2429,6 +2472,14 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
             message.autostart = reader.bool();
             continue;
           }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.cmd.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2455,6 +2506,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       binds: globalThis.Array.isArray(object?.binds) ? object.binds.map((e: any) => globalThis.String(e)) : [],
       limits: isSet(object.limits) ? Limits.fromJSON(object.limits) : undefined,
       autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : false,
+      cmd: globalThis.Array.isArray(object?.cmd) ? object.cmd.map((e: any) => globalThis.String(e)) : [],
     };
   },
 
@@ -2484,6 +2536,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     if (message.autostart !== false) {
       obj.autostart = message.autostart;
     }
+    if (message.cmd?.length) {
+      obj.cmd = message.cmd;
+    }
     return obj;
   },
 
@@ -2502,6 +2557,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       ? Limits.fromPartial(object.limits)
       : undefined;
     message.autostart = object.autostart ?? false;
+    message.cmd = object.cmd?.map((e) => e) || [];
     return message;
   },
 };
@@ -3340,6 +3396,73 @@ export const BindList: MessageFns<BindList> = {
   },
 };
 
+function createBaseCmdList(): CmdList {
+  return { argv: [] };
+}
+
+export const CmdList: MessageFns<CmdList> = {
+  encode(message: CmdList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.argv) {
+      writer.uint32(10).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CmdList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseCmdList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.argv.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): CmdList {
+    return { argv: globalThis.Array.isArray(object?.argv) ? object.argv.map((e: any) => globalThis.String(e)) : [] };
+  },
+
+  toJSON(message: CmdList): unknown {
+    const obj: any = {};
+    if (message.argv?.length) {
+      obj.argv = message.argv;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<CmdList>, I>>(base?: I): CmdList {
+    return CmdList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<CmdList>, I>>(object: I): CmdList {
+    const message = createBaseCmdList();
+    message.argv = object.argv?.map((e) => e) || [];
+    return message;
+  },
+};
+
 function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
   return {
     name: "",
@@ -3350,6 +3473,7 @@ function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
     snapKeepLast: undefined,
     snapMaxAgeSecs: undefined,
     autostart: undefined,
+    cmd: undefined,
   };
 }
 
@@ -3378,6 +3502,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     }
     if (message.autostart !== undefined) {
       writer.uint32(64).bool(message.autostart);
+    }
+    if (message.cmd !== undefined) {
+      CmdList.encode(message.cmd, writer.uint32(74).fork()).join();
     }
     return writer;
   },
@@ -3459,6 +3586,14 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
             message.autostart = reader.bool();
             continue;
           }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.cmd = CmdList.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3493,6 +3628,7 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
         ? globalThis.Number(object.snap_max_age_secs)
         : undefined,
       autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : undefined,
+      cmd: isSet(object.cmd) ? CmdList.fromJSON(object.cmd) : undefined,
     };
   },
 
@@ -3522,6 +3658,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     if (message.autostart !== undefined) {
       obj.autostart = message.autostart;
     }
+    if (message.cmd !== undefined) {
+      obj.cmd = CmdList.toJSON(message.cmd);
+    }
     return obj;
   },
 
@@ -3544,6 +3683,7 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     message.snapKeepLast = object.snapKeepLast ?? undefined;
     message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? undefined;
     message.autostart = object.autostart ?? undefined;
+    message.cmd = (object.cmd !== undefined && object.cmd !== null) ? CmdList.fromPartial(object.cmd) : undefined;
     return message;
   },
 };

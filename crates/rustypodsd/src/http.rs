@@ -61,6 +61,9 @@ struct CreatePodIn {
     binds: Vec<String>,
     #[serde(default)]
     autostart: bool,
+    /// Payload override argv; replaces the image entrypoint+cmd.
+    #[serde(default)]
+    cmd: Option<Vec<String>>,
 }
 
 /// `PATCH /v1/pods/:name` body — absent fields keep their current values.
@@ -78,6 +81,8 @@ struct UpdatePodIn {
     snap_max_age_secs: Option<u64>,
     /// Absent = keep; true/false sets the boot-time autostart flag.
     autostart: Option<bool>,
+    /// Absent = keep; present (even []) replaces the payload override.
+    cmd: Option<Vec<String>>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -127,6 +132,7 @@ async fn create_pod(
             binds: b.binds,
             limits: has_limits.then_some(limits),
             autostart: b.autostart,
+            cmd: b.cmd.unwrap_or_default(),
         }))
         .await
         .map_err(api_err)?
@@ -191,6 +197,7 @@ async fn update_pod(
             snap_keep_last: b.snap_keep_last,
             snap_max_age_secs: b.snap_max_age_secs,
             autostart: b.autostart,
+            cmd: b.cmd.map(|argv| CmdList { argv }),
         }))
         .await
         .map_err(api_err)?

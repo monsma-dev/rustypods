@@ -160,6 +160,7 @@ async fn update_pod_config(
                 snap_keep_last,
                 snap_max_age_secs,
                 autostart: None, // GUI doesn't manage the boot flag (yet)
+                cmd: None,       // GUI doesn't manage the payload override
             })
             .await
             .map_err(|e| e.message().to_string())?
@@ -203,6 +204,7 @@ async fn create_pod(
                 binds,
                 limits,
                 autostart: false,
+                cmd: vec![],
             })
             .await
             .map_err(|e| e.message().to_string())?
