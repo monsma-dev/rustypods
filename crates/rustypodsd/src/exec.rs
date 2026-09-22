@@ -92,6 +92,47 @@ fn is_busybox_applet(rootfs: &Path, path: &str) -> bool {
     }
 }
 
+/// Is locale `loc` (e.g. "nl_NL.UTF-8") usable inside `rootfs`?
+/// Per-locale dirs (`usr/lib/locale/<loc>` or the `.UTF-8`→`.utf8`
+/// normalized form) prove it on any distro. The glibc
+/// `usr/lib/locale/locale-archive` is authoritative elsewhere, but Debian
+/// generates it lazily via `locale-gen` — there an uncommented
+/// `/etc/locale.gen` line is the evidence.
+fn locale_available(rootfs: &Path, loc: &str) -> bool {
+    let exists = |rel: &str| -> bool {
+        matches!(
+            crate::rootfs::safe_join_if_exists(rootfs, rel),
+            Ok(Some(p)) if p.exists()
+        )
+    };
+    if exists(&format!("usr/lib/locale/{loc}")) {
+        return true;
+    }
+    let norm = loc.replace(".UTF-8", ".utf8");
+    if norm != loc && exists(&format!("usr/lib/locale/{norm}")) {
+        return true;
+    }
+    if !exists("usr/lib/locale/locale-archive") {
+        return false;
+    }
+    if !exists("etc/debian_version") {
+        return true;
+    }
+    let gen = crate::rootfs::safe_join_if_exists(rootfs, "etc/locale.gen")
+        .ok()
+        .flatten()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    gen.lines().any(|l| {
+        let l = l.trim_start();
+        !l.starts_with('#')
+            && l.split_whitespace()
+                .next()
+                .map(|name| name == loc || name == norm)
+                .unwrap_or(false)
+    })
+}
+
 /// name → (uid, gid, home, shell), parsed from the image's own /etc/passwd.
 pub fn passwd_entry(rootfs: &Path, user: &str) -> Option<(u32, u32, String, String)> {
     let text = std::fs::read_to_string(rootfs.join("etc/passwd")).ok()?;
@@ -234,7 +275,7 @@ pub fn exec_argv(
     for kv in &start.env {
         // Must be KEY=VALUE with a POSIX-ish key — anything else (a bare
         // word, or "-i"/"-S x") is an `env` option/command injection.
-        let Some((key, _)) = kv.split_once('=') else {
+        let Some((key, value)) = kv.split_once('=') else {
             anyhow::bail!("invalid env entry '{kv}'");
         };
         let key_ok = !key.is_empty()
@@ -246,6 +287,20 @@ pub fn exec_argv(
             && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !key_ok {
             anyhow::bail!("invalid env entry '{kv}'");
+        }
+        // A forwarded host LANG/LC_ALL that the rootfs never generated
+        // kills locale-aware tools (sphinx-build: locale.Error). C.UTF-8
+        // always exists in glibc ≥2.35 — degrade to it.
+        if matches!(key, "LANG" | "LC_ALL")
+            && !matches!(value, "" | "C" | "POSIX" | "C.UTF-8" | "C.utf8")
+            && !locale_available(rootfs, value)
+        {
+            tracing::debug!(
+                "pod {}: {key}={value} not generated in rootfs — downgrading to C.UTF-8",
+                start.pod
+            );
+            a.push(format!("{key}=C.UTF-8").into());
+            continue;
         }
         a.push(kv.clone().into());
     }
@@ -657,6 +712,57 @@ mod tests {
         assert!(s.iter().any(|x| *x == "--reuid=1000"));
         assert!(s.iter().any(|x| *x == "HOME=/home/nick"));
         assert!(s.iter().any(|x| *x == "/bin/bash"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A forwarded LANG that the rootfs never generated downgrades to
+    /// C.UTF-8; a generated one survives; C-locales are untouched.
+    #[test]
+    fn lang_downgrades_when_locale_missing() {
+        let dir = fake_rootfs("lang", true);
+        let mut s = start("root", &["true"]);
+        s.env = vec!["LANG=nl_NL.UTF-8".into()];
+        let a = exec_argv(42, &dir, &s, false).unwrap();
+        let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(v.iter().any(|x| x == "LANG=C.UTF-8"));
+        assert!(!v.iter().any(|x| x == "LANG=nl_NL.UTF-8"));
+
+        // Per-locale dir present → kept.
+        std::fs::create_dir_all(dir.join("usr/lib/locale/nl_NL.utf8")).unwrap();
+        let a = exec_argv(42, &dir, &s, false).unwrap();
+        let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(v.iter().any(|x| x == "LANG=nl_NL.UTF-8"));
+
+        // Debian-style: archive + uncommented locale.gen line → kept.
+        std::fs::remove_dir_all(dir.join("usr/lib/locale")).unwrap();
+        std::fs::create_dir_all(dir.join("usr/lib/locale")).unwrap();
+        std::fs::write(dir.join("usr/lib/locale/locale-archive"), b"").unwrap();
+        std::fs::write(dir.join("etc/debian_version"), b"forky/sid\n").unwrap();
+        let a = exec_argv(42, &dir, &s, false).unwrap();
+        let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(v.iter().any(|x| x == "LANG=C.UTF-8"), "debian: archive alone is not proof");
+        std::fs::write(
+            dir.join("etc/locale.gen"),
+            "# en_US.UTF-8 UTF-8\nnl_NL.UTF-8 UTF-8\n",
+        )
+        .unwrap();
+        let a = exec_argv(42, &dir, &s, false).unwrap();
+        let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(v.iter().any(|x| x == "LANG=nl_NL.UTF-8"), "locale.gen line counts");
+
+        // C and POSIX always exist — pass through untouched.
+        s.env = vec!["LANG=C".into(), "LC_ALL=POSIX".into()];
+        let a = exec_argv(42, &dir, &s, false).unwrap();
+        let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(v.iter().any(|x| x == "LANG=C"));
+        assert!(v.iter().any(|x| x == "LC_ALL=POSIX"));
+
+        // Non-debian rootfs: archive presence alone suffices.
+        std::fs::remove_file(dir.join("etc/debian_version")).unwrap();
+        s.env = vec!["LC_ALL=xx_YY.UTF-8".into()];
+        let a = exec_argv(42, &dir, &s, false).unwrap();
+        let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        assert!(v.iter().any(|x| x == "LC_ALL=xx_YY.UTF-8"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

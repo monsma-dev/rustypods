@@ -219,7 +219,10 @@ rustypods start kde-dev                 # payload pod; logs via console log
 
 The override replaces the image's entrypoint+cmd and forces non-boot mode;
 change it later with `rustypods config <pod> --cmd …` / `--clear-cmd`
-(applied at the next start).
+(applied at the next start). The host's `LANG` is forwarded on exec — a
+fresh OCI rootfs that hasn't generated it gets `C.UTF-8` instead, so
+locale-aware tools don't die; run `locale-gen` in the pod for the real
+locale.
 
 or over REST/JSON with the bearer token in `/run/rustypods/http-token`:
 
