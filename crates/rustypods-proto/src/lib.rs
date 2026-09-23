@@ -374,12 +374,13 @@ mod tests {
 
     #[test]
     fn bind_validation() {
-        let b = validate_bind("/home/nick").unwrap();
-        assert_eq!(b, BindSpec { host: "/home/nick".into(), pod: "/home/nick".into(), ro: false });
+        let b = validate_bind("/var/tmp").unwrap();
+        assert_eq!(b, BindSpec { host: "/var/tmp".into(), pod: "/var/tmp".into(), ro: false });
         assert!(validate_bind("/tmp").is_ok());
-        assert!(validate_bind("/run/user/1000:ro").unwrap().ro);
-        assert!(validate_bind("/dev/dri:ro").unwrap().ro);
-        assert!(validate_bind("/run/user/1000").is_err());
+        // /run itself may not be bound wholesale, not even read-only;
+        // subpaths are :ro-only.
+        assert!(validate_bind("/run").is_err());
+        assert!(validate_bind("/run:ro").is_err());
         assert!(validate_bind("/etc").is_err());
         assert!(validate_bind("home/nick").is_err());
         assert!(validate_bind("/a/../b").is_err());
@@ -391,10 +392,12 @@ mod tests {
         // Symlink aliases resolve before the deny-lists run:
         // /var/run → /run, /bin → /usr/bin on any usr-merged system.
         assert!(validate_bind("/var/run").is_err());
-        assert!(validate_bind("/var/run/user/1000").is_err());
-        assert!(validate_bind("/var/run/user/1000:ro").unwrap().ro);
-        assert!(validate_bind("/bin/bash").is_err());
-        assert!(validate_bind("/bin/bash:ro").unwrap().ro);
+        assert!(validate_bind("/var/run:ro").is_err());
+        assert!(validate_bind("/var/run/lock:ro").unwrap().ro);
+        if std::path::Path::new("/bin/sh").exists() {
+            assert!(validate_bind("/bin/sh").is_err());
+            assert!(validate_bind("/bin/sh:ro").unwrap().ro);
+        }
         assert!(validate_bind("/root").is_err());
     }
 

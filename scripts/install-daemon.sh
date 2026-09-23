@@ -331,7 +331,19 @@ if [[ $active -eq 0 ]]; then
   journalctl -u rustypodsd -n 30 --no-pager || true
   die "rustypodsd did not come up — see status/journal above"
 fi
-echo "    rustypodsd is active"
+# systemd reports active before the daemon has bound its socket — wait for
+# a real ping, not just the unit state.
+ready=0
+for _ in $(seq 1 20); do
+  if /usr/local/bin/rustypods ping >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.5
+done
+if [[ $ready -eq 0 ]]; then
+  systemctl status rustypodsd --no-pager || true
+  journalctl -u rustypodsd -n 30 --no-pager || true
+  die "rustypodsd is active but its control socket did not become ready"
+fi
+echo "    rustypodsd is active and its control socket is ready"
 echo
 echo "==> doctor"
 /usr/local/bin/rustypods doctor

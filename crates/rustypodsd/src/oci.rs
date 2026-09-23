@@ -547,6 +547,8 @@ mod tests {
             hdr.set_entry_type(tar::EntryType::Regular);
             hdr.set_mode(0o644);
             hdr.set_size(0);
+            hdr.set_uid(0);
+            hdr.set_gid(0);
             hdr.set_cksum();
             tw.append_data(&mut hdr, p, std::io::empty()).unwrap();
         }
@@ -579,6 +581,9 @@ mod tests {
         hdr.set_entry_type(tar::EntryType::Symlink);
         hdr.set_mode(0o777);
         hdr.set_size(0);
+        hdr.set_uid(0);
+        hdr.set_gid(0);
+        hdr.set_cksum();
         t1.append_link(&mut hdr, "d", &outside).unwrap();
         let layer1 = t1.into_inner().unwrap();
         unpack_tar(&layer1[..], &dest).unwrap();
@@ -590,6 +595,8 @@ mod tests {
         hdr.set_entry_type(tar::EntryType::Regular);
         hdr.set_mode(0o644);
         hdr.set_size(0);
+        hdr.set_uid(0);
+        hdr.set_gid(0);
         hdr.set_cksum();
         t2.append_data(&mut hdr, "d/.wh.victim", std::io::empty())
             .unwrap();
@@ -627,6 +634,8 @@ mod tests {
             hdr.set_entry_type(tar::EntryType::Regular);
             hdr.set_mode(0o644);
             hdr.set_size(0);
+            hdr.set_uid(0);
+            hdr.set_gid(0);
             hdr.set_cksum();
             t.append_data(&mut hdr, p, std::io::empty()).unwrap();
         }
