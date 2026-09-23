@@ -89,6 +89,29 @@ enum Cmd {
         /// --cmd is command argv, so it must be the final rustypods option.
         #[arg(long, num_args = 1.., value_delimiter = None, allow_hyphen_values = true)]
         cmd: Vec<String>,
+        /// Restart policy on exit/death: no|on-failure|always. "always"
+        /// also restarts on sustained healthcheck failure.
+        #[arg(long, value_parser = ["no", "on-failure", "always"])]
+        restart: Option<String>,
+        /// Exec liveness probe — run via `sh -c` inside the pod; exit 0 = healthy.
+        #[arg(long, conflicts_with_all = ["health_tcp", "health_http"])]
+        health_cmd: Option<String>,
+        /// TCP liveness probe — ":port" (the pod's own address) or "host:port".
+        #[arg(long, conflicts_with = "health_http")]
+        health_tcp: Option<String>,
+        /// HTTP liveness probe — "/path" (pod address :80) or a full
+        /// "http://ip:port/path" URL.
+        #[arg(long)]
+        health_http: Option<String>,
+        /// Probe interval, e.g. 10s (default 10s).
+        #[arg(long)]
+        health_interval: Option<String>,
+        /// Per-probe timeout, e.g. 3s (default 3s).
+        #[arg(long)]
+        health_timeout: Option<String>,
+        /// Consecutive probe failures before unhealthy (default 3).
+        #[arg(long)]
+        health_retries: Option<u32>,
     },
     /// Start a pod (nspawn --boot, machined registration).
     Start {
@@ -195,6 +218,32 @@ enum Cmd {
         /// Remove the payload command override (applied at the next start).
         #[arg(long)]
         clear_cmd: bool,
+        /// Restart policy on exit/death: no|on-failure|always (replaces
+        /// current). "always" also restarts on sustained healthcheck failure.
+        #[arg(long, value_parser = ["no", "on-failure", "always"])]
+        restart: Option<String>,
+        /// Exec liveness probe — run via `sh -c` inside the pod; exit 0 = healthy.
+        #[arg(long, conflicts_with_all = ["health_tcp", "health_http", "clear_health"])]
+        health_cmd: Option<String>,
+        /// TCP liveness probe — ":port" (the pod's own address) or "host:port".
+        #[arg(long, conflicts_with_all = ["health_http", "clear_health"])]
+        health_tcp: Option<String>,
+        /// HTTP liveness probe — "/path" (pod address :80) or a full
+        /// "http://ip:port/path" URL.
+        #[arg(long, conflicts_with = "clear_health")]
+        health_http: Option<String>,
+        /// Probe interval, e.g. 10s (default 10s).
+        #[arg(long, conflicts_with = "clear_health")]
+        health_interval: Option<String>,
+        /// Per-probe timeout, e.g. 3s (default 3s).
+        #[arg(long, conflicts_with = "clear_health")]
+        health_timeout: Option<String>,
+        /// Consecutive probe failures before unhealthy (default 3).
+        #[arg(long, conflicts_with = "clear_health")]
+        health_retries: Option<u32>,
+        /// Remove the liveness probe.
+        #[arg(long)]
+        clear_health: bool,
     },
     /// Reread a hand-edited <pod>.conf and apply it.
     Reload { name: String },
@@ -866,6 +915,12 @@ fn print_pod(p: &Pod) {
     if p.autostart {
         extra.push_str(" autostart");
     }
+    if !p.health.is_empty() {
+        extra.push_str(&format!(" health={}", p.health));
+    }
+    if !p.restart.is_empty() && p.restart != "no" {
+        extra.push_str(&format!(" restart={}", p.restart));
+    }
     println!(
         "{:<20} {:<8} {:<8} pid={:<7} {}",
         p.name,
@@ -874,6 +929,50 @@ fn print_pod(p: &Pod) {
         p.leader_pid,
         extra.trim()
     );
+}
+
+/// Build the proto HealthCheck from the CLI's --health-* flags.
+/// `--health-cmd` runs via `sh -c` (same model as Docker HEALTHCHECK CMD);
+/// the daemon re-validates before persisting.
+fn healthcheck_proto(
+    exec: Option<&String>,
+    tcp: Option<&String>,
+    http: Option<&String>,
+    interval: Option<&String>,
+    timeout: Option<&String>,
+    retries: Option<u32>,
+) -> Result<Option<HealthCheck>> {
+    let (kind, target, argv) = if let Some(c) = exec {
+        (
+            "exec".to_string(),
+            String::new(),
+            vec!["sh".into(), "-c".into(), c.clone()],
+        )
+    } else if let Some(t) = tcp {
+        ("tcp".to_string(), t.clone(), vec![])
+    } else if let Some(h) = http {
+        ("http".to_string(), h.clone(), vec![])
+    } else {
+        if interval.is_some() || timeout.is_some() || retries.is_some() {
+            anyhow::bail!(
+                "--health-interval/--health-timeout/--health-retries need a probe (--health-cmd/--health-tcp/--health-http)"
+            );
+        }
+        return Ok(None);
+    };
+    let hc = HealthCheck {
+        kind,
+        target,
+        argv,
+        interval_secs: interval
+            .map(|s| parse_duration(s))
+            .transpose()?
+            .unwrap_or(0) as u32,
+        timeout_secs: timeout.map(|s| parse_duration(s)).transpose()?.unwrap_or(0) as u32,
+        retries: retries.unwrap_or(0),
+    };
+    rustypods_proto::validate_healthcheck(&hc)?;
+    Ok(Some(hc))
 }
 
 #[tokio::main]
@@ -1024,7 +1123,7 @@ async fn main() -> Result<()> {
             connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
             println!("image {name} removed");
         }
-        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, ingress, cmd } => {
+        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, ingress, cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries } => {
             let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
             if !port.is_empty() || !ingress.is_empty() {
                 eprintln!("note: --port/--ingress imply a private netns (--network-veth); the pod no longer shares host networking");
@@ -1033,9 +1132,17 @@ async fn main() -> Result<()> {
             for spec in &ingress {
                 ingress_rules.push(rustypods_proto::parse_ingress_rule(spec)?);
             }
+            let healthcheck = healthcheck_proto(
+                health_cmd.as_ref(),
+                health_tcp.as_ref(),
+                health_http.as_ref(),
+                health_interval.as_ref(),
+                health_timeout.as_ref(),
+                health_retries,
+            )?;
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, ingress: ingress_rules, desktop, binds: bind, limits: None, autostart, cmd })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, ingress: ingress_rules, desktop, binds: bind, limits: None, autostart, cmd, restart: restart.unwrap_or_default(), healthcheck })
                 .await?
                 .into_inner();
             print_pod(&p);
@@ -1202,7 +1309,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, ingress, clear_ingress, cmd, clear_cmd } => {
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, ingress, clear_ingress, cmd, clear_cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries, clear_health } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -1257,6 +1364,19 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            let healthcheck = if clear_health {
+                // Present-but-empty kind disables the probe.
+                Some(HealthCheck::default())
+            } else {
+                healthcheck_proto(
+                    health_cmd.as_ref(),
+                    health_tcp.as_ref(),
+                    health_http.as_ref(),
+                    health_interval.as_ref(),
+                    health_timeout.as_ref(),
+                    health_retries,
+                )?
+            };
             let p = c
                 .update_pod_config(UpdatePodConfigRequest {
                     name,
@@ -1272,6 +1392,8 @@ async fn main() -> Result<()> {
                         .map(parse_duration)
                         .transpose()?,
                     autostart,
+                    restart,
+                    healthcheck,
                 })
                 .await?
                 .into_inner();

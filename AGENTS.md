@@ -173,6 +173,27 @@ rustypodsd does it itself:
   re-applied at every start (quota state doesn't survive remount).
 - Verify: `btrfs qgroup show -re /var/lib/rustypods/pods/<pod>`.
 
+## Healthchecks & restart (server.rs supervisor)
+
+- Per-second `supervise_once` tick over pods with a restart policy, a
+  configured probe, or `ingress_gateway` (managed ⇒ always "always").
+- Death-watch keys on the in-memory `stop_intent` set — `PodMeta.started`
+  means "was ever started" (drives Created/Stopped display), NOT "should
+  be running". stop_pod records intent before engine.stop; start_pod
+  clears it; a daemon restart loses intent (Docker-"always"-like).
+- Exec probes reuse `exec_argv` — the payload ends with an
+  `exec 0<&200` stdin-restore wrapper that ONLY works with
+  `pre_exec(exec::preserve_stdin)` on the spawn (util-linux ≤2.42
+  --join-cgroup closes fd 0). Spawning the argv without that hook makes
+  every probe exit non-zero — probes always "fail" while `rustypods exec`
+  works fine (burned an hour on this).
+- tcp/http probes dial `10.220.<idx>.2` (pod veth) for ":port"/"/path",
+  or a numeric host:port verbatim — the daemon never resolves DNS.
+- Backoff: 2^n s per restart attempt, cap 60s, decays after 60s of
+  sustained health. "always" restarts on sustained probe failure too;
+  "on-failure" only on leader death (exit-code distinction is a machined
+  blind spot for now).
+
 ## Rootless podman caveat
 
 `podman` needs the user session bus (`/run/user/1000/bus`). If `podman

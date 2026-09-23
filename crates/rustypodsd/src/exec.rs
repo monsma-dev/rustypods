@@ -38,7 +38,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// pre_exec hook: stash the real stdin on a high fd that survives nsenter's
 /// fd-0 clobber (dup2 clears CLOEXEC, so it propagates through the
 /// nsenter→setpriv→env→sh exec chain).
-fn preserve_stdin() -> std::io::Result<()> {
+pub(crate) fn preserve_stdin() -> std::io::Result<()> {
     // SAFETY: dup2 only touches fds; called in pre_exec where fd 0 is the
     // child's real stdin and fd 9 is free in a fresh exec'd process.
     if unsafe { libc::dup2(0, STDIN_DUP_FD) } < 0 {

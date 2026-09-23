@@ -67,6 +67,12 @@ struct CreatePodIn {
     /// "<host>.rustypods.localhost:<port>" ingress rules.
     #[serde(default)]
     ingress: Vec<String>,
+    /// Restart policy: "no" (default) | "on-failure" | "always".
+    #[serde(default)]
+    restart: Option<String>,
+    /// Liveness probe spec (see rpc::HealthCheck).
+    #[serde(default)]
+    healthcheck: Option<HealthCheck>,
 }
 
 /// `PATCH /v1/pods/:name` body — absent fields keep their current values.
@@ -89,6 +95,10 @@ struct UpdatePodIn {
     /// Absent = keep current rules; present (even []) replaces them.
     /// The pod must be stopped to change ingress.
     ingress: Option<Vec<String>>,
+    /// Absent = keep; present replaces the restart policy.
+    restart: Option<String>,
+    /// Absent = keep; present replaces the probe (empty kind = off).
+    healthcheck: Option<HealthCheck>,
 }
 
 fn parse_ingress(specs: &[String]) -> Result<Vec<IngressRule>, ApiErr> {
@@ -148,6 +158,8 @@ async fn create_pod(
             autostart: b.autostart,
             cmd: b.cmd.unwrap_or_default(),
             ingress: parse_ingress(&b.ingress)?,
+            restart: b.restart.unwrap_or_default(),
+            healthcheck: b.healthcheck,
         }))
         .await
         .map_err(api_err)?
@@ -219,6 +231,8 @@ async fn update_pod(
                 .map(parse_ingress)
                 .transpose()?
                 .map(|rules| IngressList { rules }),
+            restart: b.restart,
+            healthcheck: b.healthcheck,
         }))
         .await
         .map_err(api_err)?

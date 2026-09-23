@@ -24,7 +24,7 @@ use crate::oci;
 use crate::runtime::{RuntimeEngine, StartSpec};
 use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State};
 use crate::storage::StorageDriver;
-use crate::{ingress, net, pki, runtime, stack, storage, Config};
+use crate::{exec, ingress, net, pki, runtime, stack, storage, Config};
 
 #[derive(Clone)]
 pub struct Svc {
@@ -61,6 +61,31 @@ pub struct Svc {
     /// (each commit logs on the dataplane). `None` after daemon restart
     /// always forces a push — clearing whatever the gateway kept.
     ingress_last_push: Arc<Mutex<Option<(u64, Vec<ActiveIngressRoute>)>>>,
+    /// Per-pod supervisor state for liveness probes and restarts.
+    /// Entries exist only while a pod is under supervision (running
+    /// with a restart policy or a configured probe).
+    health: Arc<Mutex<HashMap<String, PodHealth>>>,
+    /// Pods stopped on purpose via stop_pod — the supervisor must not
+    /// restart these. PodMeta.started means "was ever started" (display
+    /// state), not "should be running", so intent lives here. In-memory:
+    /// a daemon restart clears it, matching Docker's "always" semantics
+    /// (a dead should-be-running pod comes back).
+    stop_intent: Arc<Mutex<BTreeSet<String>>>,
+}
+
+/// Supervisor bookkeeping for one pod. `status` is surfaced on Pod as
+/// "starting" | "healthy" | "unhealthy" | "dead".
+struct PodHealth {
+    status: &'static str,
+    fails: u32,
+    last_probe: std::time::Instant,
+    /// Exponential restart backoff: 2^n seconds, capped at 60s, counted
+    /// by restart_count. Reset when the pod stays healthy ≥60s.
+    restart_count: u32,
+    backoff_until: Option<std::time::Instant>,
+    /// When the pod last passed a probe or was freshly started — used
+    /// to decay restart_count after stability.
+    healthy_since: std::time::Instant,
 }
 
 /// Hard cap on a single SHM segment — the file lives on /dev/shm (tmpfs),
@@ -85,7 +110,7 @@ fn to_image(m: &ImageMeta, path: &Path) -> Image {
     }
 }
 
-fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
+fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>, health: &str) -> Pod {
     Pod {
         name: m.name.clone(),
         image: m.image.clone(),
@@ -116,6 +141,8 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         cmd: m.cmd.clone(),
         ingress: ingress_to_proto(&m.ingress),
         ingress_gateway: m.ingress_gateway,
+        health: health.into(),
+        restart: m.restart.clone(),
     }
 }
 
@@ -158,6 +185,55 @@ fn limits_from(l: Option<Limits>) -> LimitsSpec {
         cpu_quota_percent: l.cpu_quota_percent,
     })
     .unwrap_or_default()
+}
+
+/// rpc::HealthCheck → persisted HealthSpec, validating first so a
+/// malformed probe can never reach the conf. "none" normalizes to "".
+fn health_from_proto(h: &HealthCheck) -> Result<state::HealthSpec> {
+    proto::validate_healthcheck(h)?;
+    let kind = if h.kind == "none" { "" } else { h.kind.as_str() };
+    Ok(state::HealthSpec {
+        kind: kind.into(),
+        target: h.target.trim().into(),
+        argv: h.argv.clone(),
+        interval_secs: h.interval_secs,
+        timeout_secs: h.timeout_secs,
+        retries: h.retries,
+    })
+}
+
+/// Effective restart policy: "" normalizes to "no"; the managed gateway
+/// is always "always" regardless of what its conf says.
+fn restart_policy(m: &PodMeta) -> &str {
+    if m.ingress_gateway {
+        return "always";
+    }
+    match m.restart.as_str() {
+        "on-failure" | "always" => m.restart.as_str(),
+        _ => "no",
+    }
+}
+
+/// Pods the supervisor watches: explicit restart policy, a configured
+/// probe, or the managed gateway.
+fn supervised(m: &PodMeta) -> bool {
+    restart_policy(m) != "no" || !m.healthcheck.kind.is_empty()
+}
+
+/// ":port" or a bare "port" → the pod's own veth address; "host:port"
+/// (numeric) → verbatim. None when the pod has no private-net address
+/// to probe.
+fn probe_addr(m: &PodMeta, target: &str) -> Option<std::net::SocketAddr> {
+    let t = target.trim();
+    let bare = t.parse::<u16>().ok().map(|p| format!(":{p}"));
+    let t = bare.as_deref().unwrap_or(t);
+    match t.strip_prefix(':') {
+        Some(p) if m.net_index > 0 => {
+            Some((net::pod_ip(m.net_index), p.parse().ok()?).into())
+        }
+        Some(_) => None,
+        None => t.parse().ok(),
+    }
 }
 
 /// "hostPort:podPort[/proto]" → (host_port, "tcp"|"udp"). Specs reach here
@@ -468,6 +544,315 @@ impl Svc {
         Self::blocking(move || net::rebuild_nat(pods.iter(), &running)).await
     }
 
+    /// Supervisor health string for Pod.health — "" when the pod isn't
+    /// under supervision (stopped, or no probe and no restart policy).
+    async fn health_view(&self, name: &str) -> String {
+        self.health
+            .lock()
+            .await
+            .get(name)
+            .map(|h| h.status)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// One supervisor tick: death-watch + liveness probes for every pod
+    /// that opted in (restart policy or healthcheck) plus the managed
+    /// gateway. Per-pod failures are logged, never fatal to the loop.
+    async fn supervise_once(&self) {
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods.values().filter(|m| supervised(m)).cloned().collect()
+        };
+        let now = std::time::Instant::now();
+        for m in &pods {
+            if let Err(e) = self.supervise_pod(m, now).await {
+                tracing::warn!("supervise {}: {e:#}", m.name);
+            }
+        }
+    }
+
+    /// Supervise one pod: restart on leader death per its policy, run
+    /// the configured probe when due, restart on sustained failure under
+    /// "always". Decisions are taken under the health lock; the actions
+    /// themselves run after it drops (start/stop re-enter health_view).
+    async fn supervise_pod(&self, m: &PodMeta, now: std::time::Instant) -> Result<()> {
+        enum Act {
+            Idle,
+            /// Leader died — restart via start_pod.
+            Restart,
+            /// Probe due — spec cloned out so the lock isn't held over .await.
+            Probe(state::HealthSpec),
+        }
+        let policy = restart_policy(m);
+        let running = self.engine.running_pid(&m.name).await.is_some();
+        let act = {
+            let mut map = self.health.lock().await;
+            if !running
+                && (!m.started || self.stop_intent.lock().await.contains(&m.name))
+            {
+                // Never booted, or stopped on purpose — nothing to watch
+                // until a start (re)arms the death-watch.
+                map.remove(&m.name);
+                Act::Idle
+            } else {
+                let ent = map.entry(m.name.clone()).or_insert_with(|| PodHealth {
+                    status: "starting",
+                    fails: 0,
+                    last_probe: now,
+                    restart_count: 0,
+                    backoff_until: None,
+                    healthy_since: now,
+                });
+                if !running {
+                    // No stop intent but the leader is gone → death-watch.
+                    match policy {
+                        "no" => {
+                            ent.status = "dead";
+                            Act::Idle
+                        }
+                        _ if ent.backoff_until.is_some_and(|t| now < t) => Act::Idle,
+                        _ => Act::Restart,
+                    }
+                } else if m.healthcheck.kind.is_empty() {
+                    // No probe: alive ⇒ healthy; decay backoff after a
+                    // minute of uninterrupted health.
+                    if ent.status != "healthy" {
+                        ent.healthy_since = now;
+                    } else if now.duration_since(ent.healthy_since) >= Duration::from_secs(60) {
+                        ent.restart_count = 0;
+                    }
+                    ent.status = "healthy";
+                    ent.fails = 0;
+                    Act::Idle
+                } else {
+                    let secs = if m.healthcheck.interval_secs == 0 {
+                        10
+                    } else {
+                        m.healthcheck.interval_secs.max(1)
+                    } as u64;
+                    if now.duration_since(ent.last_probe) >= Duration::from_secs(secs) {
+                        ent.last_probe = now;
+                        Act::Probe(m.healthcheck.clone())
+                    } else {
+                        Act::Idle
+                    }
+                }
+            }
+        };
+        match act {
+            Act::Idle => Ok(()),
+            Act::Restart => self.supervised_restart(m, "leader died").await,
+            Act::Probe(spec) => {
+                let ok = self.probe(m, &spec).await;
+                let mut do_restart = false;
+                {
+                    let mut map = self.health.lock().await;
+                    if let Some(ent) = map.get_mut(&m.name) {
+                        if ok {
+                            if ent.status != "healthy" {
+                                ent.healthy_since = std::time::Instant::now();
+                            }
+                            ent.status = "healthy";
+                            ent.fails = 0;
+                            if ent.healthy_since.elapsed() >= Duration::from_secs(60) {
+                                ent.restart_count = 0;
+                            }
+                        } else {
+                            ent.fails += 1;
+                            let retries = if spec.retries == 0 { 3 } else { spec.retries };
+                            if ent.fails >= retries {
+                                ent.status = "unhealthy";
+                                do_restart = policy == "always";
+                            } else {
+                                ent.status = "starting";
+                            }
+                        }
+                    }
+                }
+                if do_restart {
+                    self.supervised_restart(m, "probe unhealthy").await
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Restart a pod that died or went unhealthy. Goes through the real
+    /// RPCs so op-locking, state flags and NAT behave exactly like a
+    /// manual stop+start. Backoff is 2^n s per consecutive attempt
+    /// (cap 60s) and decays after a minute of sustained health.
+    async fn supervised_restart(&self, m: &PodMeta, why: &str) -> Result<()> {
+        tracing::warn!("{}: {why} — restarting (policy {})", m.name, restart_policy(m));
+        if self.engine.running_pid(&m.name).await.is_some() {
+            if let Err(e) = self
+                .stop_pod(Request::new(PodRef {
+                    name: m.name.clone(),
+                }))
+                .await
+            {
+                tracing::warn!("{}: pre-restart stop failed: {e}", m.name);
+            }
+        }
+        let attempt = self
+            .start_pod(Request::new(StartPodRequest {
+                name: m.name.clone(),
+                limits: None,
+                ephemeral: false,
+                private_users: None,
+            }))
+            .await;
+        {
+            let mut map = self.health.lock().await;
+            if let Some(ent) = map.get_mut(&m.name) {
+                ent.restart_count = ent.restart_count.saturating_add(1);
+                let secs = (1u64 << ent.restart_count.min(6)).min(60);
+                ent.backoff_until =
+                    Some(std::time::Instant::now() + Duration::from_secs(secs));
+                ent.status = "starting";
+                ent.fails = 0;
+                ent.healthy_since = std::time::Instant::now();
+                ent.last_probe = std::time::Instant::now();
+            }
+        }
+        match attempt {
+            Ok(_) => {
+                tracing::info!("{}: restarted ({why})", m.name);
+                Ok(())
+            }
+            Err(e) => {
+                // Backoff is already recorded — a later tick retries.
+                tracing::warn!("{}: restart failed ({why}): {e}", m.name);
+                Ok(())
+            }
+        }
+    }
+
+    /// Run one liveness probe; true = healthy. Any error or timeout is
+    /// a failure.
+    async fn probe(&self, m: &PodMeta, spec: &state::HealthSpec) -> bool {
+        let timeout = Duration::from_secs(if spec.timeout_secs == 0 {
+            3
+        } else {
+            spec.timeout_secs
+        } as u64);
+        match spec.kind.as_str() {
+            "exec" => self.probe_exec(m, spec, timeout).await,
+            "tcp" => self.probe_tcp(m, &spec.target, timeout).await,
+            "http" => self.probe_http(m, &spec.target, timeout).await,
+            _ => true,
+        }
+    }
+
+    /// exec probe: run argv inside the pod via the same nsenter+setpriv
+    /// path as `rustypods exec` — exit 0 = healthy.
+    async fn probe_exec(&self, m: &PodMeta, spec: &state::HealthSpec, timeout: Duration) -> bool {
+        let Some(leader) = self.engine.running_pid(&m.name).await else {
+            return false;
+        };
+        let start = ExecStart {
+            pod: m.name.clone(),
+            user: String::new(), // root
+            argv: spec.argv.clone(),
+            tty: false,
+            rows: 0,
+            cols: 0,
+            env: vec![],
+            workdir: String::new(),
+        };
+        let argv = match exec::exec_argv(leader, &self.pod_rootfs(&m.name), &start, m.private_users)
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("{}: exec probe argv: {e:#}", m.name);
+                return false;
+            }
+        };
+        // Same spawn discipline as exec.rs run_pipe: pre_exec preserves
+        // stdin on STDIN_DUP_FD — without it the argv's `exec 0<&N`
+        // wrapper fails and every probe exits non-zero.
+        let mut scmd = std::process::Command::new(&argv[0]);
+        scmd.args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            scmd.pre_exec(exec::preserve_stdin);
+        }
+        let mut cmd = tokio::process::Command::from(scmd);
+        cmd.kill_on_drop(true);
+        match tokio::time::timeout(timeout, cmd.status()).await {
+            Ok(Ok(s)) => s.success(),
+            _ => false,
+        }
+    }
+
+    /// tcp probe: a completed connect = healthy. ":port" targets the
+    /// pod's own veth address; "host:port" is dialed verbatim.
+    async fn probe_tcp(&self, m: &PodMeta, target: &str, timeout: Duration) -> bool {
+        let Some(addr) = probe_addr(m, target) else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// http probe: plain HTTP/1.1 GET — 2xx/3xx = healthy. "/path"
+    /// targets the pod's own veth address :80; a full
+    /// "http://host[:port]/path" URL is dialed verbatim (numeric hosts
+    /// only — the daemon never resolves DNS).
+    async fn probe_http(&self, m: &PodMeta, target: &str, timeout: Duration) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let t = target.trim();
+        let (addr, req_path, host) = if t.starts_with('/') {
+            if m.net_index == 0 {
+                return false;
+            }
+            let ip = net::pod_ip(m.net_index);
+            (
+                std::net::SocketAddr::from((ip, 80)),
+                t.to_string(),
+                ip.to_string(),
+            )
+        } else {
+            let Ok(uri) = t.parse::<http::Uri>() else {
+                return false;
+            };
+            let Some(auth) = uri.authority() else {
+                return false;
+            };
+            let host = auth.host().to_string();
+            let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+                return false;
+            };
+            (
+                std::net::SocketAddr::new(ip, auth.port_u16().unwrap_or(80)),
+                uri.path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/")
+                    .to_string(),
+                host,
+            )
+        };
+        let fut = async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
+            let req = format!(
+                "GET {req_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rustypodsd-probe\r\nConnection: close\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).await.ok()?;
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).await.ok()?;
+            let head = std::str::from_utf8(&buf[..n]).ok()?;
+            let code: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
+            Some((200..400).contains(&code))
+        };
+        matches!(tokio::time::timeout(timeout, fut).await, Ok(Some(true)))
+    }
+
     /// Current running set from the engine's point of view.
     async fn running_set(&self) -> BTreeSet<String> {
         let pods: Vec<PodMeta> = {
@@ -768,6 +1153,14 @@ impl PodControl for Svc {
         if !req.cmd.is_empty() {
             proto::validate_argv(&req.cmd).map_err(bad)?;
         }
+        proto::validate_restart(&req.restart).map_err(bad)?;
+        let hc = req
+            .healthcheck
+            .as_ref()
+            .map(health_from_proto)
+            .transpose()
+            .map_err(bad)?
+            .unwrap_or_default();
         if let Err(e) = self.st_clone(&img_dir, &dest).await {
             // A partial dest (fallback cp died mid-copy) would wedge the
             // name on "already exists" forever — clean it like pull/import.
@@ -795,6 +1188,8 @@ impl PodControl for Svc {
             autostart: req.autostart,
             cmd: req.cmd.clone(),
             ingress_gateway: false,
+            restart: req.restart.clone(),
+            healthcheck: hc,
         };
         let mut st = self.st.lock().await;
         if let Err(e) = validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress)) {
@@ -807,7 +1202,7 @@ impl PodControl for Svc {
         st.pods.insert(name.clone(), meta.clone());
         drop(st);
         self.save_pod(&meta).map_err(int)?;
-        Ok(Response::new(to_pod(&meta, &dest, None)))
+        Ok(Response::new(to_pod(&meta, &dest, None, "")))
     }
 
     /// `rustypods clone <src> <dest>`: instant btrfs snapshot of the pod
@@ -894,7 +1289,7 @@ impl PodControl for Svc {
         let mut st = self.st.lock().await;
         st.pods.insert(dest.clone(), meta.clone());
         self.save_pod(&meta).map_err(int)?;
-        Ok(Response::new(to_pod(&meta, &dst_root, None)))
+        Ok(Response::new(to_pod(&meta, &dst_root, None, "")))
     }
 
     /// `rustypods commit <pod> [label]`: atomic CoW snapshot of the live
@@ -1029,7 +1424,7 @@ impl PodControl for Svc {
             }
         }
         tracing::info!("rollback {pod} → snapshot {}", snap.id);
-        Ok(Response::new(to_pod(&meta, &rootfs, None)))
+        Ok(Response::new(to_pod(&meta, &rootfs, None, &self.health_view(&pod).await)))
     }
 
     async fn list_snapshots(
@@ -1283,6 +1678,8 @@ impl PodControl for Svc {
                         // the daemon boot path.
                         autostart: false,
                         ingress_gateway: false,
+                        restart: String::new(),
+                        healthcheck: Default::default(),
                     };
                     let mut st = self.st.lock().await;
                     if st.pods.contains_key(&pname) {
@@ -1322,9 +1719,13 @@ impl PodControl for Svc {
         net::ensure_ip_forward().map_err(int)?;
         // Members' ports/net_index may have changed — rebuild the DNAT table.
         self.sync_nat().await?;
+        let hmap: HashMap<String, String> = {
+            let h = self.health.lock().await;
+            h.iter().map(|(k, v)| (k.clone(), v.status.to_string())).collect()
+        };
         let pods = out
             .iter()
-            .map(|m| to_pod(m, &self.pod_rootfs(&m.name), None))
+            .map(|m| to_pod(m, &self.pod_rootfs(&m.name), None, hmap.get(&m.name).map(String::as_str).unwrap_or("")))
             .collect();
         Ok(Response::new(ApplyStackResponse {
             name: def.name,
@@ -1424,6 +1825,9 @@ impl PodControl for Svc {
             }
         }
         let _op = self.pod_op(&name).await;
+        // Any start — manual, autostart or supervised — clears the
+        // intentional-stop marker for the death-watch.
+        self.stop_intent.lock().await.remove(&name);
         if self.engine.running_pid(&name).await.is_some() {
             return Err(Status::failed_precondition(format!(
                 "pod {name} is already running"
@@ -1721,7 +2125,7 @@ impl PodControl for Svc {
             self.save_pod(&m).map_err(int)?;
         }
         let m = st.pods.get(&name).cloned().unwrap_or(meta);
-        Ok(Response::new(to_pod(&m, &rootfs, leader)))
+        Ok(Response::new(to_pod(&m, &rootfs, leader, &self.health_view(&name).await)))
     }
 
     async fn stop_pod(&self, req: Request<PodRef>) -> Result<Response<Pod>, Status> {
@@ -1735,6 +2139,9 @@ impl PodControl for Svc {
             }
         }
         let _op = self.pod_op(&name).await;
+        // Record intent before stopping: a racing supervisor tick must
+        // not see "dead + no intent" mid-stop and restart the pod.
+        self.stop_intent.lock().await.insert(name.clone());
         let meta = {
             let st = self.st.lock().await;
             st.pods.get(&name).cloned()
@@ -1789,7 +2196,7 @@ impl PodControl for Svc {
         let Some(m) = st.pods.get(&name) else {
             return Err(Status::not_found(format!("pod {name} not found")));
         };
-        let p = to_pod(m, &self.pod_rootfs(&name), None);
+        let p = to_pod(m, &self.pod_rootfs(&name), None, &self.health_view(&name).await);
         drop(st);
         if let Err(e) = self.sync_nat().await {
             tracing::warn!("nft rebuild after {name} stop failed: {e}");
@@ -1812,12 +2219,17 @@ impl PodControl for Svc {
             let st = self.st.lock().await;
             st.pods.values().cloned().collect()
         };
+        let hmap: HashMap<String, String> = {
+            let h = self.health.lock().await;
+            h.iter().map(|(k, v)| (k.clone(), v.status.to_string())).collect()
+        };
         let mut out = Vec::new();
         for m in &pods {
             out.push(to_pod(
                 m,
                 &self.pod_rootfs(&m.name),
                 self.engine.running_pid(&m.name).await,
+                hmap.get(&m.name).map(String::as_str).unwrap_or(""),
             ));
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1913,6 +2325,8 @@ impl PodControl for Svc {
         // explicit order keeps it obvious.
         drop(_op);
         self.ops.lock().await.remove(&name);
+        self.stop_intent.lock().await.remove(&name);
+        self.health.lock().await.remove(&name);
         Ok(Response::new(Empty {}))
     }
 
@@ -1931,23 +2345,34 @@ impl PodControl for Svc {
         }
         let _op = self.pod_op(&name).await;
         // The gateway's identity is daemon-managed — its cmd, ports,
-        // binds and ingress rules are provisioned by InitIngress and must
-        // not be rewritable through the ordinary config path. Resource
-        // limits and autostart stay tunable.
+        // binds, ingress rules and supervision are provisioned by
+        // InitIngress and must not be rewritable through the ordinary
+        // config path. Resource limits and autostart stay tunable.
         {
             let st = self.st.lock().await;
             if st.pods.get(&name).is_some_and(|m| m.ingress_gateway)
                 && (req.ports.is_some()
                     || req.binds.is_some()
                     || req.cmd.is_some()
-                    || req.ingress.is_some())
+                    || req.ingress.is_some()
+                    || req.restart.is_some()
+                    || req.healthcheck.is_some())
             {
                 return Err(Status::failed_precondition(
-                    "the ingress gateway is managed — cmd/ports/binds/ingress are not configurable; re-run `rustypods ingress init`",
+                    "the ingress gateway is managed — cmd/ports/binds/ingress/restart are not configurable; re-run `rustypods ingress init`",
                 ));
             }
         }
         let lim = limits_from(req.limits);
+        if let Some(r) = &req.restart {
+            proto::validate_restart(r).map_err(bad)?;
+        }
+        let new_hc = req
+            .healthcheck
+            .as_ref()
+            .map(health_from_proto)
+            .transpose()
+            .map_err(bad)?;
         if let Some(pm) = &req.ports {
             for spec in &pm.ports {
                 proto::validate_port(spec).map_err(bad)?;
@@ -2019,6 +2444,14 @@ impl PodControl for Svc {
             if let Some(a) = req.autostart {
                 m.autostart = a;
             }
+            // Restart policy + probe: applied by the supervisor's next
+            // tick — no pod restart needed.
+            if let Some(r) = req.restart {
+                m.restart = r;
+            }
+            if let Some(h) = new_hc {
+                m.healthcheck = h;
+            }
             let m = m.clone();
             self.save_pod(&m).map_err(int)?;
             m
@@ -2034,7 +2467,7 @@ impl PodControl for Svc {
             }
         }
         let leader = self.engine.running_pid(&name).await;
-        Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
+        Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader, &self.health_view(&name).await)))
     }
 
     /// `rustypods reload`: reread the conf from disk (hand edits) + apply.
@@ -2109,7 +2542,7 @@ impl PodControl for Svc {
         }
         self.apply_storage_cap(&meta).await.map_err(int)?;
         let leader = self.engine.running_pid(&name).await;
-        Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
+        Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader, &self.health_view(&name).await)))
     }
 
     /// `rustypods ingress init`: provision the managed gateway pod —
@@ -2203,6 +2636,8 @@ impl PodControl for Svc {
             snap_max_age_secs: 0,
             ingress_gateway: true,
             autostart: true,
+            restart: "always".into(),
+            healthcheck: Default::default(),
         };
         // Copy the dataplane binary + LEAF pair into the rootfs via
         // symlink-safe helpers. The CA key NEVER leaves the host.
@@ -2320,7 +2755,7 @@ impl PodControl for Svc {
         };
         let leader = self.engine.running_pid(&meta.name).await;
         Ok(Response::new(IngressDeployment {
-            pod: Some(to_pod(&meta, &rootfs, leader)),
+            pod: Some(to_pod(&meta, &rootfs, leader, &self.health_view(&meta.name).await)),
             ca_cert_path: paths.ca_crt.display().to_string(),
             ca_installed,
         }))
@@ -3087,6 +3522,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         ingress_mu: Arc::new(Mutex::new(())),
         ingress_last_err: Arc::new(Mutex::new(None)),
         ingress_last_push: Arc::new(Mutex::new(None)),
+        health: Default::default(),
+        stop_intent: Default::default(),
     };
 
     // Daemon restarted while pods kept running → rebind their agent channels.
@@ -3199,6 +3636,20 @@ pub async fn serve(cfg: Config) -> Result<()> {
         });
     }
 
+    // Supervisor: per-second death-watch + liveness probes for pods with
+    // a restart policy or a healthcheck (and the managed gateway).
+    {
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                svc.supervise_once().await;
+            }
+        });
+    }
+
     // REST/JSON facade (axum) for automation — bearer-token gated (token
     // in <socket-dir>/http-token, mode 0400). The default bind is
     // localhost-only; empty --http-addr disables it. If the token file
@@ -3282,7 +3733,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        snapshot_expired, validate_ingress_conflicts, validate_ingress_conflicts_excluding,
+        probe_addr, restart_policy, snapshot_expired, supervised,
+        validate_ingress_conflicts, validate_ingress_conflicts_excluding,
     };
     use crate::state::{IngressSpec, LimitsSpec, PodMeta, State};
     use rustypods_proto::rpc::IngressRule;
@@ -3314,7 +3766,64 @@ mod tests {
             snap_max_age_secs: 0,
             autostart: false,
             ingress_gateway: false,
+            restart: String::new(),
+            healthcheck: Default::default(),
         }
+    }
+
+    fn meta_plain(name: &str) -> PodMeta {
+        meta_with_ingress(name, &[])
+    }
+
+    #[test]
+    fn restart_policy_rules() {
+        let mut m = meta_plain("p");
+        assert_eq!(restart_policy(&m), "no");
+        m.restart = "no".into();
+        assert_eq!(restart_policy(&m), "no");
+        m.restart = "on-failure".into();
+        assert_eq!(restart_policy(&m), "on-failure");
+        m.restart = "always".into();
+        assert_eq!(restart_policy(&m), "always");
+        // Garbage in a hand-edited conf degrades to "no"...
+        m.restart = "bogus".into();
+        assert_eq!(restart_policy(&m), "no");
+        // ...but the managed gateway is always "always".
+        m.restart = "bogus".into();
+        m.ingress_gateway = true;
+        assert_eq!(restart_policy(&m), "always");
+    }
+
+    #[test]
+    fn supervised_selection() {
+        let mut m = meta_plain("p");
+        assert!(!supervised(&m));
+        m.restart = "on-failure".into();
+        assert!(supervised(&m));
+        m.restart = String::new();
+        m.healthcheck.kind = "tcp".into();
+        assert!(supervised(&m));
+        m.healthcheck.kind = String::new();
+        m.ingress_gateway = true;
+        assert!(supervised(&m));
+    }
+
+    #[test]
+    fn probe_addr_resolution() {
+        let mut m = meta_plain("p");
+        // No private net → ":port" has nothing to dial.
+        assert!(probe_addr(&m, ":8080").is_none());
+        // Explicit numeric host:port works regardless.
+        assert_eq!(
+            probe_addr(&m, "127.0.0.1:9090").unwrap().to_string(),
+            "127.0.0.1:9090"
+        );
+        m.net_index = 7;
+        assert_eq!(
+            probe_addr(&m, ":8080").unwrap().to_string(),
+            "10.220.7.2:8080"
+        );
+        assert!(probe_addr(&m, ":notaport").is_none());
     }
 
     fn rule(host: &str) -> IngressRule {

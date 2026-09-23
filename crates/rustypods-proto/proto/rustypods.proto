@@ -189,6 +189,12 @@ message Pod {
   // This pod IS the ingress gateway (the rustypods-ingress proxy
   // itself). Managed pod — created only via InitIngress.
   bool ingress_gateway = 19;
+  // Supervisor view: "" (no probe/not started) | "starting" |
+  // "healthy" | "unhealthy" | "dead". Death-watch always runs for
+  // pods with a restart policy, even without a configured probe.
+  string health = 20;
+  // Persisted restart policy: "no" | "on-failure" | "always".
+  string restart = 21;
 }
 
 message PodList {
@@ -200,6 +206,21 @@ message PodRef {
 }
 
 message ListPodsRequest {}
+
+// Liveness probe + restart policy. A pod with no probe still gets
+// death-watch restarts under a non-"no" restart policy — the supervisor
+// treats leader-death as the ultimate failure.
+message HealthCheck {
+  string kind = 1;          // "exec" | "tcp" | "http"; "" = disabled
+  // tcp: ":port" (resolved on the pod's own address) or "host:port".
+  // http: "/path" (on the pod's address :80) or a full "http://…" URL.
+  // exec: unused — argv carries the probe command.
+  string target = 2;
+  repeated string argv = 3; // exec probe command
+  uint32 interval_secs = 4; // 0 = daemon default (10s)
+  uint32 timeout_secs = 5;  // 0 = default (3s)
+  uint32 retries = 6;       // consecutive failures → unhealthy; 0 = 3
+}
 
 message CreatePodRequest {
   string name = 1;
@@ -220,6 +241,9 @@ message CreatePodRequest {
   repeated string cmd = 9;
   // Ingress rules (see Pod.ingress); imply private networking.
   repeated IngressRule ingress = 10;
+  // Restart policy: "no" (default), "on-failure", "always".
+  string restart = 11;
+  HealthCheck healthcheck = 12;
 }
 
 message ClonePodRequest {
@@ -316,6 +340,10 @@ message UpdatePodConfigRequest {
   // Absent = keep current ingress rules; present (even empty) = replace.
   // Ingress changes require a stopped pod.
   optional IngressList ingress = 10;
+  // Absent = keep; present = replace the restart policy.
+  optional string restart = 11;
+  // Absent = keep; present = replace the healthcheck (empty kind = off).
+  optional HealthCheck healthcheck = 12;
 }
 
 message StartPodRequest {

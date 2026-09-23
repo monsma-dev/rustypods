@@ -178,6 +178,28 @@ fn default_true() -> bool {
     true
 }
 
+/// Liveness probe config, persisted in the pod conf. `kind` "" =
+/// disabled — a pod with only a restart policy still gets death-watch
+/// restarts on leader death.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HealthSpec {
+    /// "" | "exec" | "tcp" | "http".
+    #[serde(default)]
+    pub kind: String,
+    /// tcp: ":port" | "host:port"; http: "/path" | "http://…"; exec: unused.
+    #[serde(default)]
+    pub target: String,
+    /// exec probe argv.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub interval_secs: u32,
+    #[serde(default)]
+    pub timeout_secs: u32,
+    #[serde(default)]
+    pub retries: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
     pub name: String,
@@ -234,6 +256,14 @@ pub struct PodMeta {
     /// the state scan (failures are logged, never fatal).
     #[serde(default)]
     pub autostart: bool,
+    /// Restart policy: "" | "no" | "on-failure" | "always" — "" == "no".
+    /// The supervisor restarts on leader death ("on-failure"/"always")
+    /// or sustained probe failure ("always" only).
+    #[serde(default)]
+    pub restart: String,
+    /// Liveness probe spec; kind "" = disabled.
+    #[serde(default)]
+    pub healthcheck: HealthSpec,
 }
 
 #[derive(Debug, Default)]
@@ -563,6 +593,8 @@ fn migrate_json(data_dir: &Path) {
             snap_max_age_secs: 0,
             autostart: false,
             ingress_gateway: false,
+            restart: String::new(),
+            healthcheck: Default::default(),
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");
@@ -606,7 +638,47 @@ mod tests {
             snap_max_age_secs: 0,
             autostart: false,
             ingress_gateway: false,
+            restart: String::new(),
+            healthcheck: Default::default(),
         }
+    }
+
+    /// restart + healthcheck survive a save→load roundtrip, and confs
+    /// written before the fields existed still load with defaults.
+    #[test]
+    fn health_and_restart_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("rp-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = meta("hc", "hc.rustypods.localhost");
+        m.restart = "always".into();
+        m.healthcheck = HealthSpec {
+            kind: "http".into(),
+            target: "/healthz".into(),
+            argv: vec![],
+            interval_secs: 15,
+            timeout_secs: 2,
+            retries: 5,
+        };
+        save_pod(&dir, &m).unwrap();
+        let back = load_pod(&dir, "hc").unwrap();
+        assert_eq!(back.restart, "always");
+        assert_eq!(back.healthcheck.kind, "http");
+        assert_eq!(back.healthcheck.target, "/healthz");
+        assert_eq!(back.healthcheck.interval_secs, 15);
+        assert_eq!(back.healthcheck.retries, 5);
+        // A pre-Wave-D conf (no restart/healthcheck keys) loads as "".
+        let legacy = dir.join("conf").join("pods").join("legacy.conf");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy,
+            "name = 'legacy'\nimage = 'img'\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let old = load_pod(&dir, "legacy").unwrap();
+        assert_eq!(old.restart, "");
+        assert_eq!(old.healthcheck.kind, "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A cross-conf ingress collision is the one state error that must

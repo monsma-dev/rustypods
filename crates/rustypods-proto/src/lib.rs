@@ -359,6 +359,61 @@ pub fn validate_argv(argv: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Restart policy names — "" normalizes to "no".
+pub const RESTART_POLICIES: [&str; 3] = ["no", "on-failure", "always"];
+
+/// Validate a restart policy name ("" and "no" are equivalent).
+pub fn validate_restart(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() || RESTART_POLICIES.contains(&s) {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid restart policy '{s}' — expected no|on-failure|always");
+    }
+}
+
+/// Validate a healthcheck spec: kind must be a known probe, and each
+/// kind's target shape is checked so a malformed spec can't be
+/// persisted into a conf the supervisor will silently misprobe.
+pub fn validate_healthcheck(h: &rpc::HealthCheck) -> anyhow::Result<()> {
+    match h.kind.as_str() {
+        "" | "none" => {}
+        "exec" => validate_argv(&h.argv)?,
+        "tcp" => {
+            let t = h.target.trim();
+            // ":8080" (pod IP) or "host:port".
+            let port = t
+                .rsplit_once(':')
+                .map(|(_, p)| p)
+                .unwrap_or(t)
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("invalid tcp probe target '{t}' — want :port or host:port"))?;
+            if port == 0 {
+                anyhow::bail!("invalid tcp probe target '{t}' — port 0");
+            }
+        }
+        "http" => {
+            let t = h.target.trim();
+            if t.starts_with('/') {
+                // "/path" on the pod's own veth address :80.
+            } else if let Some(rest) = t.strip_prefix("http://") {
+                // The daemon dials numeric hosts only — never DNS.
+                let auth = rest.split('/').next().unwrap_or("");
+                let host = auth.rsplit_once(':').map(|(h, _)| h).unwrap_or(auth);
+                if host.parse::<std::net::IpAddr>().is_err() {
+                    anyhow::bail!("invalid http probe target '{t}' — host must be a numeric IP");
+                }
+            } else {
+                anyhow::bail!("invalid http probe target '{t}' — want /path or http://ip:port/path");
+            }
+        }
+        other => anyhow::bail!("invalid healthcheck kind '{other}' — exec|tcp|http"),
+    }
+    if h.interval_secs > 3600 || h.timeout_secs > 3600 || h.retries > 100 {
+        anyhow::bail!("healthcheck timing fields out of range");
+    }
+    Ok(())
+}
+
 /// Parse "10G", "512M", "1024" (bytes) into a byte count.
 pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
@@ -463,6 +518,49 @@ mod tests {
         // Malformed lines are skipped, not fatal.
         assert_eq!(username_for_uid("badline\nnick:x:1000:g:::", 1000).as_deref(), Some("nick"));
         assert_eq!(username_for_uid("", 1000), None);
+    }
+
+    #[test]
+    fn restart_policy_validation() {
+        assert!(validate_restart("").is_ok());
+        assert!(validate_restart("no").is_ok());
+        assert!(validate_restart("on-failure").is_ok());
+        assert!(validate_restart("always").is_ok());
+        assert!(validate_restart("unless-stopped").is_err());
+        assert!(validate_restart("sometimes").is_err());
+    }
+
+    #[test]
+    fn healthcheck_validation() {
+        let hc = |kind: &str, target: &str, argv: &[&str]| rpc::HealthCheck {
+            kind: kind.into(),
+            target: target.into(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        // Disabled / none always pass.
+        assert!(validate_healthcheck(&hc("", "", &[])).is_ok());
+        assert!(validate_healthcheck(&hc("none", "", &[])).is_ok());
+        // exec needs argv; tcp/http need their target shape.
+        assert!(validate_healthcheck(&hc("exec", "", &["sh", "-c", "true"])).is_ok());
+        assert!(validate_healthcheck(&hc("exec", "", &[])).is_err());
+        assert!(validate_healthcheck(&hc("tcp", ":8080", &[])).is_ok());
+        assert!(validate_healthcheck(&hc("tcp", "10.0.0.1:53", &[])).is_ok());
+        assert!(validate_healthcheck(&hc("tcp", ":0", &[])).is_err());
+        assert!(validate_healthcheck(&hc("tcp", "noport", &[])).is_err());
+        assert!(validate_healthcheck(&hc("http", "/healthz", &[])).is_ok());
+        assert!(validate_healthcheck(&hc("http", "http://10.0.0.1:8080/h", &[])).is_ok());
+        assert!(validate_healthcheck(&hc("http", "example.com", &[])).is_err());
+        assert!(validate_healthcheck(&hc("grpc", "", &[])).is_err());
+        // Timing bounds.
+        let mut h = hc("tcp", ":1", &[]);
+        h.interval_secs = 3601;
+        assert!(validate_healthcheck(&h).is_err());
+        h.interval_secs = 60;
+        h.retries = 101;
+        assert!(validate_healthcheck(&h).is_err());
+        h.retries = 3;
+        assert!(validate_healthcheck(&h).is_ok());
     }
 
     #[test]

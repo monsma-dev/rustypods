@@ -143,6 +143,8 @@ mod tests {
             snap_max_age_secs: 0,
             ingress_gateway: false,
             autostart: false,
+            restart: String::new(),
+            healthcheck: Default::default(),
         }
     }
 
