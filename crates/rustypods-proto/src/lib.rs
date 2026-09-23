@@ -42,6 +42,8 @@ pub fn conf_dir(data_dir: &std::path::Path) -> PathBuf {
 /// In-pod paths (container side of the binds).
 pub const POD_RUN_DIR: &str = "/run/rustypods/run";
 pub const POD_AGENT_SOCK: &str = "/run/rustypods/run/agent.sock";
+/// rustypods-ingress control socket (host side; root-only 0600).
+pub const POD_INGRESS_SOCK: &str = "/run/rustypods/run/ingress.sock";
 pub const POD_SHM_DIR: &str = "/run/rustypods/shm";
 
 /// Pod/image names double as nspawn machine names and directory names.

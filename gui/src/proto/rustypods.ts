@@ -431,6 +431,37 @@ export interface LogLine {
   data: Uint8Array;
 }
 
+export interface ActiveIngressRoute {
+  /** Canonical host, e.g. web.rustypods.localhost. */
+  host: string;
+  /** Pod endpoint on the daemon-owned 10.220.0.0/16 (veth/stack IP). */
+  backendIp: string;
+  backendPort: number;
+}
+
+export interface RouteSnapshot {
+  /**
+   * Daemon-side generation for observability; need not be monotonic
+   * (a daemon restart may reset it).
+   */
+  generation: number;
+  /** The ENTIRE desired route set — replaces, never merges. */
+  routes: ActiveIngressRoute[];
+}
+
+export interface RouteSnapshotAck {
+  generation: number;
+  routeCount: number;
+}
+
+export interface IngressStatusRequest {
+}
+
+export interface IngressStatus {
+  generation: number;
+  routeCount: number;
+}
+
 function createBaseAgentInfo(): AgentInfo {
   return { version: "" };
 }
@@ -4853,6 +4884,432 @@ export const LogLine: MessageFns<LogLine> = {
   },
 };
 
+function createBaseActiveIngressRoute(): ActiveIngressRoute {
+  return { host: "", backendIp: "", backendPort: 0 };
+}
+
+export const ActiveIngressRoute: MessageFns<ActiveIngressRoute> = {
+  encode(message: ActiveIngressRoute, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.host !== "") {
+      writer.uint32(10).string(message.host);
+    }
+    if (message.backendIp !== "") {
+      writer.uint32(18).string(message.backendIp);
+    }
+    if (message.backendPort !== 0) {
+      writer.uint32(24).uint32(message.backendPort);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ActiveIngressRoute {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseActiveIngressRoute();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.host = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.backendIp = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.backendPort = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): ActiveIngressRoute {
+    return {
+      host: isSet(object.host) ? globalThis.String(object.host) : "",
+      backendIp: isSet(object.backendIp)
+        ? globalThis.String(object.backendIp)
+        : isSet(object.backend_ip)
+        ? globalThis.String(object.backend_ip)
+        : "",
+      backendPort: isSet(object.backendPort)
+        ? globalThis.Number(object.backendPort)
+        : isSet(object.backend_port)
+        ? globalThis.Number(object.backend_port)
+        : 0,
+    };
+  },
+
+  toJSON(message: ActiveIngressRoute): unknown {
+    const obj: any = {};
+    if (message.host !== "") {
+      obj.host = message.host;
+    }
+    if (message.backendIp !== "") {
+      obj.backendIp = message.backendIp;
+    }
+    if (message.backendPort !== 0) {
+      obj.backendPort = Math.round(message.backendPort);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ActiveIngressRoute>, I>>(base?: I): ActiveIngressRoute {
+    return ActiveIngressRoute.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ActiveIngressRoute>, I>>(object: I): ActiveIngressRoute {
+    const message = createBaseActiveIngressRoute();
+    message.host = object.host ?? "";
+    message.backendIp = object.backendIp ?? "";
+    message.backendPort = object.backendPort ?? 0;
+    return message;
+  },
+};
+
+function createBaseRouteSnapshot(): RouteSnapshot {
+  return { generation: 0, routes: [] };
+}
+
+export const RouteSnapshot: MessageFns<RouteSnapshot> = {
+  encode(message: RouteSnapshot, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.generation !== 0) {
+      writer.uint32(8).uint64(message.generation);
+    }
+    for (const v of message.routes) {
+      ActiveIngressRoute.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RouteSnapshot {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRouteSnapshot();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.generation = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.routes.push(ActiveIngressRoute.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RouteSnapshot {
+    return {
+      generation: isSet(object.generation) ? globalThis.Number(object.generation) : 0,
+      routes: globalThis.Array.isArray(object?.routes)
+        ? object.routes.map((e: any) => ActiveIngressRoute.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: RouteSnapshot): unknown {
+    const obj: any = {};
+    if (message.generation !== 0) {
+      obj.generation = Math.round(message.generation);
+    }
+    if (message.routes?.length) {
+      obj.routes = message.routes.map((e) => ActiveIngressRoute.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RouteSnapshot>, I>>(base?: I): RouteSnapshot {
+    return RouteSnapshot.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RouteSnapshot>, I>>(object: I): RouteSnapshot {
+    const message = createBaseRouteSnapshot();
+    message.generation = object.generation ?? 0;
+    message.routes = object.routes?.map((e) => ActiveIngressRoute.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseRouteSnapshotAck(): RouteSnapshotAck {
+  return { generation: 0, routeCount: 0 };
+}
+
+export const RouteSnapshotAck: MessageFns<RouteSnapshotAck> = {
+  encode(message: RouteSnapshotAck, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.generation !== 0) {
+      writer.uint32(8).uint64(message.generation);
+    }
+    if (message.routeCount !== 0) {
+      writer.uint32(16).uint32(message.routeCount);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RouteSnapshotAck {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRouteSnapshotAck();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.generation = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.routeCount = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RouteSnapshotAck {
+    return {
+      generation: isSet(object.generation) ? globalThis.Number(object.generation) : 0,
+      routeCount: isSet(object.routeCount)
+        ? globalThis.Number(object.routeCount)
+        : isSet(object.route_count)
+        ? globalThis.Number(object.route_count)
+        : 0,
+    };
+  },
+
+  toJSON(message: RouteSnapshotAck): unknown {
+    const obj: any = {};
+    if (message.generation !== 0) {
+      obj.generation = Math.round(message.generation);
+    }
+    if (message.routeCount !== 0) {
+      obj.routeCount = Math.round(message.routeCount);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RouteSnapshotAck>, I>>(base?: I): RouteSnapshotAck {
+    return RouteSnapshotAck.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RouteSnapshotAck>, I>>(object: I): RouteSnapshotAck {
+    const message = createBaseRouteSnapshotAck();
+    message.generation = object.generation ?? 0;
+    message.routeCount = object.routeCount ?? 0;
+    return message;
+  },
+};
+
+function createBaseIngressStatusRequest(): IngressStatusRequest {
+  return {};
+}
+
+export const IngressStatusRequest: MessageFns<IngressStatusRequest> = {
+  encode(_: IngressStatusRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressStatusRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressStatusRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(_: any): IngressStatusRequest {
+    return {};
+  },
+
+  toJSON(_: IngressStatusRequest): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressStatusRequest>, I>>(base?: I): IngressStatusRequest {
+    return IngressStatusRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressStatusRequest>, I>>(_: I): IngressStatusRequest {
+    const message = createBaseIngressStatusRequest();
+    return message;
+  },
+};
+
+function createBaseIngressStatus(): IngressStatus {
+  return { generation: 0, routeCount: 0 };
+}
+
+export const IngressStatus: MessageFns<IngressStatus> = {
+  encode(message: IngressStatus, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.generation !== 0) {
+      writer.uint32(8).uint64(message.generation);
+    }
+    if (message.routeCount !== 0) {
+      writer.uint32(16).uint32(message.routeCount);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressStatus {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressStatus();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.generation = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.routeCount = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): IngressStatus {
+    return {
+      generation: isSet(object.generation) ? globalThis.Number(object.generation) : 0,
+      routeCount: isSet(object.routeCount)
+        ? globalThis.Number(object.routeCount)
+        : isSet(object.route_count)
+        ? globalThis.Number(object.route_count)
+        : 0,
+    };
+  },
+
+  toJSON(message: IngressStatus): unknown {
+    const obj: any = {};
+    if (message.generation !== 0) {
+      obj.generation = Math.round(message.generation);
+    }
+    if (message.routeCount !== 0) {
+      obj.routeCount = Math.round(message.routeCount);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressStatus>, I>>(base?: I): IngressStatus {
+    return IngressStatus.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressStatus>, I>>(object: I): IngressStatus {
+    const message = createBaseIngressStatus();
+    message.generation = object.generation ?? 0;
+    message.routeCount = object.routeCount ?? 0;
+    return message;
+  },
+};
+
 /**
  * Control plane: pod lifecycle over a Unix domain socket.
  * Phase-2 RPCs (Exec, PodMetrics, StreamLogs) are declared now for API
@@ -5103,6 +5560,36 @@ export const AgentDefinition = {
       requestType: Metric as typeof Metric,
       requestStream: true,
       responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+  },
+} as const;
+
+/**
+ * Daemon → rustypods-ingress, on the root-only socket
+ * /run/rustypods/run/ingress.sock. The daemon pushes the complete desired
+ * route table; the proxy swaps it in atomically (one generation = one
+ * coherent set — a partially applied snapshot never serves traffic).
+ */
+export type IngressControlDefinition = typeof IngressControlDefinition;
+export const IngressControlDefinition = {
+  name: "IngressControl",
+  fullName: "rustypods.v1.IngressControl",
+  methods: {
+    replaceRoutes: {
+      name: "ReplaceRoutes",
+      requestType: RouteSnapshot as typeof RouteSnapshot,
+      requestStream: false,
+      responseType: RouteSnapshotAck as typeof RouteSnapshotAck,
+      responseStream: false,
+      options: {},
+    },
+    getStatus: {
+      name: "GetStatus",
+      requestType: IngressStatusRequest as typeof IngressStatusRequest,
+      requestStream: false,
+      responseType: IngressStatus as typeof IngressStatus,
       responseStream: false,
       options: {},
     },

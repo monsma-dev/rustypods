@@ -373,3 +373,40 @@ message LogLine {
   uint64 ts_unix_ms = 1;
   bytes data = 2;
 }
+
+// Daemon → rustypods-ingress, on the root-only socket
+// /run/rustypods/run/ingress.sock. The daemon pushes the complete desired
+// route table; the proxy swaps it in atomically (one generation = one
+// coherent set — a partially applied snapshot never serves traffic).
+service IngressControl {
+  rpc ReplaceRoutes(RouteSnapshot) returns (RouteSnapshotAck);
+  rpc GetStatus(IngressStatusRequest) returns (IngressStatus);
+}
+
+message ActiveIngressRoute {
+  // Canonical host, e.g. web.rustypods.localhost.
+  string host = 1;
+  // Pod endpoint on the daemon-owned 10.220.0.0/16 (veth/stack IP).
+  string backend_ip = 2;
+  uint32 backend_port = 3;
+}
+
+message RouteSnapshot {
+  // Daemon-side generation for observability; need not be monotonic
+  // (a daemon restart may reset it).
+  uint64 generation = 1;
+  // The ENTIRE desired route set — replaces, never merges.
+  repeated ActiveIngressRoute routes = 2;
+}
+
+message RouteSnapshotAck {
+  uint64 generation = 1;
+  uint32 route_count = 2;
+}
+
+message IngressStatusRequest {}
+
+message IngressStatus {
+  uint64 generation = 1;
+  uint32 route_count = 2;
+}

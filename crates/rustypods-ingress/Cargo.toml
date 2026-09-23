@@ -1,0 +1,37 @@
+[package]
+name = "rustypods-ingress"
+version.workspace = true
+edition.workspace = true
+description = "RustyPods ingress — hostname L7 reverse proxy (route control over UDS)"
+
+[lib]
+name = "rustypods_ingress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustypods-ingress"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arc-swap.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+clap.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+rustypods-proto.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "=0.27.0"

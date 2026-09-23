@@ -5,6 +5,7 @@ members = [
     "crates/rustypods-client",
     "crates/rustypodsd",
     "crates/rustypods-agent",
+    "crates/rustypods-ingress",
     "crates/rustypods-proto",
 ]
 # gui/src-tauri is deliberately NOT a member — the tauri dep tree is heavy
@@ -37,7 +38,14 @@ tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 tower = "0.5"
 http = "1"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1"] }
+http-body-util = "0.1"
+arc-swap = "=1.9.2"
+axum-server = { version = "=0.8.0", features = ["tls-rustls-no-provider"] }
+# Direct rustls dep so we pick the crypto provider — ring, not aws-lc.
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+socket2 = "=0.5.10"
 libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 axum = "=0.8.9"
