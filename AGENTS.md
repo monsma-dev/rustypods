@@ -217,6 +217,40 @@ rustypodsd does it itself:
   expansion, `A=$HOME` stays literal; `--env` flags override file
   entries per key.
 
+## Pod export/import (Wave H)
+
+`rustypods export <pod> [-o file]` → one opaque archive stream:
+`[8B magic "RPEX0001"][u32 len][manifest JSON][payload]`. Payload =
+multi-subvolume `btrfs send` (needs `-r` ro snapshots — `clone_rootfs`
+makes rw ones, use `storage::btrfs::snapshot_ro`) on btrfs hosts, `tar`
+elsewhere; both name entries `<pod>`/`<vol>` so `btrfs receive`/`tar
+-x` recreate the same layout in staging. `rustypods load <file|->
+[--name x]` imports.
+
+- Running pods are cgroup-frozen (`cgroup.freeze` on the machined
+  scope) for the snapshot window only — point-in-time across rootfs +
+  volumes, ms-scale pause. Freeze is inside the SAME blocking closure
+  as the snapshots so unfreeze can't be skipped.
+- `btrfs receive` lands subvols ro WITH `received_uuid` — `property
+  set ro false` is REFUSED on those (the uuid serves incremental
+  sends). The canonical move is an rw `subvolume snapshot` into place
+  (= clone_rootfs) and deleting the ro staging copy.
+- Import sanitizes: started=false, net_index=0 (a /30 can't move
+  hosts), stack="", ingress_gateway=false. Image CONF travels (pods
+  resolve entrypoint/env from ImageMeta at start) — the image tree
+  never does; the pod rootfs is complete.
+- Export refuses the managed gateway pod (per-host infrastructure).
+- Name/volume collisions refuse before payload lands; existing volume
+  names fail hard (never overwrite data). Volume dirs get 0777 like
+  ensure_volume.
+- REST: `GET /v1/pods/{name}/export` (octet-stream download) and
+  `POST /v1/import?name=` (body upload) — same archive, no temp copy.
+- Import is client-streaming→unary: the default 30s call timeout
+  would cut large uploads — the CLI uses connect_timeout(1h).
+- Known gap: multi-subvolume consistency is freeze-window only, not a
+  memory checkpoint — apps see a crash-consistent state (like a clean
+  power cut). True live migration needs CRIU, out of scope.
+
 ## REST API surface (Wave G)
 
 `/v1/pods/{name}` GET · `/v1/pods/{name}/stats` GET (live cgroup-v2:

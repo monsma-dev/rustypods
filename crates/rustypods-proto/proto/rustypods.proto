@@ -53,6 +53,14 @@ service PodControl {
   rpc CreateVolume(VolumeRef) returns (VolumeInfo);
   rpc RemoveVolume(VolumeRef) returns (Empty);
 
+  // Pod export/import (Wave H): serialize a pod — rootfs, conf, image
+  // conf and every attached named volume — into one portable stream,
+  // and reconstruct it on any host. Export streams the archive out;
+  // Import consumes the archive as a client stream (first chunk may
+  // carry ImportOptions for a rename).
+  rpc ExportPod(PodRef) returns (stream ExportChunk);
+  rpc ImportPod(stream ImportChunk) returns (Pod);
+
   // Provision/start the managed ingress gateway pod (local PKI + the
   // rustypods-ingress proxy), and report its health/route table.
   rpc InitIngress(InitIngressRequest) returns (IngressDeployment);
@@ -238,6 +246,26 @@ message VolumeInfo {
 
 message VolumeInfoList {
   repeated VolumeInfo volumes = 1;
+}
+
+// One frame of a pod export archive (header+manifest in the first
+// chunk, then raw btrfs-send/tar payload bytes). The archive format is
+// opaque to the wire — the daemon owns it.
+message ExportChunk {
+  bytes data = 1;
+}
+
+// Client → daemon import stream: an optional leading options frame,
+// then raw archive bytes (same format ExportPod produces).
+message ImportChunk {
+  oneof kind {
+    ImportOptions options = 1;
+    bytes data = 2;
+  }
+}
+
+message ImportOptions {
+  string rename = 1; // import under a different pod name ("" = keep)
 }
 
 message ListPodsRequest {}

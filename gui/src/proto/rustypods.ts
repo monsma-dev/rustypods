@@ -260,6 +260,29 @@ export interface VolumeInfoList {
   volumes: VolumeInfo[];
 }
 
+/**
+ * One frame of a pod export archive (header+manifest in the first
+ * chunk, then raw btrfs-send/tar payload bytes). The archive format is
+ * opaque to the wire — the daemon owns it.
+ */
+export interface ExportChunk {
+  data: Uint8Array;
+}
+
+/**
+ * Client → daemon import stream: an optional leading options frame,
+ * then raw archive bytes (same format ExportPod produces).
+ */
+export interface ImportChunk {
+  options?: ImportOptions | undefined;
+  data?: Uint8Array | undefined;
+}
+
+export interface ImportOptions {
+  /** import under a different pod name ("" = keep) */
+  rename: string;
+}
+
 export interface ListPodsRequest {
 }
 
@@ -2998,6 +3021,227 @@ export const VolumeInfoList: MessageFns<VolumeInfoList> = {
   fromPartial<I extends Exact<DeepPartial<VolumeInfoList>, I>>(object: I): VolumeInfoList {
     const message = createBaseVolumeInfoList();
     message.volumes = object.volumes?.map((e) => VolumeInfo.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseExportChunk(): ExportChunk {
+  return { data: new Uint8Array(0) };
+}
+
+export const ExportChunk: MessageFns<ExportChunk> = {
+  encode(message: ExportChunk, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.data.length !== 0) {
+      writer.uint32(10).bytes(message.data);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ExportChunk {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseExportChunk();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.data = reader.bytes();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): ExportChunk {
+    return { data: isSet(object.data) ? bytesFromBase64(object.data) : new Uint8Array(0) };
+  },
+
+  toJSON(message: ExportChunk): unknown {
+    const obj: any = {};
+    if (message.data.length !== 0) {
+      obj.data = base64FromBytes(message.data);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ExportChunk>, I>>(base?: I): ExportChunk {
+    return ExportChunk.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ExportChunk>, I>>(object: I): ExportChunk {
+    const message = createBaseExportChunk();
+    message.data = object.data ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseImportChunk(): ImportChunk {
+  return { options: undefined, data: undefined };
+}
+
+export const ImportChunk: MessageFns<ImportChunk> = {
+  encode(message: ImportChunk, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.options !== undefined) {
+      ImportOptions.encode(message.options, writer.uint32(10).fork()).join();
+    }
+    if (message.data !== undefined) {
+      writer.uint32(18).bytes(message.data);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ImportChunk {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseImportChunk();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.options = ImportOptions.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.data = reader.bytes();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): ImportChunk {
+    return {
+      options: isSet(object.options) ? ImportOptions.fromJSON(object.options) : undefined,
+      data: isSet(object.data) ? bytesFromBase64(object.data) : undefined,
+    };
+  },
+
+  toJSON(message: ImportChunk): unknown {
+    const obj: any = {};
+    if (message.options !== undefined) {
+      obj.options = ImportOptions.toJSON(message.options);
+    }
+    if (message.data !== undefined) {
+      obj.data = base64FromBytes(message.data);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ImportChunk>, I>>(base?: I): ImportChunk {
+    return ImportChunk.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ImportChunk>, I>>(object: I): ImportChunk {
+    const message = createBaseImportChunk();
+    message.options = (object.options !== undefined && object.options !== null)
+      ? ImportOptions.fromPartial(object.options)
+      : undefined;
+    message.data = object.data ?? undefined;
+    return message;
+  },
+};
+
+function createBaseImportOptions(): ImportOptions {
+  return { rename: "" };
+}
+
+export const ImportOptions: MessageFns<ImportOptions> = {
+  encode(message: ImportOptions, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.rename !== "") {
+      writer.uint32(10).string(message.rename);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ImportOptions {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseImportOptions();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.rename = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): ImportOptions {
+    return { rename: isSet(object.rename) ? globalThis.String(object.rename) : "" };
+  },
+
+  toJSON(message: ImportOptions): unknown {
+    const obj: any = {};
+    if (message.rename !== "") {
+      obj.rename = message.rename;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ImportOptions>, I>>(base?: I): ImportOptions {
+    return ImportOptions.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ImportOptions>, I>>(object: I): ImportOptions {
+    const message = createBaseImportOptions();
+    message.rename = object.rename ?? "";
     return message;
   },
 };
@@ -7032,6 +7276,29 @@ export const PodControlDefinition = {
       requestType: VolumeRef as typeof VolumeRef,
       requestStream: false,
       responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Pod export/import (Wave H): serialize a pod — rootfs, conf, image
+     * conf and every attached named volume — into one portable stream,
+     * and reconstruct it on any host. Export streams the archive out;
+     * Import consumes the archive as a client stream (first chunk may
+     * carry ImportOptions for a rename).
+     */
+    exportPod: {
+      name: "ExportPod",
+      requestType: PodRef as typeof PodRef,
+      requestStream: false,
+      responseType: ExportChunk as typeof ExportChunk,
+      responseStream: true,
+      options: {},
+    },
+    importPod: {
+      name: "ImportPod",
+      requestType: ImportChunk as typeof ImportChunk,
+      requestStream: true,
+      responseType: Pod as typeof Pod,
       responseStream: false,
       options: {},
     },

@@ -60,6 +60,25 @@ fn set_quota_limit(path: &Path, bytes: u64) -> Result<()> {
     )
 }
 
+/// Read-only snapshot — the source form `btrfs send` requires. Used by
+/// pod export: a frozen ro snap is the bit-perfect, point-in-time view
+/// that ships to another host.
+pub fn snapshot_ro(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        bail!("{} already exists", dst.display());
+    }
+    run(
+        "btrfs",
+        &[
+            OsStr::new("subvolume"),
+            OsStr::new("snapshot"),
+            OsStr::new("-r"),
+            src.as_os_str(),
+            dst.as_os_str(),
+        ],
+    )
+}
+
 /// Btrfs storage: `btrfs subvolume` for everything.
 pub struct BtrfsDriver {
     /// Filesystem root quota accounting is enabled on (the data dir).

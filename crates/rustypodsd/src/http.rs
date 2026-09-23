@@ -13,15 +13,16 @@
 use std::sync::Arc;
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, Query, Request as AxumRequest, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     middleware::Next,
     response::Response,
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
 use tonic::{Request, Status};
 
 use rustypods_proto::rpc::pod_control_server::PodControl;
@@ -422,6 +423,54 @@ async fn pod_exec(
     }))
 }
 
+/// `GET /v1/pods/:name/export` — stream the pod archive
+/// (rootfs + conf + image conf + attached volumes) as an octet-stream
+/// download. Pipe straight into `rustypods import` on another host.
+async fn export_pod_http(
+    State(s): State<Svc>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiErr> {
+    let stream = s.export_archive(&name).await.map_err(api_err)?;
+    let bytes = stream.map(|c| c.map(|c| Bytes::from(c.data)));
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{name}.rpod\""),
+        )
+        .body(Body::from_stream(bytes))
+        .map_err(|e| api_err(Status::internal(format!("{e}"))))
+}
+
+/// `POST /v1/import?name=<rename>` — upload an archive produced by
+/// export (same wire format as the gRPC client stream) and register
+/// the reconstructed pod. `?name=` imports under a different name.
+#[derive(Deserialize)]
+struct ImportQuery {
+    name: Option<String>,
+}
+
+async fn import_pod_http(
+    State(s): State<Svc>,
+    Query(q): Query<ImportQuery>,
+    req: AxumRequest,
+) -> Result<Json<Pod>, ApiErr> {
+    use rustypods_proto::rpc::import_chunk::Kind;
+    let rename = q.name.filter(|n| !n.is_empty());
+    let options = rename.map(|r| ImportChunk {
+        kind: Some(Kind::Options(ImportOptions { rename: r })),
+    });
+    let data = req.into_body().into_data_stream().map(|b| {
+        b.map(|b| ImportChunk {
+            kind: Some(Kind::Data(b.to_vec())),
+        })
+        .map_err(|e| Status::internal(format!("body read: {e}")))
+    });
+    let stream = tokio_stream::iter(options.map(Ok::<_, Status>)).chain(data);
+    let pod = s.import_archive(stream).await.map_err(api_err)?;
+    Ok(Json(pod))
+}
+
 /// Raw stack.toml as the body (application/toml or plain text).
 async fn apply_stack(
     State(s): State<Svc>,
@@ -514,6 +563,8 @@ pub fn router(svc: Svc, token: Arc<str>) -> Router {
         .route("/v1/pods/{name}/stats", get(pod_stats))
         .route("/v1/pods/{name}/logs", get(pod_logs))
         .route("/v1/pods/{name}/exec", post(pod_exec))
+        .route("/v1/pods/{name}/export", get(export_pod_http))
+        .route("/v1/import", post(import_pod_http))
         .route(
             "/v1/pods/{name}",
             get(get_pod).patch(update_pod).delete(destroy_pod),

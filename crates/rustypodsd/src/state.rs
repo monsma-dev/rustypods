@@ -367,7 +367,7 @@ pub fn remove_image(data_dir: &Path, name: &str) {
 /// /run/user/<uid>) may legitimately not exist yet, and dropping the pod
 /// from state would hide its rootfs entirely. start_pod re-validates
 /// binds anyway, so boot-time skips are fail-safe.
-fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Result<()> {
+pub(crate) fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Result<()> {
     rustypods_proto::validate_name(&m.name)?;
     if m.name != stem {
         anyhow::bail!("conf name '{}' does not match filename '{}.conf'", m.name, stem);

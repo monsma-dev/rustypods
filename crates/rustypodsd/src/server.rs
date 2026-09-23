@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -24,7 +25,7 @@ use crate::oci;
 use crate::runtime::{RuntimeEngine, StartSpec};
 use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State, VolumeMeta};
 use crate::storage::StorageDriver;
-use crate::{exec, ingress, net, pki, runtime, stack, storage, Config};
+use crate::{exec, ingress, net, pki, runtime, stack, storage, transfer, Config};
 
 #[derive(Clone)]
 pub struct Svc {
@@ -192,6 +193,20 @@ fn push_capped(buf: &mut Vec<u8>, b: Vec<u8>, max: usize, truncated: &mut bool) 
         buf.extend_from_slice(&b[..room]);
         *truncated = true;
     }
+}
+
+/// Remove an export/import staging dir: each entry may be a btrfs
+/// subvolume, so they go through the storage driver, then the dir.
+async fn clean_staging(dir: &Path, storage: &Arc<dyn StorageDriver>) {
+    let storage = storage.clone();
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let _ = storage.delete_rootfs(&e.path());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
 }
 
 fn ingress_to_proto(specs: &[IngressSpec]) -> Vec<IngressRule> {
@@ -758,6 +773,398 @@ impl Svc {
         }
         Ok(out)
     }
+
+    /// `rustypods export <pod>`: serialize the pod — rootfs, conf, image
+    /// conf and every attached named volume — as one archive stream
+    /// (transfer.rs container format). On btrfs the payload is a
+    /// multi-subvolume `btrfs send` of read-only snapshots; elsewhere a
+    /// tar stream. A running pod is cgroup-frozen for the (millisecond)
+    /// snapshot window so rootfs + volumes capture one point in time.
+    pub(crate) async fn export_archive(
+        &self,
+        name: &str,
+    ) -> Result<ReceiverStream<Result<ExportChunk, Status>>, Status> {
+        let pod = proto::validate_name(name)
+            .map_err(bad)?
+            .to_string();
+        let meta = {
+            let st = self.st.lock().await;
+            st.pods.get(&pod).cloned()
+        }
+        .ok_or_else(|| Status::not_found(format!("pod {pod} not found")))?;
+        if meta.ingress_gateway {
+            return Err(Status::failed_precondition(
+                "the managed ingress gateway is per-host infrastructure — run init-ingress on the target host",
+            ));
+        }
+        let _op = self.pod_op(&pod).await;
+
+        // Attached named volumes travel with the pod.
+        let mut vol_names = Vec::new();
+        for spec in &meta.volumes {
+            let v = proto::parse_volume_spec(spec).map_err(bad)?;
+            if v.name == pod {
+                return Err(Status::failed_precondition(format!(
+                    "volume '{pod}' shares the pod name — archive entries would collide; rename it first"
+                )));
+            }
+            vol_names.push(v.name);
+        }
+        let (image_conf, volume_confs) = {
+            let st = self.st.lock().await;
+            (
+                st.images
+                    .get(&meta.image)
+                    .and_then(|m| toml::to_string(m).ok()),
+                vol_names
+                    .iter()
+                    .filter_map(|n| {
+                        st.volumes
+                            .get(n)
+                            .and_then(|m| toml::to_string(m).ok().map(|t| (n.clone(), t)))
+                    })
+                    .collect(),
+            )
+        };
+        let use_btrfs = self.storage.name() == "btrfs";
+        let manifest = transfer::Manifest {
+            format: if use_btrfs { "btrfs".into() } else { "tar".into() },
+            pod_conf: toml::to_string(&meta).map_err(int)?,
+            image_conf,
+            volume_confs,
+            exported_unix: state::now_unix(),
+        };
+        let head = transfer::header(&manifest).map_err(int)?;
+
+        // btrfs: freeze the pod for the snapshot window (one
+        // point-in-time view across rootfs + volumes), stage ro
+        // snapshots named after their final homes, unfreeze — all in
+        // one blocking call so the unfreeze can't be skipped. Freeze
+        // failure is non-fatal: each snapshot stays per-subvol atomic.
+        // tar streams the live dirs directly (best-effort copy anyway).
+        let staging_dir = self
+            .cfg
+            .data_dir
+            .join(format!(".export-{pod}-{}", state::now_unix()));
+        let mut child = if use_btrfs {
+            let scope = self.engine.scope_name(&pod).await;
+            let freeze_path = scope.map(|u| {
+                std::path::PathBuf::from("/sys/fs/cgroup/machine.slice")
+                    .join(u)
+                    .join("cgroup.freeze")
+            });
+            let rootfs = self.pod_rootfs(&pod);
+            let vols_dir = proto::volumes_dir(&self.cfg.data_dir);
+            let stage = staging_dir.clone();
+            let vols = vol_names.clone();
+            let pname = pod.clone();
+            Self::blocking(move || {
+                let frozen = freeze_path
+                    .as_ref()
+                    .map(|p| std::fs::write(p, "1").is_ok())
+                    .unwrap_or(false);
+                let r = (|| -> Result<()> {
+                    std::fs::create_dir_all(&stage)?;
+                    storage::btrfs::snapshot_ro(&rootfs, &stage.join(&pname))?;
+                    for v in &vols {
+                        storage::btrfs::snapshot_ro(&vols_dir.join(v), &stage.join(v))?;
+                    }
+                    Ok(())
+                })();
+                if frozen {
+                    let _ = std::fs::write(freeze_path.as_ref().unwrap(), "0");
+                }
+                r
+            })
+            .await
+            .map_err(int)?;
+            let mut args: Vec<std::ffi::OsString> = vec![staging_dir.join(&pod).into_os_string()];
+            args.extend(vol_names.iter().map(|v| staging_dir.join(v).into_os_string()));
+            tokio::process::Command::new("btrfs")
+                .arg("send")
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(int)?
+        } else {
+            let mut cmd = tokio::process::Command::new("tar");
+            cmd.arg("-cf").arg("-")
+                .arg("-C").arg(self.cfg.pods_dir()).arg(&pod);
+            for v in &vol_names {
+                cmd.arg("-C").arg(proto::volumes_dir(&self.cfg.data_dir)).arg(v);
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(int)?
+        };
+
+        // Pump stdout → client; on disconnect or EOF, kill the child
+        // and always clean the staging snapshots (they hold subvolumes,
+        // so each entry goes through the storage driver).
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            let send = tx.send(Ok(ExportChunk { data: head })).await;
+            if send.is_ok() {
+                let mut stdout = child.stdout.take().unwrap();
+                let mut buf = vec![0u8; transfer::CHUNK];
+                loop {
+                    match stdout.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx
+                                .send(Ok(ExportChunk {
+                                    data: buf[..n].to_vec(),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                let _ = child.kill().await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let _ = child.kill().await;
+            }
+            let _ = child.wait().await;
+            clean_staging(&staging_dir, &storage).await;
+        });
+        Ok(ReceiverStream::new(rx))
+    }
+
+    /// `rustypods import [file|-]`: reconstruct an exported pod on this
+    /// host. The archive's manifest is peeled off first (name/volume
+    /// collisions refuse before a single payload byte lands on disk),
+    /// then the remainder is piped straight into `btrfs receive`/`tar
+    /// -x` — no temp copy of the payload. Generic over the chunk stream
+    /// so REST can feed a request body the same way gRPC does.
+    pub(crate) async fn import_archive<S>(&self, mut stream: S) -> Result<Pod, Status>
+    where
+        S: tokio_stream::Stream<Item = Result<ImportChunk, Status>> + Unpin + Send + 'static,
+    {
+        use rustypods_proto::rpc::import_chunk::Kind;
+        let mut head: Vec<u8> = Vec::new();
+        let mut rename: Option<String> = None;
+        let (manifest, payload) = loop {
+            let c = match stream.next().await {
+                None => {
+                    return Err(Status::invalid_argument(
+                        "empty import stream — expected archive bytes",
+                    ))
+                }
+                Some(Err(e)) => return Err(e),
+                Some(Ok(c)) => c,
+            };
+            match c.kind {
+                Some(Kind::Options(o)) => {
+                    if !head.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "options must precede archive data",
+                        ));
+                    }
+                    if !o.rename.is_empty() {
+                        rename = Some(o.rename);
+                    }
+                }
+                Some(Kind::Data(d)) => {
+                    head.extend_from_slice(&d);
+                    if head.len() > 12 + transfer::MAX_MANIFEST {
+                        return Err(Status::invalid_argument("manifest exceeds cap"));
+                    }
+                    if let Some((m, off)) = transfer::parse_header(&head).map_err(bad)? {
+                        break (m, head.split_off(off));
+                    }
+                }
+                None => {}
+            }
+        };
+
+        // Validate + sanitize before any payload lands on disk.
+        let mut meta: PodMeta = toml::from_str(&manifest.pod_conf).map_err(bad)?;
+        let orig_name = meta.name.clone();
+        meta = transfer::sanitize_import(meta, rename.as_deref()).map_err(bad)?;
+        state::check_pod_meta(&meta, &meta.name, true)
+            .map_err(|e| bad(anyhow::anyhow!("imported pod conf invalid: {e:#}")))?;
+        {
+            let st = self.st.lock().await;
+            if st.pods.contains_key(&meta.name) {
+                return Err(Status::already_exists(format!(
+                    "pod {} already exists",
+                    meta.name
+                )));
+            }
+            for v in manifest.volume_confs.keys() {
+                if st.volumes.contains_key(v)
+                    || proto::volumes_dir(&self.cfg.data_dir).join(v).exists()
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "volume {v} already exists on this host — refusing to overwrite data"
+                    )));
+                }
+            }
+        }
+        if self.pod_rootfs(&meta.name).exists() {
+            return Err(Status::already_exists(format!(
+                "rootfs for {} already exists",
+                meta.name
+            )));
+        }
+
+        // Pipe the payload into the unpacker.
+        let staging = self
+            .cfg
+            .data_dir
+            .join(format!(".import-{}", state::now_unix()));
+        std::fs::create_dir_all(&staging).map_err(int)?;
+        let mut child = match manifest.format.as_str() {
+            "btrfs" => tokio::process::Command::new("btrfs")
+                .arg("receive")
+                .arg(&staging)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(int)?,
+            _ => tokio::process::Command::new("tar")
+                .arg("-xf")
+                .arg("-")
+                .arg("-C")
+                .arg(&staging)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(int)?,
+        };
+        let mut stdin = child.stdin.take().unwrap();
+        // Feed on a task so a failing child (bad stream) or a dead
+        // client can't wedge the other side: dropping stdin is the EOF.
+        let feed = tokio::spawn(async move {
+            let r = async {
+                stdin.write_all(&payload).await?;
+                while let Some(c) = stream.next().await {
+                    let c = c?;
+                    if let Some(Kind::Data(d)) = c.kind {
+                        stdin.write_all(&d).await?;
+                    }
+                }
+                Ok::<_, Status>(())
+            }
+            .await;
+            let _ = stdin.shutdown().await;
+            r
+        });
+        let out = child.wait_with_output().await.map_err(int)?;
+        let feed_res = feed.await.map_err(int)?;
+        if !out.status.success() || feed_res.is_err() {
+            clean_staging(&staging, &self.storage).await;
+            if let Err(e) = feed_res {
+                return Err(e);
+            }
+            return Err(Status::internal(format!(
+                "unpack failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+
+        // Place the received trees, then persist confs. btrfs receive
+        // lands subvols ro WITH received_uuid — ro→rw is refused outright
+        // (the uuid serves incremental sends), so the canonical move is
+        // an rw snapshot into place; the ro staging copy is cleaned after.
+        // tar paths just rename. A mid-way failure deletes whatever was
+        // already placed — the names were verified free above.
+        {
+            let vols_dir = proto::volumes_dir(&self.cfg.data_dir);
+            let stage = staging.clone();
+            let rootfs_dst = self.pod_rootfs(&meta.name);
+            let orig = orig_name.clone();
+            let vols: Vec<String> = manifest.volume_confs.keys().cloned().collect();
+            let btrfs = manifest.format == "btrfs";
+            let storage = self.storage.clone();
+            if let Err(e) = Self::blocking(move || {
+                let mut placed = Vec::new();
+                let r = (|| -> Result<()> {
+                    let rootfs_src = stage.join(&orig);
+                    if !rootfs_src.exists() {
+                        bail!("archive payload did not contain pod rootfs '{orig}'");
+                    }
+                    if btrfs {
+                        storage.clone_rootfs(&rootfs_src, &rootfs_dst)?;
+                    } else {
+                        std::fs::rename(&rootfs_src, &rootfs_dst)?;
+                    }
+                    placed.push(rootfs_dst);
+                    for v in &vols {
+                        let src = stage.join(v);
+                        if !src.exists() {
+                            bail!("archive payload missing volume '{v}'");
+                        }
+                        let dst = vols_dir.join(v);
+                        if btrfs {
+                            storage.clone_rootfs(&src, &dst)?;
+                        } else {
+                            std::fs::rename(&src, &dst)?;
+                        }
+                        // Same 0777 as ensure_volume: userns pods map
+                        // pod-root to a dynamic host uid.
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o777))?;
+                        placed.push(dst);
+                    }
+                    Ok(())
+                })();
+                if r.is_err() {
+                    for p in &placed {
+                        let _ = storage.delete_rootfs(p);
+                    }
+                }
+                r
+            })
+            .await
+            {
+                clean_staging(&staging, &self.storage).await;
+                return Err(int(e));
+            }
+        }
+        clean_staging(&staging, &self.storage).await;
+
+        // Confs: volumes, image (only when the target lacks it), pod.
+        for (vname, vtoml) in &manifest.volume_confs {
+            if let Ok(v) = toml::from_str::<VolumeMeta>(vtoml) {
+                state::save_volume(&self.cfg.data_dir, &v).map_err(int)?;
+                self.st.lock().await.volumes.insert(vname.clone(), v);
+            }
+        }
+        let have_image = {
+            let st = self.st.lock().await;
+            st.images.contains_key(&meta.image)
+        };
+        if !have_image {
+            if let Some(itoml) = &manifest.image_conf {
+                if let Ok(im) = toml::from_str::<ImageMeta>(itoml) {
+                    state::save_image(&self.cfg.data_dir, &im).map_err(int)?;
+                    self.st.lock().await.images.insert(im.name.clone(), im);
+                }
+            }
+        }
+        state::save_pod(&self.cfg.data_dir, &meta).map_err(int)?;
+        self.st.lock().await.pods.insert(meta.name.clone(), meta.clone());
+        tracing::info!(
+            "imported pod {} (from '{}' archive, {} volumes)",
+            meta.name,
+            orig_name,
+            manifest.volume_confs.len()
+        );
+        let rootfs = self.pod_rootfs(&meta.name);
+        Ok(to_pod(&meta, &rootfs, None, &self.health_view(&meta.name).await))
+    }
+
 
     /// Latest agent-pushed metric for a pod (REST /metrics). None when the
     /// agent never connected — a real sample always has ts_unix_ms > 0.
@@ -3528,6 +3935,24 @@ impl PodControl for Svc {
         self.st.lock().await.volumes.remove(&name);
         Ok(Response::new(Empty {}))
     }
+
+    type ExportPodStream = ReceiverStream<Result<ExportChunk, Status>>;
+
+    async fn export_pod(
+        &self,
+        req: Request<PodRef>,
+    ) -> Result<Response<Self::ExportPodStream>, Status> {
+        Ok(Response::new(self.export_archive(&req.into_inner().name).await?))
+    }
+
+    async fn import_pod(
+        &self,
+        req: Request<tonic::Streaming<ImportChunk>>,
+    ) -> Result<Response<Pod>, Status> {
+        let p = self.import_archive(req.into_inner()).await?;
+        Ok(Response::new(p))
+    }
+
 }
 
 /// Per-line cap for stream_logs: BufReader::lines() buffers a whole line
@@ -3995,6 +4420,27 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 agent::chown_sock_for_userns(&run_dir, leader);
             }
         }
+    }
+
+    // Transfer staging dirs are always disposable: a crash mid-export/
+    // import would otherwise leak ro subvolumes forever. Sweep them once
+    // at boot — nothing legitimate ever creates .export-*/.import-*.
+    {
+        let storage = svc.storage.clone();
+        let dd = svc.cfg.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            for e in std::fs::read_dir(&dd).into_iter().flatten().flatten() {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                if n.starts_with(".export-") || n.starts_with(".import-") {
+                    tracing::info!("sweeping stale transfer staging {}", e.path().display());
+                    for inner in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                        let _ = storage.delete_rootfs(&inner.path());
+                    }
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        });
     }
 
     // Autostart: pods flagged `autostart = true` in their conf get booted

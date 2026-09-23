@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use rustypods_client::connect;
+use rustypods_client::{connect, connect_timeout};
 use rustypods_proto::rpc::*;
 use rustypods_proto::{fmt_bytes, parse_bytes, parse_duration, SOCKET_PATH};
+use tokio_stream::StreamExt;
 
 #[derive(Parser)]
 #[command(name = "rustypods", version, about = "nspawn pods on Btrfs — podman/distrobox-light")]
@@ -178,6 +179,23 @@ enum Cmd {
     Snapshots { pod: String },
     /// Delete one snapshot.
     Rmsnap { pod: String, id: String },
+    /// Export a pod — rootfs + conf + image conf + attached volumes —
+    /// as one archive stream. Pipe to another host:
+    /// `rustypods export db | ssh host2 rustypods load -`
+    Export {
+        pod: String,
+        /// Write to a file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Load an exported pod archive onto this host.
+    Load {
+        /// Archive path, or "-" for stdin.
+        file: String,
+        /// Register the pod under a different name.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Apply a stack.toml: create/update grouped pods sharing one netns
     /// (K8s-pod model — members reach each other on 127.0.0.1).
     Apply { file: PathBuf },
@@ -1393,6 +1411,94 @@ async fn main() -> Result<()> {
             if l.snapshots.is_empty() {
                 println!("no snapshots — `rustypods commit <pod> [label]`");
             }
+        }
+        Cmd::Export { pod, output } => {
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let mut stream = c
+                .export_pod(PodRef { name: pod.clone() })
+                .await?
+                .into_inner();
+            // Raw archive bytes go to stdout/file — progress stays on
+            // stderr so `export db | ssh host rustypods load -` works.
+            use tokio::io::AsyncWriteExt;
+            let mut out: Box<dyn tokio::io::AsyncWrite + Unpin> = match &output {
+                Some(p) => Box::new(
+                    tokio::fs::File::create(p)
+                        .await
+                        .with_context(|| format!("create {}", p.display()))?,
+                ),
+                None => Box::new(tokio::io::stdout()),
+            };
+            let mut total = 0u64;
+            while let Some(chunk) = stream.next().await {
+                let data = chunk?.data;
+                total += data.len() as u64;
+                out.write_all(&data).await?;
+                eprint!("\rexporting {pod}: {}\x1b[K", fmt_bytes(total));
+            }
+            out.flush().await?;
+            eprintln!("\rexported {pod}: {}", fmt_bytes(total));
+        }
+        Cmd::Load { file, name } => {
+            // The unary reply only lands after the full upload — the
+            // default 30s call timeout would cut big archives mid-send.
+            let mut c = connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                std::time::Duration::from_secs(3600),
+            )
+            .await?;
+            use rustypods_proto::rpc::import_chunk::Kind;
+            // Open before the RPC so a missing file errors locally.
+            let mut input: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if file == "-" {
+                Box::new(tokio::io::stdin())
+            } else {
+                Box::new(
+                    tokio::fs::File::open(&file)
+                        .await
+                        .with_context(|| format!("open {file}"))?,
+                )
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel::<ImportChunk>(8);
+            tokio::spawn(async move {
+                if let Some(r) = &name {
+                    let _ = tx
+                        .send(ImportChunk {
+                            kind: Some(Kind::Options(ImportOptions { rename: r.clone() })),
+                        })
+                        .await;
+                }
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 1 << 20];
+                let mut total = 0u64;
+                loop {
+                    match input.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total += n as u64;
+                            eprint!("\ruploading: {}\x1b[K", fmt_bytes(total));
+                            if tx
+                                .send(ImportChunk {
+                                    kind: Some(Kind::Data(buf[..n].to_vec())),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\nread error after {}: {e}", fmt_bytes(total));
+                            break;
+                        }
+                    }
+                }
+            });
+            let pod = c
+                .import_pod(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await?
+                .into_inner();
+            eprintln!("\rimported {} ({})", pod.name, pod.rootfs);
         }
         Cmd::Rmsnap { pod, id } => {
             connect(cli.socket.clone(), cli.remote.clone())

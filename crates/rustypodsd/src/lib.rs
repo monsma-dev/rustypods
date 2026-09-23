@@ -12,6 +12,7 @@ pub mod server;
 pub mod stack;
 pub mod state;
 pub mod storage;
+pub mod transfer;
 
 use std::path::PathBuf;
 
