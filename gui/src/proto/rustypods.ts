@@ -219,6 +219,12 @@ export interface Pod {
    * Visible via /proc/<pid>/environ — treat as config, not a vault.
    */
   env: string[];
+  /**
+   * Multi-host mesh address (fd<host-prefix>:<idx>::2) — routable on
+   * every peer host. "" when the mesh is not initialized or the pod
+   * has no private netns.
+   */
+  meshIp: string;
 }
 
 export interface PodList {
@@ -281,6 +287,45 @@ export interface ImportChunk {
 export interface ImportOptions {
   /** import under a different pod name ("" = keep) */
   rename: string;
+}
+
+/** --- Multi-host mesh (Wave I) --- */
+export interface MeshInitRequest {
+  /** UDP port for WireGuard; 0 = 51820 */
+  listenPort: number;
+}
+
+/**
+ * Peer identity: a reachable UDP endpoint + its WG pubkey. The peer's
+ * ULA /48 is derived from the pubkey — never configured separately.
+ */
+export interface MeshPeer {
+  /** "ip:port" or "[v6]:port" */
+  endpoint: string;
+  /** base64 x25519 (44 chars) */
+  pubkey: string;
+}
+
+export interface MeshPeerInfo {
+  endpoint: string;
+  pubkey: string;
+  /** fd…::/48 routed via the tunnel */
+  prefix: string;
+  /** -1 = no handshake yet */
+  handshakeSecsAgo: number;
+  txBytes: number;
+  rxBytes: number;
+}
+
+export interface MeshStatus {
+  enabled: boolean;
+  /** this host's WG identity */
+  pubkey: string;
+  /** "0.0.0.0:51820" */
+  listen: string;
+  /** this host's fd…::/48 */
+  prefix: string;
+  peers: MeshPeerInfo[];
 }
 
 export interface ListPodsRequest {
@@ -2055,6 +2100,7 @@ function createBasePod(): Pod {
     restart: "",
     volumes: [],
     env: [],
+    meshIp: "",
   };
 }
 
@@ -2128,6 +2174,9 @@ export const Pod: MessageFns<Pod> = {
     }
     for (const v of message.env) {
       writer.uint32(186).string(v!);
+    }
+    if (message.meshIp !== "") {
+      writer.uint32(194).string(message.meshIp);
     }
     return writer;
   },
@@ -2329,6 +2378,14 @@ export const Pod: MessageFns<Pod> = {
             message.env.push(reader.string());
             continue;
           }
+          case 24: {
+            if (tag !== 194) {
+              break;
+            }
+
+            message.meshIp = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2402,6 +2459,11 @@ export const Pod: MessageFns<Pod> = {
       env: globalThis.Array.isArray(object?.env)
         ? object.env.map((e: any) => globalThis.String(e))
         : [],
+      meshIp: isSet(object.meshIp)
+        ? globalThis.String(object.meshIp)
+        : isSet(object.mesh_ip)
+        ? globalThis.String(object.mesh_ip)
+        : "",
     };
   },
 
@@ -2476,6 +2538,9 @@ export const Pod: MessageFns<Pod> = {
     if (message.env?.length) {
       obj.env = message.env;
     }
+    if (message.meshIp !== "") {
+      obj.meshIp = message.meshIp;
+    }
     return obj;
   },
 
@@ -2509,6 +2574,7 @@ export const Pod: MessageFns<Pod> = {
     message.restart = object.restart ?? "";
     message.volumes = object.volumes?.map((e) => VolumeMount.fromPartial(e)) || [];
     message.env = object.env?.map((e) => e) || [];
+    message.meshIp = object.meshIp ?? "";
     return message;
   },
 };
@@ -3242,6 +3308,458 @@ export const ImportOptions: MessageFns<ImportOptions> = {
   fromPartial<I extends Exact<DeepPartial<ImportOptions>, I>>(object: I): ImportOptions {
     const message = createBaseImportOptions();
     message.rename = object.rename ?? "";
+    return message;
+  },
+};
+
+function createBaseMeshInitRequest(): MeshInitRequest {
+  return { listenPort: 0 };
+}
+
+export const MeshInitRequest: MessageFns<MeshInitRequest> = {
+  encode(message: MeshInitRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.listenPort !== 0) {
+      writer.uint32(8).uint32(message.listenPort);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshInitRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshInitRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.listenPort = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshInitRequest {
+    return {
+      listenPort: isSet(object.listenPort)
+        ? globalThis.Number(object.listenPort)
+        : isSet(object.listen_port)
+        ? globalThis.Number(object.listen_port)
+        : 0,
+    };
+  },
+
+  toJSON(message: MeshInitRequest): unknown {
+    const obj: any = {};
+    if (message.listenPort !== 0) {
+      obj.listenPort = Math.round(message.listenPort);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshInitRequest>, I>>(base?: I): MeshInitRequest {
+    return MeshInitRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshInitRequest>, I>>(object: I): MeshInitRequest {
+    const message = createBaseMeshInitRequest();
+    message.listenPort = object.listenPort ?? 0;
+    return message;
+  },
+};
+
+function createBaseMeshPeer(): MeshPeer {
+  return { endpoint: "", pubkey: "" };
+}
+
+export const MeshPeer: MessageFns<MeshPeer> = {
+  encode(message: MeshPeer, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.endpoint !== "") {
+      writer.uint32(10).string(message.endpoint);
+    }
+    if (message.pubkey !== "") {
+      writer.uint32(18).string(message.pubkey);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshPeer {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshPeer();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.endpoint = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.pubkey = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshPeer {
+    return {
+      endpoint: isSet(object.endpoint) ? globalThis.String(object.endpoint) : "",
+      pubkey: isSet(object.pubkey) ? globalThis.String(object.pubkey) : "",
+    };
+  },
+
+  toJSON(message: MeshPeer): unknown {
+    const obj: any = {};
+    if (message.endpoint !== "") {
+      obj.endpoint = message.endpoint;
+    }
+    if (message.pubkey !== "") {
+      obj.pubkey = message.pubkey;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshPeer>, I>>(base?: I): MeshPeer {
+    return MeshPeer.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshPeer>, I>>(object: I): MeshPeer {
+    const message = createBaseMeshPeer();
+    message.endpoint = object.endpoint ?? "";
+    message.pubkey = object.pubkey ?? "";
+    return message;
+  },
+};
+
+function createBaseMeshPeerInfo(): MeshPeerInfo {
+  return { endpoint: "", pubkey: "", prefix: "", handshakeSecsAgo: 0, txBytes: 0, rxBytes: 0 };
+}
+
+export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
+  encode(message: MeshPeerInfo, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.endpoint !== "") {
+      writer.uint32(10).string(message.endpoint);
+    }
+    if (message.pubkey !== "") {
+      writer.uint32(18).string(message.pubkey);
+    }
+    if (message.prefix !== "") {
+      writer.uint32(26).string(message.prefix);
+    }
+    if (message.handshakeSecsAgo !== 0) {
+      writer.uint32(32).int64(message.handshakeSecsAgo);
+    }
+    if (message.txBytes !== 0) {
+      writer.uint32(40).uint64(message.txBytes);
+    }
+    if (message.rxBytes !== 0) {
+      writer.uint32(48).uint64(message.rxBytes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshPeerInfo {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshPeerInfo();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.endpoint = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.pubkey = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.prefix = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.handshakeSecsAgo = longToNumber(reader.int64());
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.txBytes = longToNumber(reader.uint64());
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.rxBytes = longToNumber(reader.uint64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshPeerInfo {
+    return {
+      endpoint: isSet(object.endpoint) ? globalThis.String(object.endpoint) : "",
+      pubkey: isSet(object.pubkey) ? globalThis.String(object.pubkey) : "",
+      prefix: isSet(object.prefix) ? globalThis.String(object.prefix) : "",
+      handshakeSecsAgo: isSet(object.handshakeSecsAgo)
+        ? globalThis.Number(object.handshakeSecsAgo)
+        : isSet(object.handshake_secs_ago)
+        ? globalThis.Number(object.handshake_secs_ago)
+        : 0,
+      txBytes: isSet(object.txBytes)
+        ? globalThis.Number(object.txBytes)
+        : isSet(object.tx_bytes)
+        ? globalThis.Number(object.tx_bytes)
+        : 0,
+      rxBytes: isSet(object.rxBytes)
+        ? globalThis.Number(object.rxBytes)
+        : isSet(object.rx_bytes)
+        ? globalThis.Number(object.rx_bytes)
+        : 0,
+    };
+  },
+
+  toJSON(message: MeshPeerInfo): unknown {
+    const obj: any = {};
+    if (message.endpoint !== "") {
+      obj.endpoint = message.endpoint;
+    }
+    if (message.pubkey !== "") {
+      obj.pubkey = message.pubkey;
+    }
+    if (message.prefix !== "") {
+      obj.prefix = message.prefix;
+    }
+    if (message.handshakeSecsAgo !== 0) {
+      obj.handshakeSecsAgo = Math.round(message.handshakeSecsAgo);
+    }
+    if (message.txBytes !== 0) {
+      obj.txBytes = Math.round(message.txBytes);
+    }
+    if (message.rxBytes !== 0) {
+      obj.rxBytes = Math.round(message.rxBytes);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshPeerInfo>, I>>(base?: I): MeshPeerInfo {
+    return MeshPeerInfo.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshPeerInfo>, I>>(object: I): MeshPeerInfo {
+    const message = createBaseMeshPeerInfo();
+    message.endpoint = object.endpoint ?? "";
+    message.pubkey = object.pubkey ?? "";
+    message.prefix = object.prefix ?? "";
+    message.handshakeSecsAgo = object.handshakeSecsAgo ?? 0;
+    message.txBytes = object.txBytes ?? 0;
+    message.rxBytes = object.rxBytes ?? 0;
+    return message;
+  },
+};
+
+function createBaseMeshStatus(): MeshStatus {
+  return { enabled: false, pubkey: "", listen: "", prefix: "", peers: [] };
+}
+
+export const MeshStatus: MessageFns<MeshStatus> = {
+  encode(message: MeshStatus, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.enabled !== false) {
+      writer.uint32(8).bool(message.enabled);
+    }
+    if (message.pubkey !== "") {
+      writer.uint32(18).string(message.pubkey);
+    }
+    if (message.listen !== "") {
+      writer.uint32(26).string(message.listen);
+    }
+    if (message.prefix !== "") {
+      writer.uint32(34).string(message.prefix);
+    }
+    for (const v of message.peers) {
+      MeshPeerInfo.encode(v!, writer.uint32(42).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshStatus {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshStatus();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.enabled = reader.bool();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.pubkey = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.listen = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.prefix = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.peers.push(MeshPeerInfo.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshStatus {
+    return {
+      enabled: isSet(object.enabled) ? globalThis.Boolean(object.enabled) : false,
+      pubkey: isSet(object.pubkey) ? globalThis.String(object.pubkey) : "",
+      listen: isSet(object.listen) ? globalThis.String(object.listen) : "",
+      prefix: isSet(object.prefix) ? globalThis.String(object.prefix) : "",
+      peers: globalThis.Array.isArray(object?.peers) ? object.peers.map((e: any) => MeshPeerInfo.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: MeshStatus): unknown {
+    const obj: any = {};
+    if (message.enabled !== false) {
+      obj.enabled = message.enabled;
+    }
+    if (message.pubkey !== "") {
+      obj.pubkey = message.pubkey;
+    }
+    if (message.listen !== "") {
+      obj.listen = message.listen;
+    }
+    if (message.prefix !== "") {
+      obj.prefix = message.prefix;
+    }
+    if (message.peers?.length) {
+      obj.peers = message.peers.map((e) => MeshPeerInfo.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshStatus>, I>>(base?: I): MeshStatus {
+    return MeshStatus.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshStatus>, I>>(object: I): MeshStatus {
+    const message = createBaseMeshStatus();
+    message.enabled = object.enabled ?? false;
+    message.pubkey = object.pubkey ?? "";
+    message.listen = object.listen ?? "";
+    message.prefix = object.prefix ?? "";
+    message.peers = object.peers?.map((e) => MeshPeerInfo.fromPartial(e)) || [];
     return message;
   },
 };
@@ -7299,6 +7817,49 @@ export const PodControlDefinition = {
       requestType: ImportChunk as typeof ImportChunk,
       requestStream: true,
       responseType: Pod as typeof Pod,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Multi-host mesh (Wave I): userspace WireGuard (BoringTun) between
+     * daemons. Each host derives a stable ULA /48 from its pubkey —
+     * pods get fd<host>:<idx>::2 and reach pods on peer hosts directly,
+     * end-to-end encrypted, no NAT.
+     */
+    meshInit: {
+      name: "MeshInit",
+      requestType: MeshInitRequest as typeof MeshInitRequest,
+      requestStream: false,
+      responseType: MeshStatus as typeof MeshStatus,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Named GetMeshStatus (not MeshStatus): inside a service, method
+     * names share the symbol table with types — protoc resolves a bare
+     * `MeshStatus` here to the METHOD and fails "not a message type".
+     */
+    getMeshStatus: {
+      name: "GetMeshStatus",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: MeshStatus as typeof MeshStatus,
+      responseStream: false,
+      options: {},
+    },
+    meshAddPeer: {
+      name: "MeshAddPeer",
+      requestType: MeshPeer as typeof MeshPeer,
+      requestStream: false,
+      responseType: MeshStatus as typeof MeshStatus,
+      responseStream: false,
+      options: {},
+    },
+    meshRemovePeer: {
+      name: "MeshRemovePeer",
+      requestType: MeshPeer as typeof MeshPeer,
+      requestStream: false,
+      responseType: MeshStatus as typeof MeshStatus,
       responseStream: false,
       options: {},
     },

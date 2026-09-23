@@ -346,6 +346,59 @@ pub fn save_pod(data_dir: &Path, m: &PodMeta) -> Result<()> {
     std::fs::create_dir_all(pods_conf_dir(data_dir))?;
     write_conf(&pod_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
 }
+/// Multi-host mesh config (Wave I): the host's WG identity + static
+/// peers. One TOML file — not per-entity confs — because it's a single
+/// daemon-scoped object, not a registry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeshConf {
+    /// base64 x25519 private key; "" = mesh not initialized.
+    #[serde(default)]
+    pub private_key: String,
+    /// UDP listen port for WireGuard datagrams.
+    #[serde(default = "default_mesh_port")]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub peers: Vec<MeshPeerConf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshPeerConf {
+    /// "ip:port" the peer's daemon listens on.
+    pub endpoint: String,
+    /// base64 x25519 pubkey — also derives the peer's ULA /48.
+    pub pubkey: String,
+}
+
+fn default_mesh_port() -> u16 {
+    51820
+}
+
+fn mesh_conf_path(data_dir: &Path) -> std::path::PathBuf {
+    rustypods_proto::conf_dir(data_dir).join("mesh.conf")
+}
+
+pub fn load_mesh(data_dir: &Path) -> Option<MeshConf> {
+    let p = mesh_conf_path(data_dir);
+    let s = std::fs::read_to_string(p).ok()?;
+    let m: MeshConf = toml::from_str(&s).ok()?;
+    if m.private_key.is_empty() {
+        return None;
+    }
+    Some(m)
+}
+
+pub fn save_mesh(data_dir: &Path, m: &MeshConf) -> Result<()> {
+    std::fs::create_dir_all(rustypods_proto::conf_dir(data_dir))?;
+    // 0600 — the file holds the host's WG private key.
+    write_conf(&mesh_conf_path(data_dir), &toml::to_string_pretty(m)?)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        mesh_conf_path(data_dir),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    Ok(())
+}
+
 pub fn save_image(data_dir: &Path, m: &ImageMeta) -> Result<()> {
     std::fs::create_dir_all(images_conf_dir(data_dir))?;
     write_conf(&image_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
@@ -859,6 +912,38 @@ mod tests {
         squatter.ingress.clear();
         save_pod(&dir, &squatter).unwrap();
         assert!(load(&dir).is_err(), "reserved name without gateway flag");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mesh_conf_roundtrip_and_mode() {
+        let dir = std::env::temp_dir().join(format!("rp-mesh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Absent file → None (mesh never initialized).
+        assert!(load_mesh(&dir).is_none());
+        let conf = MeshConf {
+            private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            listen_port: 51820,
+            peers: vec![MeshPeerConf {
+                endpoint: "192.0.2.1:51820".into(),
+                pubkey: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=".into(),
+            }],
+        };
+        save_mesh(&dir, &conf).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("conf/mesh.conf"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "mesh.conf holds a private key");
+        let back = load_mesh(&dir).unwrap();
+        assert_eq!(back.private_key, conf.private_key);
+        assert_eq!(back.peers.len(), 1);
+        assert_eq!(back.peers[0].endpoint, "192.0.2.1:51820");
+        // Empty key = uninitialized even if the file exists.
+        save_mesh(&dir, &MeshConf::default()).unwrap();
+        assert!(load_mesh(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

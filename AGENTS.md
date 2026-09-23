@@ -251,6 +251,63 @@ elsewhere; both name entries `<pod>`/`<vol>` so `btrfs receive`/`tar
   memory checkpoint — apps see a crash-consistent state (like a clean
   power cut). True live migration needs CRIU, out of scope.
 
+## Multi-host mesh (Wave I)
+
+`rustypods mesh init|status|add-peer|rm-peer` — userspace WireGuard via
+BoringTun (no kernel module), giving every pod a ULA address reachable
+from pods on other hosts. L3, end-to-end encrypted, no NAT.
+
+- Identity = addressing: each daemon derives its /48 as
+  `fd<40 bits of sha256(pubkey)>` (RFC 4193 L-bit set). A peer's prefix
+  is verified BY its pubkey — config can't claim foreign space, and
+  prefix derivation needs zero coordination.
+- Pod mesh addr = `fd<host>:<net_idx>::2` — a second /128 on host0 next
+  to the intra-host fd22:220:<idx>::2. Pods need NO extra route (v6
+  default already via host); longest-prefix src selection picks the
+  mesh addr when dialing mesh space.
+- Datapath: persistent `rp-mesh0` TUN (IFF_NO_PI, created via
+  `ip tuntap` so routes survive daemon restarts) + one UDP socket +
+  one boringtun `Tunn` per peer. `fd<peer>::/48 dev rp-mesh0` steers
+  outbound; `fd<local>:<idx>::2/128 dev ve-<pod>` delivers inbound.
+- `conf/mesh.conf` (0600 — holds the WG private key, base64) persists
+  identity + static peers. Daemon restart re-derives the same /48.
+- The pump is one tokio task: TUN reads → dst /48 → peer Tunn → UDP;
+  UDP datagrams → peer session (endpoint map, key-scan fallback for
+  roaming sources) → decapsulate → TUN — but only when the plaintext
+  dst sits inside OUR /48 (peers can't inject routes for foreign
+  space). 1s timer tick drives rekey/keepalive (25s keepalive keeps
+  NAT mappings warm).
+- Firewall: `ensure_mesh_forward` inserts `fd00::/8` accepts in
+  ip6/inet FORWARD (ULA is non-routable — safe), `firewalld_bind` puts
+  rp-mesh0 in the trusted zone alongside pod veths.
+- mesh_init is idempotent and retroactive: running pods get their /128
+  immediately, no restart needed. A pod whose mesh addr fails while the
+  mesh is up unwinds like a veth failure — never reports "running"
+  unreachable cluster-wide.
+- Gotcha: inside a service, rpc METHOD names share the symbol table
+  with types — `rpc MeshStatus(Empty) returns (MeshStatus)` fails with
+  "not a message type" (resolves to the method). Hence `GetMeshStatus`.
+- Hard-won: never nest a second `AsyncFd::readable()` inside a select
+  arm that already holds the readiness guard — the inner await parked
+  forever (guard `r` alive until arm end) freezing the whole pump:
+  UDP Recv-Q grew, 0% CPU, `mesh status` still answered. Diagnose via
+  pump_ticks/udp_pkts/tun_pkts/pump_where (also mirrored to
+  $data_dir/mesh-pump.status each tick). Fix: `guard.try_io` directly
+  on the select arm's own guard. The pump also runs under a supervisor
+  task — a panic would otherwise die silently on a dropped JoinHandle.
+- Hard-won: dual-stack UDP sockets need v4-mapped-v6 endpoints —
+  `send_to` to a plain `SocketAddrV4` on a `[::]`-bound socket fails
+  silently. `canon_ep` maps both directions (config, roaming srcs) and
+  `mesh status` unmaps for display.
+- Same-host testing needs real isolation: two mesh endpoints on one
+  kernel share the routing table — a connected /128 (fake pod addr on
+  `lo`) or A's pod-veth route shortcircuits the tunnel while ping
+  still "works". `examples/meshpeer` in its own netns over a veth pair
+  gives honest verification; `--fake-pod` uses `noprefixroute` so the
+  addr lives only in the local table.
+- Scope: standalone pods only (stack members share one netns and are
+  skipped); IPv6 ULA only — v4 has no place on the mesh.
+
 ## REST API surface (Wave G)
 
 `/v1/pods/{name}` GET · `/v1/pods/{name}/stats` GET (live cgroup-v2:

@@ -99,7 +99,7 @@ pub fn write_pod_network(rootfs: &Path, idx: u32) -> Result<()> {
 /// Blocking subprocess — the sync callers of this are themselves invoked
 /// via `tokio::task::spawn_blocking` (or run on a dedicated thread), so it
 /// never sits on the async executor.
-fn run(cmd: &str, args: &[&str]) -> Result<()> {
+pub(crate) fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let out = Command::new(cmd)
         .args(args)
         .output()
@@ -140,7 +140,7 @@ async fn run_async(cmd: &'static str, args: &[&str]) -> Result<()> {
 /// `nsenter --target <pid> --net -- <args>` — run the host's `ip` inside
 /// one process's network namespace only. Used to wire host0 on pods whose
 /// payload has no networkd (bare OCI images).
-async fn nsenter_net(leader: u32, args: &[&str]) -> Result<()> {
+pub(crate) async fn nsenter_net(leader: u32, args: &[&str]) -> Result<()> {
     let mut argv: Vec<String> = vec![
         "--target".into(),
         leader.to_string(),
@@ -198,7 +198,7 @@ fn host_iface_by_ifindex(idx: u32) -> Option<String> {
 /// unique in the host's ifindex space. Read via `ip` (netlink → the
 /// pod's CURRENT netns), not /sys: `nsenter --net` does not enter the
 /// mount ns, so /sys/class/net keeps showing the HOST's interfaces.
-async fn wait_host_veth(leader: u32) -> Result<String> {
+pub(crate) async fn wait_host_veth(leader: u32) -> Result<String> {
     for _ in 0..150 {
         let out = nsenter_net_out(leader, &["ip", "-o", "link", "show"]).await;
         // Any interface with an '@if' peer suffix is the veth end — don't
@@ -239,7 +239,7 @@ async fn firewalld_bind(veth: &str) {
 }
 
 /// Blocking variant for the sync stack-net path.
-fn firewalld_bind_sync(veth: &str) {
+pub(crate) fn firewalld_bind_sync(veth: &str) {
     if run("firewall-cmd", &["--state"]).is_err() {
         return;
     }
@@ -431,6 +431,43 @@ pub async fn configure_veth(_pod: &str, idx: u32, leader: u32) -> Result<()> {
     Ok(())
 }
 
+/// Wave I: give a pod its mesh identity — fd<host>:<idx>::2/128 on
+/// host0 plus a host-side route steering decrypted inbound traffic
+/// into this pod's veth. Pods need no extra route: the v6 default
+/// already points at the host. Idempotent (`replace`) so re-entry is
+/// safe (mesh_init on already-running pods, daemon restart).
+pub async fn configure_mesh_addr(
+    idx: u32,
+    leader: u32,
+    prefix: std::net::Ipv6Addr,
+) -> Result<()> {
+    if leader == 0 {
+        bail!("pod has no usable leader pid yet — cannot enter its netns");
+    }
+    let addr = crate::mesh::mesh_ip(prefix, idx);
+    let veth = wait_host_veth(leader).await?;
+    run_async(
+        "ip",
+        &["-6", "route", "replace", &format!("{addr}/128"), "dev", &veth],
+    )
+    .await?;
+    nsenter_net(
+        leader,
+        &[
+            "ip",
+            "-6",
+            "addr",
+            "replace",
+            &format!("{addr}/128"),
+            "dev",
+            "host0",
+            "nodad",
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Kernel knobs required for DNAT into the veth — ip_forward (v4 and v6)
 /// for routed traffic, route_localnet so localhost→pod flows survive
 /// (Docker does the same on container hosts). Idempotent; a kernel
@@ -445,6 +482,43 @@ pub fn ensure_ip_forward() -> Result<()> {
         std::fs::write(fwd6, "1").context("enable net.ipv6.conf.all.forwarding")?;
     }
     Ok(())
+}
+
+/// Mesh forwarding accepts (Wave I): pod↔tun traffic carries ULA
+/// fd00::/8 addresses, which sit OUTSIDE the fd22:220::/32 pod pool the
+/// base accepts cover. ULA is non-routable on the public internet, so
+/// accepting it in FORWARD is safe and required on every host firewall
+/// shape (ufw iptables-compat, plain inet filter, and — via
+/// firewalld_bind on rp-mesh0 — firewalld zones).
+pub(crate) fn ensure_mesh_forward() {
+    const MARK: &str = "rustypods-mesh-fwd";
+    for (fam, rules) in [
+        ("ip6", ["ip6 saddr fd00::/8 accept", "ip6 daddr fd00::/8 accept"].as_slice()),
+        ("inet", ["ip6 saddr fd00::/8 accept", "ip6 daddr fd00::/8 accept"].as_slice()),
+    ] {
+        let out = Command::new("nft")
+            .args(["list", "chain", fam, "filter", "FORWARD"])
+            .output();
+        let Ok(out) = out else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let txt = String::from_utf8_lossy(&out.stdout);
+        if txt.contains(MARK) {
+            continue;
+        }
+        for r in rules {
+            let mut argv: Vec<&str> = vec!["insert", "rule", fam, "filter", "FORWARD"];
+            argv.extend(r.split_whitespace());
+            argv.extend(["comment", MARK]);
+            match Command::new("nft").args(&argv).status() {
+                Ok(s) if s.success() => {}
+                Ok(s) => tracing::warn!("nft insert into {fam} filter FORWARD: exit {s}"),
+                Err(e) => tracing::warn!("nft insert into {fam} filter FORWARD: {e}"),
+            }
+        }
+        tracing::info!("installed mesh ULA accepts in {fam} filter FORWARD");
+    }
 }
 
 fn port_rule_ports(spec: &str) -> Option<(u16, u16, &'static str)> {

@@ -355,6 +355,38 @@ enum Cmd {
         #[command(subcommand)]
         sub: VolumeCmd,
     },
+    /// Multi-host mesh: userspace WireGuard (BoringTun) giving every pod
+    /// a ULA address reachable from pods on peer hosts — L3, no NAT.
+    Mesh {
+        #[command(subcommand)]
+        sub: MeshCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeshCmd {
+    /// Generate (or reuse) this host's WG identity and bring the mesh
+    /// up. Prints the pubkey + ULA /48 to hand to peer hosts.
+    Init {
+        /// UDP port WireGuard listens on (default 51820).
+        #[arg(long, default_value_t = 51820)]
+        port: u32,
+    },
+    /// Show mesh state: pubkey, listen addr, /48, per-peer handshakes.
+    Status,
+    /// Add a peer host: its UDP endpoint + WG pubkey (`mesh status` on
+    /// that host prints both).
+    AddPeer {
+        /// "ip:port" or "[v6]:port" the peer daemon listens on.
+        endpoint: String,
+        /// Peer's base64 WG pubkey (its `mesh init` output).
+        pubkey: String,
+    },
+    /// Remove a peer by its pubkey.
+    RmPeer {
+        /// Peer's base64 WG pubkey (`mesh status` lists them).
+        pubkey: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -991,6 +1023,9 @@ fn print_pod(p: &Pod) {
     if !p.restart.is_empty() && p.restart != "no" {
         extra.push_str(&format!(" restart={}", p.restart));
     }
+    if !p.mesh_ip.is_empty() {
+        extra.push_str(&format!(" mesh={}", p.mesh_ip));
+    }
     if !p.volumes.is_empty() {
         let vs: Vec<String> = p
             .volumes
@@ -1007,6 +1042,30 @@ fn print_pod(p: &Pod) {
         p.leader_pid,
         extra.trim()
     );
+}
+
+fn print_mesh_status(st: &MeshStatus) {
+    println!("pubkey:  {}", st.pubkey);
+    println!("listen:  {}", st.listen);
+    println!("prefix:  {}", st.prefix);
+    if st.peers.is_empty() {
+        println!("peers:   none — `rustypods mesh add-peer <ip:port> <pubkey>`");
+    }
+    for p in &st.peers {
+        let hs = if p.handshake_secs_ago < 0 {
+            "no handshake".to_string()
+        } else {
+            format!("handshake {}s ago", p.handshake_secs_ago)
+        };
+        println!(
+            "peer {} {}  {}  tx={} rx={}",
+            p.endpoint,
+            p.prefix,
+            hs,
+            fmt_bytes(p.tx_bytes),
+            fmt_bytes(p.rx_bytes)
+        );
+    }
 }
 
 /// Build the proto HealthCheck from the CLI's --health-* flags.
@@ -1158,6 +1217,47 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Mesh { sub } => match sub {
+            MeshCmd::Init { port } => {
+                let st = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .mesh_init(MeshInitRequest { listen_port: port })
+                    .await?
+                    .into_inner();
+                print_mesh_status(&st);
+            }
+            MeshCmd::Status => {
+                let st = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .get_mesh_status(Empty {})
+                    .await?
+                    .into_inner();
+                if !st.enabled {
+                    println!("mesh disabled — `rustypods mesh init` to enable");
+                } else {
+                    print_mesh_status(&st);
+                }
+            }
+            MeshCmd::AddPeer { endpoint, pubkey } => {
+                let st = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .mesh_add_peer(MeshPeer { endpoint, pubkey })
+                    .await?
+                    .into_inner();
+                print_mesh_status(&st);
+            }
+            MeshCmd::RmPeer { pubkey } => {
+                let st = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .mesh_remove_peer(MeshPeer {
+                        endpoint: String::new(),
+                        pubkey,
+                    })
+                    .await?
+                    .into_inner();
+                print_mesh_status(&st);
+            }
+        },
         Cmd::Ingress { sub } => match sub {
             IngressCmd::Init { image, install_ca } => {
                 let d = connect(cli.socket.clone(), cli.remote.clone())

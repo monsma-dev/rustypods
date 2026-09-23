@@ -61,6 +61,18 @@ service PodControl {
   rpc ExportPod(PodRef) returns (stream ExportChunk);
   rpc ImportPod(stream ImportChunk) returns (Pod);
 
+  // Multi-host mesh (Wave I): userspace WireGuard (BoringTun) between
+  // daemons. Each host derives a stable ULA /48 from its pubkey —
+  // pods get fd<host>:<idx>::2 and reach pods on peer hosts directly,
+  // end-to-end encrypted, no NAT.
+  rpc MeshInit(MeshInitRequest) returns (MeshStatus);
+  // Named GetMeshStatus (not MeshStatus): inside a service, method
+  // names share the symbol table with types — protoc resolves a bare
+  // `MeshStatus` here to the METHOD and fails "not a message type".
+  rpc GetMeshStatus(Empty) returns (MeshStatus);
+  rpc MeshAddPeer(MeshPeer) returns (MeshStatus);
+  rpc MeshRemovePeer(MeshPeer) returns (MeshStatus);
+
   // Provision/start the managed ingress gateway pod (local PKI + the
   // rustypods-ingress proxy), and report its health/route table.
   rpc InitIngress(InitIngressRequest) returns (IngressDeployment);
@@ -213,6 +225,10 @@ message Pod {
   // Pod-level env "KEY=value", merged over the image's OCI env.
   // Visible via /proc/<pid>/environ — treat as config, not a vault.
   repeated string env = 23;
+  // Multi-host mesh address (fd<host-prefix>:<idx>::2) — routable on
+  // every peer host. "" when the mesh is not initialized or the pod
+  // has no private netns.
+  string mesh_ip = 24;
 }
 
 message PodList {
@@ -266,6 +282,35 @@ message ImportChunk {
 
 message ImportOptions {
   string rename = 1; // import under a different pod name ("" = keep)
+}
+
+// --- Multi-host mesh (Wave I) ---
+message MeshInitRequest {
+  uint32 listen_port = 1; // UDP port for WireGuard; 0 = 51820
+}
+
+// Peer identity: a reachable UDP endpoint + its WG pubkey. The peer's
+// ULA /48 is derived from the pubkey — never configured separately.
+message MeshPeer {
+  string endpoint = 1; // "ip:port" or "[v6]:port"
+  string pubkey = 2;   // base64 x25519 (44 chars)
+}
+
+message MeshPeerInfo {
+  string endpoint = 1;
+  string pubkey = 2;
+  string prefix = 3;              // fd…::/48 routed via the tunnel
+  int64 handshake_secs_ago = 4;   // -1 = no handshake yet
+  uint64 tx_bytes = 5;
+  uint64 rx_bytes = 6;
+}
+
+message MeshStatus {
+  bool enabled = 1;
+  string pubkey = 2;     // this host's WG identity
+  string listen = 3;     // "0.0.0.0:51820"
+  string prefix = 4;     // this host's fd…::/48
+  repeated MeshPeerInfo peers = 5;
 }
 
 message ListPodsRequest {}
