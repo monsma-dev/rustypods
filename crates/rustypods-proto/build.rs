@@ -12,10 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // HealthCheck is accepted verbatim in REST bodies too — type
         // attributes are additive, so the "." rename_all already applies;
         // only the extra derive is needed here.
-        .type_attribute(
-            "rustypods.v1.HealthCheck",
-            "#[derive(serde::Deserialize)]",
-        )
+        .type_attribute("rustypods.v1.HealthCheck", "#[derive(serde::Deserialize)]")
         .compile_protos(&["proto/rustypods.proto"], &["proto"])?;
     Ok(())
 }

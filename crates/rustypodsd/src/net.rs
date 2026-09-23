@@ -41,8 +41,11 @@ pub fn pod_ip6(idx: u32) -> Ipv6Addr {
 }
 /// Lowest free index in 1..=255 across all pods.
 pub fn alloc_index(pods: &BTreeMap<String, PodMeta>) -> u32 {
-    let used: std::collections::BTreeSet<u32> =
-        pods.values().map(|p| p.net_index).filter(|i| *i > 0).collect();
+    let used: std::collections::BTreeSet<u32> = pods
+        .values()
+        .map(|p| p.net_index)
+        .filter(|i| *i > 0)
+        .collect();
     (1..=255).find(|i| !used.contains(i)).unwrap_or(0)
 }
 
@@ -107,7 +110,10 @@ pub(crate) fn run(cmd: &str, args: &[&str]) -> Result<()> {
     if out.status.success() {
         Ok(())
     } else {
-        bail!("{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim())
+        bail!(
+            "{cmd} {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
     }
 }
 
@@ -120,7 +126,10 @@ fn run_out(cmd: &str, args: &[&str]) -> Result<String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        bail!("{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim())
+        bail!(
+            "{cmd} {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
     }
 }
 
@@ -205,7 +214,12 @@ pub(crate) async fn wait_host_veth(leader: u32) -> Result<String> {
         // assume the container side is literally called host0 either.
         let peer = out.ok().and_then(|s| {
             s.lines().find_map(|l| {
-                l.split("@if").nth(1)?.split(':').next()?.parse::<u32>().ok()
+                l.split("@if")
+                    .nth(1)?
+                    .split(':')
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
             })
         });
         if let Some(idx) = peer {
@@ -231,9 +245,7 @@ async fn firewalld_bind(veth: &str) {
     if run_async("firewall-cmd", &["--state"]).await.is_err() {
         return;
     }
-    if let Err(e) =
-        run_async("firewall-cmd", &["--zone=trusted", "--add-interface", veth]).await
-    {
+    if let Err(e) = run_async("firewall-cmd", &["--zone=trusted", "--add-interface", veth]).await {
         tracing::warn!("firewalld trusted-bind {veth}: {e:#}");
     }
 }
@@ -278,14 +290,25 @@ pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
     let host_v = veth_name(stack);
     let peer = stack_peer(stack);
     if !Path::new(&format!("/sys/class/net/{host_v}")).exists() {
-        run("ip", &["link", "add", &host_v, "type", "veth", "peer", "name", &peer])?;
+        run(
+            "ip",
+            &[
+                "link", "add", &host_v, "type", "veth", "peer", "name", &peer,
+            ],
+        )?;
         run("ip", &["link", "set", &peer, "netns", &ns])?;
     }
     firewalld_bind_sync(&host_v);
     run("ip", &["link", "set", &host_v, "up"])?;
     run(
         "ip",
-        &["addr", "replace", &format!("{}/30", host_ip(idx)), "dev", &host_v],
+        &[
+            "addr",
+            "replace",
+            &format!("{}/30", host_ip(idx)),
+            "dev",
+            &host_v,
+        ],
     )?;
     // `nodad`: skip Duplicate Address Detection — the ULA space is
     // daemon-owned, and a tentative address would be unusable for ~1s.
@@ -305,30 +328,69 @@ pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
         format!("/proc/sys/net/ipv4/conf/{host_v}/route_localnet"),
         "1",
     );
-    run("ip", &["netns", "exec", &ns, "ip", "link", "set", "lo", "up"])?;
-    run("ip", &["netns", "exec", &ns, "ip", "link", "set", &peer, "up"])?;
+    run(
+        "ip",
+        &["netns", "exec", &ns, "ip", "link", "set", "lo", "up"],
+    )?;
+    run(
+        "ip",
+        &["netns", "exec", &ns, "ip", "link", "set", &peer, "up"],
+    )?;
     run(
         "ip",
         &[
-            "netns", "exec", &ns, "ip", "addr", "replace",
-            &format!("{}/30", pod_ip(idx)), "dev", &peer,
+            "netns",
+            "exec",
+            &ns,
+            "ip",
+            "addr",
+            "replace",
+            &format!("{}/30", pod_ip(idx)),
+            "dev",
+            &peer,
         ],
     )?;
     run(
         "ip",
         &[
-            "netns", "exec", &ns, "ip", "addr", "replace",
-            &format!("{}/64", pod_ip6(idx)), "dev", &peer, "nodad",
+            "netns",
+            "exec",
+            &ns,
+            "ip",
+            "addr",
+            "replace",
+            &format!("{}/64", pod_ip6(idx)),
+            "dev",
+            &peer,
+            "nodad",
         ],
     )?;
     run(
         "ip",
-        &["netns", "exec", &ns, "ip", "route", "replace", "default", "via", &host_ip(idx).to_string()],
+        &[
+            "netns",
+            "exec",
+            &ns,
+            "ip",
+            "route",
+            "replace",
+            "default",
+            "via",
+            &host_ip(idx).to_string(),
+        ],
     )?;
     run(
         "ip",
         &[
-            "netns", "exec", &ns, "ip", "-6", "route", "replace", "default", "via",
+            "netns",
+            "exec",
+            &ns,
+            "ip",
+            "-6",
+            "route",
+            "replace",
+            "default",
+            "via",
             &host_ip6(idx).to_string(),
         ],
     )?;
@@ -359,7 +421,13 @@ pub async fn configure_veth(_pod: &str, idx: u32, leader: u32) -> Result<()> {
     run_async("ip", &["link", "set", &veth, "up"]).await?;
     run_async(
         "ip",
-        &["addr", "replace", &format!("{}/30", host_ip(idx)), "dev", &veth],
+        &[
+            "addr",
+            "replace",
+            &format!("{}/30", host_ip(idx)),
+            "dev",
+            &veth,
+        ],
     )
     .await?;
     // `nodad` as on the stack path — the daemon owns this ULA space.
@@ -412,7 +480,14 @@ pub async fn configure_veth(_pod: &str, idx: u32, leader: u32) -> Result<()> {
     .await?;
     nsenter_net(
         leader,
-        &["ip", "route", "replace", "default", "via", &host_ip(idx).to_string()],
+        &[
+            "ip",
+            "route",
+            "replace",
+            "default",
+            "via",
+            &host_ip(idx).to_string(),
+        ],
     )
     .await?;
     nsenter_net(
@@ -436,11 +511,7 @@ pub async fn configure_veth(_pod: &str, idx: u32, leader: u32) -> Result<()> {
 /// into this pod's veth. Pods need no extra route: the v6 default
 /// already points at the host. Idempotent (`replace`) so re-entry is
 /// safe (mesh_init on already-running pods, daemon restart).
-pub async fn configure_mesh_addr(
-    idx: u32,
-    leader: u32,
-    prefix: std::net::Ipv6Addr,
-) -> Result<()> {
+pub async fn configure_mesh_addr(idx: u32, leader: u32, prefix: std::net::Ipv6Addr) -> Result<()> {
     if leader == 0 {
         bail!("pod has no usable leader pid yet — cannot enter its netns");
     }
@@ -448,7 +519,14 @@ pub async fn configure_mesh_addr(
     let veth = wait_host_veth(leader).await?;
     run_async(
         "ip",
-        &["-6", "route", "replace", &format!("{addr}/128"), "dev", &veth],
+        &[
+            "-6",
+            "route",
+            "replace",
+            &format!("{addr}/128"),
+            "dev",
+            &veth,
+        ],
     )
     .await?;
     nsenter_net(
@@ -483,7 +561,15 @@ pub async fn remove_mesh_addr(idx: u32, leader: u32, prefix: std::net::Ipv6Addr)
     if leader != 0 {
         let _ = nsenter_net(
             leader,
-            &["ip", "-6", "addr", "del", &format!("{addr}/128"), "dev", "host0"],
+            &[
+                "ip",
+                "-6",
+                "addr",
+                "del",
+                &format!("{addr}/128"),
+                "dev",
+                "host0",
+            ],
         )
         .await;
     }
@@ -515,8 +601,14 @@ pub fn ensure_ip_forward() -> Result<()> {
 pub(crate) fn ensure_mesh_forward() {
     const MARK: &str = "rustypods-mesh-fwd";
     for (fam, rules) in [
-        ("ip6", ["ip6 saddr fd00::/8 accept", "ip6 daddr fd00::/8 accept"].as_slice()),
-        ("inet", ["ip6 saddr fd00::/8 accept", "ip6 daddr fd00::/8 accept"].as_slice()),
+        (
+            "ip6",
+            ["ip6 saddr fd00::/8 accept", "ip6 daddr fd00::/8 accept"].as_slice(),
+        ),
+        (
+            "inet",
+            ["ip6 saddr fd00::/8 accept", "ip6 daddr fd00::/8 accept"].as_slice(),
+        ),
     ] {
         let out = Command::new("nft")
             .args(["list", "chain", fam, "filter", "FORWARD"])
@@ -928,10 +1020,9 @@ mod tests {
         let rootfs = dir.join("rootfs");
         std::fs::create_dir_all(&rootfs).unwrap();
         write_pod_network(&rootfs, 7).unwrap();
-        let text = std::fs::read_to_string(
-            rootfs.join("etc/systemd/network/80-container-host0.network"),
-        )
-        .unwrap();
+        let text =
+            std::fs::read_to_string(rootfs.join("etc/systemd/network/80-container-host0.network"))
+                .unwrap();
         assert!(text.contains("Address=10.220.7.2/30"));
         assert!(text.contains("Address=fd22:220:7::2/64"));
         assert!(text.contains("Gateway=10.220.7.1"));

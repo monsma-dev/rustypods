@@ -101,7 +101,10 @@ async fn main() -> Result<()> {
             .filter(|m| m.net_index > 0)
             .map(|m| m.name.clone())
             .collect();
-        print!("{}", rustypodsd::net::nat_script(st.pods.values(), &running));
+        print!(
+            "{}",
+            rustypodsd::net::nat_script(st.pods.values(), &running)
+        );
         return Ok(());
     }
     server::serve(Config {

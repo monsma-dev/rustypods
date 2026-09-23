@@ -83,9 +83,7 @@ async fn machine<'a>(conn: &'a Connection, name: &str) -> Result<Option<MachineP
         Err(e) if is_no_such_machine(&e) => return Ok(None),
         Err(e) => return Err(e).context("machined GetMachine"),
     };
-    Ok(Some(
-        MachineProxy::builder(conn).path(path)?.build().await?,
-    ))
+    Ok(Some(MachineProxy::builder(conn).path(path)?.build().await?))
 }
 
 /// machined is socket-activated; ping the systemd manager to wake it.

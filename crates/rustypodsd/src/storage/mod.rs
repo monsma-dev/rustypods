@@ -35,11 +35,9 @@ pub trait StorageDriver: Send + Sync {
 /// Compares on path components (starts_with on Path), never strings —
 /// `/a/b` must not match `/a/bc`.
 pub(crate) fn refuse_if_mounted(path: &Path) -> Result<()> {
-    let target = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
-    let mounts = std::fs::read_to_string("/proc/self/mounts")
-        .with_context(|| "read /proc/self/mounts")?;
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mounts =
+        std::fs::read_to_string("/proc/self/mounts").with_context(|| "read /proc/self/mounts")?;
     for line in mounts.lines() {
         // Field 2 is the mountpoint; octal escapes (\040 etc.) keep it
         // whitespace-free. A path under `target` is the danger.
@@ -62,12 +60,19 @@ pub(crate) fn refuse_if_mounted(path: &Path) -> Result<()> {
 /// Pick the best driver for the filesystem hosting `data_dir`/pods.
 pub fn detect(data_dir: &Path) -> Arc<dyn StorageDriver> {
     let pods = data_dir.join("pods");
-    let probe = if pods.exists() { pods } else { data_dir.to_path_buf() };
+    let probe = if pods.exists() {
+        pods
+    } else {
+        data_dir.to_path_buf()
+    };
     if btrfs::is_btrfs(&probe) {
         tracing::info!("storage driver: btrfs (CoW snapshots + qgroup quotas)");
         Arc::new(BtrfsDriver::new(data_dir))
     } else {
-        tracing::info!("storage driver: reflink-copy fallback (no btrfs on {})", probe.display());
+        tracing::info!(
+            "storage driver: reflink-copy fallback (no btrfs on {})",
+            probe.display()
+        );
         Arc::new(FallbackDriver)
     }
 }
@@ -79,8 +84,7 @@ mod tests {
     #[test]
     fn refuse_if_mounted_behaviour() {
         // A plain tmp dir with nothing mounted under it passes.
-        let dir = std::env::temp_dir()
-            .join(format!("rp-mnt-check-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rp-mnt-check-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(refuse_if_mounted(&dir).is_ok());
         let _ = std::fs::remove_dir_all(&dir);

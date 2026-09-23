@@ -67,18 +67,25 @@ fn chunk_exit(code: i32) -> Result<ExecChunk, tonic::Status> {
 /// argv can't rely on PATH: the daemon's PATH doesn't include /bin, and a
 /// minimal OCI image (busybox) may have *only* /bin.
 fn image_bin(rootfs: &Path, name: &str) -> Option<String> {
-    ["bin", "sbin", "usr/bin", "usr/sbin", "usr/local/bin", "usr/local/sbin"]
-        .iter()
-        .find(|d| {
-            // safe_join_if_exists refuses symlinked intermediates; the leaf
-            // check is symlink_metadata (not exists()) so an absolute leaf
-            // symlink can't be resolved against the HOST fs.
-            matches!(
-                crate::rootfs::safe_join_if_exists(rootfs, format!("{d}/{name}")),
-                Ok(Some(p)) if p.symlink_metadata().is_ok()
-            )
-        })
-        .map(|d| format!("/{d}/{name}"))
+    [
+        "bin",
+        "sbin",
+        "usr/bin",
+        "usr/sbin",
+        "usr/local/bin",
+        "usr/local/sbin",
+    ]
+    .iter()
+    .find(|d| {
+        // safe_join_if_exists refuses symlinked intermediates; the leaf
+        // check is symlink_metadata (not exists()) so an absolute leaf
+        // symlink can't be resolved against the HOST fs.
+        matches!(
+            crate::rootfs::safe_join_if_exists(rootfs, format!("{d}/{name}")),
+            Ok(Some(p)) if p.symlink_metadata().is_ok()
+        )
+    })
+    .map(|d| format!("/{d}/{name}"))
 }
 
 /// Is `path` (absolute in-container) a busybox applet — symlink to busybox
@@ -250,10 +257,8 @@ pub fn exec_argv(
     // setpriv lives in the image (util-linux): the cap/uid drop must happen
     // after setns, so it has to run in-container. A busybox setpriv lacks
     // --bounding-set/--reuid — counts as absent.
-    let setpriv = image_bin(rootfs, "setpriv")
-        .filter(|p| !is_busybox_applet(rootfs, p));
-    let env = image_bin(rootfs, "env")
-        .context("image has no 'env' binary — exec unsupported")?;
+    let setpriv = image_bin(rootfs, "setpriv").filter(|p| !is_busybox_applet(rootfs, p));
+    let env = image_bin(rootfs, "env").context("image has no 'env' binary — exec unsupported")?;
     if setpriv.is_none() {
         if !private_users {
             // Without userns confinement an exec'd process would carry the
@@ -294,8 +299,28 @@ pub fn exec_argv(
     }
     a.push(env.into());
     a.push(format!("HOME={home}").into());
-    a.push(format!("USER={}", if start.user.is_empty() { "root" } else { &start.user }).into());
-    a.push(format!("LOGNAME={}", if start.user.is_empty() { "root" } else { &start.user }).into());
+    a.push(
+        format!(
+            "USER={}",
+            if start.user.is_empty() {
+                "root"
+            } else {
+                &start.user
+            }
+        )
+        .into(),
+    );
+    a.push(
+        format!(
+            "LOGNAME={}",
+            if start.user.is_empty() {
+                "root"
+            } else {
+                &start.user
+            }
+        )
+        .into(),
+    );
     // A container-default PATH unless the client overrides it — the
     // daemon's own PATH lacks /bin, which is all a minimal OCI image has.
     if !start.env.iter().any(|kv| kv.starts_with("PATH=")) {
@@ -435,12 +460,7 @@ where
     }
 }
 
-async fn run_tty<S>(
-    argv: &[OsString],
-    start: &ExecStart,
-    mut inbound: S,
-    tx: Tx,
-) -> Result<()>
+async fn run_tty<S>(argv: &[OsString], start: &ExecStart, mut inbound: S, tx: Tx) -> Result<()>
 where
     S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
 {
@@ -449,8 +469,7 @@ where
     let slave_err = slave.try_clone().context("slave clone")?;
 
     let mut scmd = std::process::Command::new(&argv[0]);
-    scmd
-        .args(&argv[1..])
+    scmd.args(&argv[1..])
         .stdin(Stdio::from(slave))
         .stdout(Stdio::from(slave_in))
         .stderr(Stdio::from(slave_err));
@@ -540,18 +559,12 @@ where
     Ok(())
 }
 
-async fn run_pipe<S>(
-    argv: &[OsString],
-    _pod: String,
-    mut inbound: S,
-    tx: Tx,
-) -> Result<()>
+async fn run_pipe<S>(argv: &[OsString], _pod: String, mut inbound: S, tx: Tx) -> Result<()>
 where
     S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
 {
     let mut scmd = std::process::Command::new(&argv[0]);
-    scmd
-        .args(&argv[1..])
+    scmd.args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -675,13 +688,28 @@ mod tests {
         let a = exec_argv(42, &dir, &start("root", &["echo", "hi"]), false).unwrap();
         let s: Vec<&str> = a.iter().map(|o| o.to_str().unwrap()).collect();
         assert!(s.starts_with(&[
-            "nsenter", "--target", "42", "--mount", "--uts", "--ipc", "--net", "--pid",
-            "--cgroup", "--join-cgroup", "--"
+            "nsenter",
+            "--target",
+            "42",
+            "--mount",
+            "--uts",
+            "--ipc",
+            "--net",
+            "--pid",
+            "--cgroup",
+            "--join-cgroup",
+            "--"
         ]));
         // helpers resolve to absolute in-container paths
-        assert!(s.iter().any(|x| *x == "/bin/setpriv"), "everyone gets the cap drop");
+        assert!(
+            s.iter().any(|x| *x == "/bin/setpriv"),
+            "everyone gets the cap drop"
+        );
         assert!(s.iter().any(|x| *x == "/bin/env"));
-        assert!(!s.iter().any(|x| x.starts_with("--reuid")), "root gets no reuid");
+        assert!(
+            !s.iter().any(|x| x.starts_with("--reuid")),
+            "root gets no reuid"
+        );
         assert!(s.iter().any(|x| *x == "HOME=/root"));
         assert!(s.ends_with(&["echo", "hi"]));
         let _ = std::fs::remove_dir_all(&dir);
@@ -697,7 +725,10 @@ mod tests {
         assert!(!bset.contains("sys_module"));
         assert!(!bset.contains("net_admin"));
         let pu = exec_argv(42, &dir, &start("root", &["true"]), true).unwrap();
-        let ps: Vec<String> = pu.iter().map(|o| o.to_string_lossy().into_owned()).collect();
+        let ps: Vec<String> = pu
+            .iter()
+            .map(|o| o.to_string_lossy().into_owned())
+            .collect();
         assert!(ps.iter().any(|x| x == "--user"));
         assert!(!s.iter().any(|x| x == "--user"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -718,7 +749,9 @@ mod tests {
         // root on a setpriv-less image: no id switch at all.
         let a = exec_argv(42, &dir, &start("root", &["id"]), true).unwrap();
         let s: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
-        assert!(!s.iter().any(|x| x.starts_with("--setuid") || x.contains("setpriv")));
+        assert!(!s
+            .iter()
+            .any(|x| x.starts_with("--setuid") || x.contains("setpriv")));
         // …but without userns confinement it's refused outright.
         assert!(exec_argv(42, &dir, &start("root", &["id"]), false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -786,7 +819,10 @@ mod tests {
         std::fs::write(dir.join("etc/debian_version"), b"forky/sid\n").unwrap();
         let a = exec_argv(42, &dir, &s, false).unwrap();
         let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
-        assert!(v.iter().any(|x| x == "LANG=C.UTF-8"), "debian: archive alone is not proof");
+        assert!(
+            v.iter().any(|x| x == "LANG=C.UTF-8"),
+            "debian: archive alone is not proof"
+        );
         std::fs::write(
             dir.join("etc/locale.gen"),
             "# en_US.UTF-8 UTF-8\nnl_NL.UTF-8 UTF-8\n",
@@ -794,7 +830,10 @@ mod tests {
         .unwrap();
         let a = exec_argv(42, &dir, &s, false).unwrap();
         let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
-        assert!(v.iter().any(|x| x == "LANG=nl_NL.UTF-8"), "locale.gen line counts");
+        assert!(
+            v.iter().any(|x| x == "LANG=nl_NL.UTF-8"),
+            "locale.gen line counts"
+        );
 
         // C and POSIX always exist — pass through untouched.
         s.env = vec!["LANG=C".into(), "LC_ALL=POSIX".into()];

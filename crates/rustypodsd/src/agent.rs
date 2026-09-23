@@ -65,14 +65,12 @@ pub async fn spawn_listener(
     metrics: MetricsMap,
     listeners: ListenerMap,
 ) -> Result<()> {
-    std::fs::create_dir_all(run_dir)
-        .with_context(|| format!("mkdir {}", run_dir.display()))?;
+    std::fs::create_dir_all(run_dir).with_context(|| format!("mkdir {}", run_dir.display()))?;
     let sock = run_dir.join("agent.sock");
     if sock.exists() {
         let _ = std::fs::remove_file(&sock);
     }
-    let listener = UnixListener::bind(&sock)
-        .with_context(|| format!("bind {}", sock.display()))?;
+    let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     // 0660 root:root: the in-pod agent connects as container root; other
     // pod-side processes can't open the socket to spoof metrics. For a
     // userns pod (--private-users) container root is a host SUBUID — the
@@ -159,7 +157,10 @@ pub fn chown_run_dir_for_userns(run_dir: &Path, leader: u32) {
     }
     match std::fs::symlink_metadata(run_dir) {
         Ok(md) if !md.file_type().is_dir() => {
-            tracing::warn!("{} is not a real directory — run-dir chown skipped", run_dir.display());
+            tracing::warn!(
+                "{} is not a real directory — run-dir chown skipped",
+                run_dir.display()
+            );
         }
         Err(e) => {
             tracing::warn!("stat {} for run-dir chown: {e}", run_dir.display());

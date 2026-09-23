@@ -156,9 +156,8 @@ async fn create_pod(
         memory_max_bytes: b.memory_max_bytes.unwrap_or(0),
         cpu_quota_percent: b.cpu_quota_percent.unwrap_or(0),
     };
-    let has_limits = limits.memory_high_bytes > 0
-        || limits.memory_max_bytes > 0
-        || limits.cpu_quota_percent > 0;
+    let has_limits =
+        limits.memory_high_bytes > 0 || limits.memory_max_bytes > 0 || limits.cpu_quota_percent > 0;
     let p = s
         .create_pod(Request::new(CreatePodRequest {
             name: b.name,
@@ -647,10 +646,7 @@ pub fn router(svc: Svc, token: Arc<str>) -> Router {
         .route("/v1/mesh/init", post(mesh_init_http))
         .route("/v1/mesh/peers", post(mesh_add_peer_http))
         .route("/v1/mesh/peers/{*pubkey}", delete(mesh_rm_peer_http))
-        .route_layer(axum::middleware::from_fn_with_state(
-            token,
-            require_token,
-        ));
+        .route_layer(axum::middleware::from_fn_with_state(token, require_token));
     Router::new()
         .route("/healthz", get(healthz))
         .merge(v1)

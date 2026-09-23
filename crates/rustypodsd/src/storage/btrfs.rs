@@ -56,7 +56,12 @@ fn set_quota_limit(path: &Path, bytes: u64) -> Result<()> {
     };
     run(
         "btrfs",
-        &[OsStr::new("qgroup"), OsStr::new("limit"), lim, path.as_os_str()],
+        &[
+            OsStr::new("qgroup"),
+            OsStr::new("limit"),
+            lim,
+            path.as_os_str(),
+        ],
     )
 }
 
@@ -107,7 +112,11 @@ impl StorageDriver for BtrfsDriver {
         }
         run(
             "btrfs",
-            &[OsStr::new("subvolume"), OsStr::new("create"), path.as_os_str()],
+            &[
+                OsStr::new("subvolume"),
+                OsStr::new("create"),
+                path.as_os_str(),
+            ],
         )
     }
 
@@ -137,15 +146,19 @@ impl StorageDriver for BtrfsDriver {
         // progress) must propagate: falling back to rm -rf there would
         // recurse through whatever is still mounted.
         let out = Command::new("btrfs")
-            .args([OsStr::new("subvolume"), OsStr::new("delete"), path.as_os_str()])
+            .args([
+                OsStr::new("subvolume"),
+                OsStr::new("delete"),
+                path.as_os_str(),
+            ])
             .output()
             .context("running btrfs")?;
         if out.status.success() {
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let not_subvol = stderr.contains("not a subvolume")
-            || stderr.contains("Not a Btrfs subvolume");
+        let not_subvol =
+            stderr.contains("not a subvolume") || stderr.contains("Not a Btrfs subvolume");
         if not_subvol {
             return run("rm", &[OsStr::new("-rf"), path.as_os_str()]);
         }
@@ -166,7 +179,8 @@ impl StorageDriver for BtrfsDriver {
 mod tests {
     #[test]
     fn create_clone_delete() {
-        let base = std::env::temp_dir().join(format!("rustypods-storage-test-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("rustypods-storage-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let d = super::super::detect(&base); // tmpfs → fallback, still fine to use

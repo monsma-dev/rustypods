@@ -99,7 +99,8 @@ fn join_parents(rootfs: &Path, rel: &Path, missing: Missing) -> Result<Option<Pa
 /// below picks the leaf policy appropriate to its operation.
 pub fn safe_join(rootfs: &Path, rel: impl AsRef<Path>) -> Result<PathBuf> {
     // Ok(None) is impossible under Missing::Error.
-    Ok(join_parents(rootfs, rel.as_ref(), Missing::Error)?.expect("Missing::Error never yields None"))
+    Ok(join_parents(rootfs, rel.as_ref(), Missing::Error)?
+        .expect("Missing::Error never yields None"))
 }
 
 /// Parent resolution for read-only access (read_dir, read_to_string):
@@ -124,8 +125,7 @@ pub fn mkdir_in_rootfs(rootfs: &Path, rel: impl AsRef<Path>) -> Result<PathBuf> 
                 cur.display()
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&cur)
-                    .with_context(|| format!("mkdir {}", cur.display()))?;
+                std::fs::create_dir(&cur).with_context(|| format!("mkdir {}", cur.display()))?;
             }
             Err(e) => return Err(e).with_context(|| format!("stat {}", cur.display())),
         }
@@ -186,15 +186,16 @@ pub fn symlink_in_rootfs(rootfs: &Path, rel: impl AsRef<Path>, target: &Path) ->
     let p = safe_join(rootfs, rel)?;
     match std::fs::symlink_metadata(&p) {
         Ok(md) if md.is_dir() => {
-            bail!("{} is a directory — refusing to replace it with a symlink", p.display())
+            bail!(
+                "{} is a directory — refusing to replace it with a symlink",
+                p.display()
+            )
         }
-        Ok(_) => std::fs::remove_file(&p)
-            .with_context(|| format!("rm {}", p.display()))?,
+        Ok(_) => std::fs::remove_file(&p).with_context(|| format!("rm {}", p.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("stat {}", p.display())),
     }
-    std::os::unix::fs::symlink(target, &p)
-        .with_context(|| format!("symlink {}", p.display()))
+    std::os::unix::fs::symlink(target, &p).with_context(|| format!("symlink {}", p.display()))
 }
 
 #[cfg(test)]
@@ -225,8 +226,14 @@ mod tests {
 
     #[test]
     fn normalization() {
-        assert_eq!(normalize_rel("/etc/x").unwrap().unwrap(), PathBuf::from("etc/x"));
-        assert_eq!(normalize_rel("etc/./x").unwrap().unwrap(), PathBuf::from("etc/x"));
+        assert_eq!(
+            normalize_rel("/etc/x").unwrap().unwrap(),
+            PathBuf::from("etc/x")
+        );
+        assert_eq!(
+            normalize_rel("etc/./x").unwrap().unwrap(),
+            PathBuf::from("etc/x")
+        );
         assert_eq!(normalize_rel("/").unwrap(), None);
         assert_eq!(normalize_rel("").unwrap(), None);
         assert!(normalize_rel("../x").is_err());

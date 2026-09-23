@@ -14,11 +14,7 @@ pub fn dual_stack_listener(addr: SocketAddr) -> io::Result<tokio::net::TcpListen
             socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?
         }
         SocketAddr::V6(_) => {
-            let s = socket2::Socket::new(
-                socket2::Domain::IPV6,
-                socket2::Type::STREAM,
-                None,
-            )?;
+            let s = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?;
             s.set_only_v6(false)?;
             s
         }

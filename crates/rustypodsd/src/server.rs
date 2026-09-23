@@ -269,7 +269,11 @@ fn limits_from(l: Option<Limits>) -> LimitsSpec {
 /// malformed probe can never reach the conf. "none" normalizes to "".
 fn health_from_proto(h: &HealthCheck) -> Result<state::HealthSpec> {
     proto::validate_healthcheck(h)?;
-    let kind = if h.kind == "none" { "" } else { h.kind.as_str() };
+    let kind = if h.kind == "none" {
+        ""
+    } else {
+        h.kind.as_str()
+    };
     Ok(state::HealthSpec {
         kind: kind.into(),
         target: h.target.trim().into(),
@@ -306,9 +310,7 @@ fn probe_addr(m: &PodMeta, target: &str) -> Option<std::net::SocketAddr> {
     let bare = t.parse::<u16>().ok().map(|p| format!(":{p}"));
     let t = bare.as_deref().unwrap_or(t);
     match t.strip_prefix(':') {
-        Some(p) if m.net_index > 0 => {
-            Some((net::pod_ip(m.net_index), p.parse().ok()?).into())
-        }
+        Some(p) if m.net_index > 0 => Some((net::pod_ip(m.net_index), p.parse().ok()?).into()),
         Some(_) => None,
         None => t.parse().ok(),
     }
@@ -428,9 +430,7 @@ fn validate_ingress_conflicts_excluding(
 /// semantically meaningful, so a TOML reshuffle isn't a "change".
 fn same_ingress(a: &[IngressSpec], b: &[IngressSpec]) -> bool {
     fn set(v: &[IngressSpec]) -> std::collections::BTreeSet<(&str, u16)> {
-        v.iter()
-            .map(|i| (i.host.as_str(), i.pod_port))
-            .collect()
+        v.iter().map(|i| (i.host.as_str(), i.pod_port)).collect()
     }
     set(a) == set(b)
 }
@@ -685,11 +685,7 @@ impl Svc {
         Self::blocking(move || s.create_rootfs(&p)).await
     }
     async fn st_clone(&self, src: &Path, dst: &Path) -> Result<(), Status> {
-        let (s, a, b) = (
-            self.storage.clone(),
-            src.to_path_buf(),
-            dst.to_path_buf(),
-        );
+        let (s, a, b) = (self.storage.clone(), src.to_path_buf(), dst.to_path_buf());
         Self::blocking(move || s.clone_rootfs(&a, &b)).await
     }
     async fn st_delete(&self, path: &Path) -> Result<(), Status> {
@@ -735,8 +731,7 @@ impl Svc {
         // mapping (and non-userns pods) able to write, like /tmp.
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
-                .map_err(int)?;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).map_err(int)?;
         }
         let v = VolumeMeta {
             name,
@@ -964,9 +959,7 @@ impl Svc {
         &self,
         name: &str,
     ) -> Result<ReceiverStream<Result<ExportChunk, Status>>, Status> {
-        let pod = proto::validate_name(name)
-            .map_err(bad)?
-            .to_string();
+        let pod = proto::validate_name(name).map_err(bad)?.to_string();
         let meta = {
             let st = self.st.lock().await;
             st.pods.get(&pod).cloned()
@@ -1008,7 +1001,11 @@ impl Svc {
         };
         let use_btrfs = self.storage.name() == "btrfs";
         let manifest = transfer::Manifest {
-            format: if use_btrfs { "btrfs".into() } else { "tar".into() },
+            format: if use_btrfs {
+                "btrfs".into()
+            } else {
+                "tar".into()
+            },
             pod_conf: toml::to_string(&meta).map_err(int)?,
             image_conf,
             volume_confs,
@@ -1059,7 +1056,11 @@ impl Svc {
             .await
             .map_err(int)?;
             let mut args: Vec<std::ffi::OsString> = vec![staging_dir.join(&pod).into_os_string()];
-            args.extend(vol_names.iter().map(|v| staging_dir.join(v).into_os_string()));
+            args.extend(
+                vol_names
+                    .iter()
+                    .map(|v| staging_dir.join(v).into_os_string()),
+            );
             tokio::process::Command::new("btrfs")
                 .arg("send")
                 .args(&args)
@@ -1070,10 +1071,15 @@ impl Svc {
                 .map_err(int)?
         } else {
             let mut cmd = tokio::process::Command::new("tar");
-            cmd.arg("-cf").arg("-")
-                .arg("-C").arg(self.cfg.pods_dir()).arg(&pod);
+            cmd.arg("-cf")
+                .arg("-")
+                .arg("-C")
+                .arg(self.cfg.pods_dir())
+                .arg(&pod);
             for v in &vol_names {
-                cmd.arg("-C").arg(proto::volumes_dir(&self.cfg.data_dir)).arg(v);
+                cmd.arg("-C")
+                    .arg(proto::volumes_dir(&self.cfg.data_dir))
+                    .arg(v);
             }
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -1334,7 +1340,11 @@ impl Svc {
             }
         }
         state::save_pod(&self.cfg.data_dir, &meta).map_err(int)?;
-        self.st.lock().await.pods.insert(meta.name.clone(), meta.clone());
+        self.st
+            .lock()
+            .await
+            .pods
+            .insert(meta.name.clone(), meta.clone());
         tracing::info!(
             "imported pod {} (from '{}' archive, {} volumes)",
             meta.name,
@@ -1350,7 +1360,6 @@ impl Svc {
             self.mesh_prefix(),
         ))
     }
-
 
     /// Latest agent-pushed metric for a pod (REST /metrics). None when the
     /// agent never connected — a real sample always has ts_unix_ms > 0.
@@ -1383,7 +1392,13 @@ impl Svc {
                 continue;
             };
             for (i, s) in self.snapshots(&m.name).iter().enumerate() {
-                if snapshot_expired(i, s.created_unix, m.snap_keep_last, m.snap_max_age_secs, now) {
+                if snapshot_expired(
+                    i,
+                    s.created_unix,
+                    m.snap_keep_last,
+                    m.snap_max_age_secs,
+                    now,
+                ) {
                     match self.st_delete(Path::new(&s.path)).await {
                         Ok(()) => tracing::info!("gc: deleted snapshot {} of pod {}", s.id, m.name),
                         Err(e) => {
@@ -1431,7 +1446,11 @@ impl Svc {
     async fn supervise_once(&self) {
         let pods: Vec<PodMeta> = {
             let st = self.st.lock().await;
-            st.pods.values().filter(|m| supervised(m)).cloned().collect()
+            st.pods
+                .values()
+                .filter(|m| supervised(m))
+                .cloned()
+                .collect()
         };
         let now = std::time::Instant::now();
         for m in &pods {
@@ -1457,9 +1476,7 @@ impl Svc {
         let running = self.engine.running_pid(&m.name).await.is_some();
         let act = {
             let mut map = self.health.lock().await;
-            if !running
-                && (!m.started || self.stop_intent.lock().await.contains(&m.name))
-            {
+            if !running && (!m.started || self.stop_intent.lock().await.contains(&m.name)) {
                 // Never booted, or stopped on purpose — nothing to watch
                 // until a start (re)arms the death-watch.
                 map.remove(&m.name);
@@ -1553,7 +1570,11 @@ impl Svc {
     /// manual stop+start. Backoff is 2^n s per consecutive attempt
     /// (cap 60s) and decays after a minute of sustained health.
     async fn supervised_restart(&self, m: &PodMeta, why: &str) -> Result<()> {
-        tracing::warn!("{}: {why} — restarting (policy {})", m.name, restart_policy(m));
+        tracing::warn!(
+            "{}: {why} — restarting (policy {})",
+            m.name,
+            restart_policy(m)
+        );
         if self.engine.running_pid(&m.name).await.is_some() {
             if let Err(e) = self
                 .stop_pod(Request::new(PodRef {
@@ -1577,8 +1598,7 @@ impl Svc {
             if let Some(ent) = map.get_mut(&m.name) {
                 ent.restart_count = ent.restart_count.saturating_add(1);
                 let secs = (1u64 << ent.restart_count.min(6)).min(60);
-                ent.backoff_until =
-                    Some(std::time::Instant::now() + Duration::from_secs(secs));
+                ent.backoff_until = Some(std::time::Instant::now() + Duration::from_secs(secs));
                 ent.status = "starting";
                 ent.fails = 0;
                 ent.healthy_since = std::time::Instant::now();
@@ -1754,9 +1774,8 @@ impl Svc {
         let running = self.running_set().await;
         let gw_running = running.contains(proto::INGRESS_POD);
         let generation = self.ingress_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let snap =
-            ingress::build_snapshot(pods.iter().collect(), &running, exclude, generation)
-                .map_err(int)?;
+        let snap = ingress::build_snapshot(pods.iter().collect(), &running, exclude, generation)
+            .map_err(int)?;
         let want_routes = !snap.routes.is_empty();
         if !gateway_configured {
             if want_routes && required {
@@ -1904,7 +1923,9 @@ impl PodControl for Svc {
         proto::validate_container_ref(&req.distrobox).map_err(bad)?;
         let dest = self.cfg.images_dir().join(&name);
         if dest.exists() {
-            return Err(Status::already_exists(format!("image {name} already exists")));
+            return Err(Status::already_exists(format!(
+                "image {name} already exists"
+            )));
         }
         // runuser runs the export as this user — the request may only ever
         // name the configured import_user, never root or another account.
@@ -1962,7 +1983,9 @@ impl PodControl for Svc {
         };
         let dest = self.cfg.images_dir().join(&name);
         if dest.exists() {
-            return Err(Status::already_exists(format!("image {name} already exists")));
+            return Err(Status::already_exists(format!(
+                "image {name} already exists"
+            )));
         }
         self.st_create(&dest).await?;
         let cfg = match oci::pull(&req.reference, &dest).await {
@@ -2195,7 +2218,9 @@ impl PodControl for Svc {
             m.clone()
         };
         if self.engine.running_pid(&src).await.is_some() {
-            tracing::warn!("cloning running pod {src} — snapshot is atomic but mid-write state is live");
+            tracing::warn!(
+                "cloning running pod {src} — snapshot is atomic but mid-write state is live"
+            );
         }
         let dst_root = self.pod_rootfs(&dest);
         if dst_root.exists() {
@@ -2239,7 +2264,10 @@ impl PodControl for Svc {
 
     /// `rustypods commit <pod> [label]`: atomic CoW snapshot of the live
     /// rootfs into snapshots/<pod>/<ts>[-label]. The live pod keeps running.
-    async fn commit_pod(&self, req: Request<CommitPodRequest>) -> Result<Response<Snapshot>, Status> {
+    async fn commit_pod(
+        &self,
+        req: Request<CommitPodRequest>,
+    ) -> Result<Response<Snapshot>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
         {
@@ -2250,7 +2278,9 @@ impl PodControl for Svc {
         }
         let _op = self.pod_op(&pod).await;
         if self.engine.running_pid(&pod).await.is_some() {
-            tracing::warn!("commit on running pod {pod} — snapshot is atomic but mid-write state is live");
+            tracing::warn!(
+                "commit on running pod {pod} — snapshot is atomic but mid-write state is live"
+            );
         }
         let slug = slugify(&req.label);
         let ts = state::now_unix();
@@ -2290,7 +2320,10 @@ impl PodControl for Svc {
     /// `rustypods rollback <pod> [--to <id>]`: swap the live rootfs for a
     /// commit. The pod is stopped first — rollback discards current state.
     /// The snapshot itself survives (it becomes the new live rootfs' source).
-    async fn rollback_pod(&self, req: Request<RollbackPodRequest>) -> Result<Response<Pod>, Status> {
+    async fn rollback_pod(
+        &self,
+        req: Request<RollbackPodRequest>,
+    ) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
         let meta = {
@@ -2313,7 +2346,11 @@ impl PodControl for Svc {
         let Some(snap) = snap else {
             return Err(Status::not_found(format!(
                 "no snapshot{} for pod {pod}",
-                if req.snapshot.is_empty() { "s".to_string() } else { format!(" '{}'", req.snapshot) }
+                if req.snapshot.is_empty() {
+                    "s".to_string()
+                } else {
+                    format!(" '{}'", req.snapshot)
+                }
             )));
         };
         self.engine.stop(&pod).await.map_err(int)?; // rollback discards live state
@@ -2378,10 +2415,7 @@ impl PodControl for Svc {
         )))
     }
 
-    async fn list_snapshots(
-        &self,
-        req: Request<PodRef>,
-    ) -> Result<Response<SnapshotList>, Status> {
+    async fn list_snapshots(&self, req: Request<PodRef>) -> Result<Response<SnapshotList>, Status> {
         let pod = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
@@ -2410,7 +2444,10 @@ impl PodControl for Svc {
         // Guard: the id may only ever resolve inside this pod's snap dir.
         let path = self.snaps_dir(&pod).join(&req.id);
         if !path.starts_with(self.snaps_dir(&pod)) || !path.exists() {
-            return Err(Status::not_found(format!("snapshot '{}' not found", req.id)));
+            return Err(Status::not_found(format!(
+                "snapshot '{}' not found",
+                req.id
+            )));
         }
         self.st_delete(&path).await?;
         Ok(Response::new(Empty {}))
@@ -2452,10 +2489,7 @@ impl PodControl for Svc {
         }
         // A stack/member combo that lands on the reserved gateway name
         // would squat the managed pod — reject the whole apply.
-        if member_ingress
-            .keys()
-            .any(|n| n == proto::INGRESS_POD)
-        {
+        if member_ingress.keys().any(|n| n == proto::INGRESS_POD) {
             return Err(Status::failed_precondition(format!(
                 "stack member name {} is reserved",
                 proto::INGRESS_POD
@@ -2678,7 +2712,9 @@ impl PodControl for Svc {
         self.sync_nat().await?;
         let hmap: HashMap<String, String> = {
             let h = self.health.lock().await;
-            h.iter().map(|(k, v)| (k.clone(), v.status.to_string())).collect()
+            h.iter()
+                .map(|(k, v)| (k.clone(), v.status.to_string()))
+                .collect()
         };
         let pods = out
             .iter()
@@ -3070,9 +3106,7 @@ impl PodControl for Svc {
         // table rebuilt from live state. A veth failure unwinds the
         // start rather than leaving a half-networked "running" pod.
         if needs_network && meta.stack.is_empty() {
-            if let Err(e) =
-                net::configure_veth(&name, meta.net_index, leader.unwrap_or(0)).await
-            {
+            if let Err(e) = net::configure_veth(&name, meta.net_index, leader.unwrap_or(0)).await {
                 agent::stop_listener(&self.listeners, &self.metrics, &name).await;
                 let _ = self.engine.stop(&name).await;
                 return Err(int(e));
@@ -3249,7 +3283,9 @@ impl PodControl for Svc {
         };
         let hmap: HashMap<String, String> = {
             let h = self.health.lock().await;
-            h.iter().map(|(k, v)| (k.clone(), v.status.to_string())).collect()
+            h.iter()
+                .map(|(k, v)| (k.clone(), v.status.to_string()))
+                .collect()
         };
         let mut out = Vec::new();
         for m in &pods {
@@ -3510,7 +3546,10 @@ impl PodControl for Svc {
         }
         // Hot-apply while the pod runs — no restart needed.
         if self.engine.running_pid(&name).await.is_some() {
-            self.engine.apply_limits(&name, &meta.limits).await.map_err(int)?;
+            self.engine
+                .apply_limits(&name, &meta.limits)
+                .await
+                .map_err(int)?;
         }
         self.apply_storage_cap(&meta).await.map_err(int)?;
         if ports_changed {
@@ -3529,10 +3568,7 @@ impl PodControl for Svc {
     }
 
     /// `rustypods reload`: reread the conf from disk (hand edits) + apply.
-    async fn reload_pod_config(
-        &self,
-        req: Request<PodRef>,
-    ) -> Result<Response<Pod>, Status> {
+    async fn reload_pod_config(&self, req: Request<PodRef>) -> Result<Response<Pod>, Status> {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
@@ -3596,7 +3632,10 @@ impl PodControl for Svc {
             st.pods.insert(name.clone(), meta.clone());
         }
         if self.engine.running_pid(&name).await.is_some() {
-            self.engine.apply_limits(&name, &meta.limits).await.map_err(int)?;
+            self.engine
+                .apply_limits(&name, &meta.limits)
+                .await
+                .map_err(int)?;
         }
         self.apply_storage_cap(&meta).await.map_err(int)?;
         let leader = self.engine.running_pid(&name).await;
@@ -3842,12 +3881,7 @@ impl PodControl for Svc {
             let st = self.st.lock().await;
             st.pods.values().any(|m| m.ingress_gateway)
         };
-        let running = configured
-            && self
-                .engine
-                .running_pid(proto::INGRESS_POD)
-                .await
-                .is_some();
+        let running = configured && self.engine.running_pid(proto::INGRESS_POD).await.is_some();
         let (control_ready, generation, route_count) = if running {
             match ingress::gateway_status(&self.cfg.data_dir).await {
                 Ok(s) => (true, s.generation, s.route_count),
@@ -3872,10 +3906,7 @@ impl PodControl for Svc {
         }))
     }
 
-    async fn create_shm(
-        &self,
-        req: Request<ShmRequest>,
-    ) -> Result<Response<ShmSegment>, Status> {
+    async fn create_shm(&self, req: Request<ShmRequest>) -> Result<Response<ShmSegment>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
@@ -3993,9 +4024,7 @@ impl PodControl for Svc {
                 )));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Status::not_found(format!(
-                    "shm segment {name} not found"
-                )));
+                return Err(Status::not_found(format!("shm segment {name} not found")));
             }
             Err(e) => return Err(int(e)),
         }
@@ -4030,7 +4059,9 @@ impl PodControl for Svc {
             m.private_users
         };
         let Some(leader) = self.engine.running_pid(&name).await else {
-            return Err(Status::failed_precondition(format!("pod {name} is not running")));
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is not running"
+            )));
         };
         if leader == 0 {
             // Registered with machined but no leader yet — nsenter has
@@ -4040,9 +4071,16 @@ impl PodControl for Svc {
             )));
         }
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        crate::exec::run(start, &self.pod_rootfs(&name), leader, private_users, stream, tx)
-            .await
-            .map_err(int)?;
+        crate::exec::run(
+            start,
+            &self.pod_rootfs(&name),
+            leader,
+            private_users,
+            stream,
+            tx,
+        )
+        .await
+        .map_err(int)?;
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -4268,7 +4306,9 @@ impl PodControl for Svc {
         &self,
         req: Request<PodRef>,
     ) -> Result<Response<Self::ExportPodStream>, Status> {
-        Ok(Response::new(self.export_archive(&req.into_inner().name).await?))
+        Ok(Response::new(
+            self.export_archive(&req.into_inner().name).await?,
+        ))
     }
 
     async fn import_pod(
@@ -4278,7 +4318,6 @@ impl PodControl for Svc {
         let p = self.import_archive(req.into_inner()).await?;
         Ok(Response::new(p))
     }
-
 }
 
 /// Per-line cap for stream_logs: BufReader::lines() buffers a whole line
@@ -4409,7 +4448,10 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         .output()
         .context("id -u")?;
     if !uid_out.status.success() {
-        bail!("id -u {user} failed: {}", String::from_utf8_lossy(&uid_out.stderr).trim());
+        bail!(
+            "id -u {user} failed: {}",
+            String::from_utf8_lossy(&uid_out.stderr).trim()
+        );
     }
     let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
     let mut exp = SyncCommand::new("runuser")
@@ -4432,8 +4474,8 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         .take()
         .context("export stdout")
         .and_then(|mut out| {
-            let mut f = std::fs::File::create(&tmp)
-                .with_context(|| format!("create {}", tmp.display()))?;
+            let mut f =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
             std::io::copy(&mut out, &mut f)
                 .map(|_| ())
                 .context("reading podman export stream")
@@ -4457,15 +4499,19 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
 fn has_systemd_init(rootfs: &Path) -> bool {
     // Same leaf policy as resolve_in_rootfs: symlinked intermediates are
     // refused (no host-fs stat), a leaf symlink counts as existing.
-    ["usr/lib/systemd/systemd", "lib/systemd/systemd", "sbin/init"]
-        .iter()
-        .any(|p| {
-            crate::rootfs::safe_join_if_exists(rootfs, p)
-                .ok()
-                .flatten()
-                .map(|p| std::fs::symlink_metadata(&p).is_ok())
-                .unwrap_or(false)
-        })
+    [
+        "usr/lib/systemd/systemd",
+        "lib/systemd/systemd",
+        "sbin/init",
+    ]
+    .iter()
+    .any(|p| {
+        crate::rootfs::safe_join_if_exists(rootfs, p)
+            .ok()
+            .flatten()
+            .map(|p| std::fs::symlink_metadata(&p).is_ok())
+            .unwrap_or(false)
+    })
 }
 
 /// Resolve a payload argv[0] inside the rootfs: absolute paths checked
@@ -4487,7 +4533,14 @@ fn resolve_in_rootfs(rootfs: &Path, prog: &str) -> Option<String> {
     if prog.contains('/') {
         return exists(prog).then(|| prog.to_string());
     }
-    for d in ["usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "bin"] {
+    for d in [
+        "usr/local/sbin",
+        "usr/local/bin",
+        "usr/sbin",
+        "usr/bin",
+        "sbin",
+        "bin",
+    ] {
         if exists(&format!("{d}/{prog}")) {
             return Some(format!("/{d}/{prog}"));
         }
@@ -4660,9 +4713,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 std::fs::create_dir_all(shm_root)
                     .with_context(|| format!("mkdir {}", shm_root.display()))?;
             }
-            Err(e) => {
-                return Err(e).with_context(|| format!("stat {}", shm_root.display()))
-            }
+            Err(e) => return Err(e).with_context(|| format!("stat {}", shm_root.display())),
         }
         // Lock it down: root-owned, 0700. Skip the calls when already right —
         // a non-root daemon can't chmod a root-owned dir, but an already-
@@ -4968,8 +5019,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        probe_addr, restart_policy, snapshot_expired, supervised,
-        validate_ingress_conflicts, validate_ingress_conflicts_excluding,
+        probe_addr, restart_policy, snapshot_expired, supervised, validate_ingress_conflicts,
+        validate_ingress_conflicts_excluding,
     };
     use crate::state::{IngressSpec, LimitsSpec, PodMeta, State};
     use rustypods_proto::rpc::IngressRule;
@@ -5082,9 +5133,7 @@ mod tests {
             meta_with_ingress("taken", &["web.rustypods.localhost"]),
         );
         // A fresh host for a new pod is fine.
-        assert!(
-            validate_ingress_conflicts(&st, "new", &[rule("api.rustypods.localhost")]).is_ok()
-        );
+        assert!(validate_ingress_conflicts(&st, "new", &[rule("api.rustypods.localhost")]).is_ok());
         // Same host on another persisted pod — even stopped — conflicts.
         let e = validate_ingress_conflicts(&st, "new", &[rule("web.rustypods.localhost")]);
         assert!(e.is_err_and(|s| s.code() == tonic::Code::AlreadyExists));
@@ -5127,8 +5176,9 @@ mod tests {
             "outside".into(),
             meta_with_ingress("outside", &["c.rustypods.localhost"]),
         );
-        let desired: BTreeSet<String> =
-            ["s-web".to_string(), "s-api".to_string()].into_iter().collect();
+        let desired: BTreeSet<String> = ["s-web".to_string(), "s-api".to_string()]
+            .into_iter()
+            .collect();
         // Desired swap (web↔api hosts) passes — sibling stale rules are
         // ignored while the atomic desired set is applied.
         assert!(validate_ingress_conflicts_excluding(

@@ -96,7 +96,9 @@ pub(crate) mod duration_field {
             toml::Value::String(s) if s.is_empty() => Ok(0),
             toml::Value::String(s) => parse_duration(&s).map_err(serde::de::Error::custom),
             toml::Value::Integer(i) if i >= 0 => Ok(i as u64),
-            other => Err(serde::de::Error::custom(format!("invalid duration {other}"))),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid duration {other}"
+            ))),
         }
     }
 }
@@ -309,8 +311,8 @@ fn write_conf(path: &Path, body: &str) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("conf.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(body.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
         f.sync_all()
@@ -433,7 +435,11 @@ pub fn remove_image(data_dir: &Path, name: &str) {
 pub(crate) fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Result<()> {
     rustypods_proto::validate_name(&m.name)?;
     if m.name != stem {
-        anyhow::bail!("conf name '{}' does not match filename '{}.conf'", m.name, stem);
+        anyhow::bail!(
+            "conf name '{}' does not match filename '{}.conf'",
+            m.name,
+            stem
+        );
     }
     if m.net_index > 255 {
         anyhow::bail!("net_index {} out of range (pool is 1..=255)", m.net_index);
@@ -446,8 +452,7 @@ pub(crate) fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Resu
             .with_context(|| format!("invalid stack name '{}'", m.stack))?;
     }
     for spec in &m.ports {
-        rustypods_proto::validate_port(spec)
-            .with_context(|| format!("invalid port '{spec}'"))?;
+        rustypods_proto::validate_port(spec).with_context(|| format!("invalid port '{spec}'"))?;
     }
     // Ingress rules: full grammar check + no duplicate hosts within a pod
     // (global uniqueness across pods needs live state — the server does it).
@@ -499,7 +504,9 @@ fn scan<T: for<'de> Deserialize<'de>>(
     name_of: fn(&T) -> &str,
     check: fn(&T, &str) -> Result<()>,
 ) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("conf") {
@@ -529,7 +536,11 @@ fn scan<T: for<'de> Deserialize<'de>>(
 fn check_volume_meta(m: &VolumeMeta, stem: &str) -> Result<()> {
     rustypods_proto::validate_name(&m.name)?;
     if m.name != stem {
-        anyhow::bail!("conf name '{}' does not match filename '{}.conf'", m.name, stem);
+        anyhow::bail!(
+            "conf name '{}' does not match filename '{}.conf'",
+            m.name,
+            stem
+        );
     }
     Ok(())
 }
@@ -537,7 +548,11 @@ fn check_volume_meta(m: &VolumeMeta, stem: &str) -> Result<()> {
 fn check_image_meta(m: &ImageMeta, stem: &str) -> Result<()> {
     rustypods_proto::validate_name(&m.name)?;
     if m.name != stem {
-        anyhow::bail!("conf name '{}' does not match filename '{}.conf'", m.name, stem);
+        anyhow::bail!(
+            "conf name '{}' does not match filename '{}.conf'",
+            m.name,
+            stem
+        );
     }
     Ok(())
 }
@@ -598,7 +613,10 @@ pub fn load(data_dir: &Path) -> Result<State> {
         }
     }
     if gateways.len() > 1 {
-        anyhow::bail!("multiple pods claim ingress_gateway ({})", gateways.join(", "));
+        anyhow::bail!(
+            "multiple pods claim ingress_gateway ({})",
+            gateways.join(", ")
+        );
     }
     // …and the reserved name may ONLY be the gateway: an ordinary pod
     // conf squatting on it would shadow the managed one.
@@ -655,7 +673,9 @@ struct LegacyState {
 
 fn migrate_json(data_dir: &Path) {
     let f = data_dir.join("state.json");
-    let Ok(s) = std::fs::read_to_string(&f) else { return };
+    let Ok(s) = std::fs::read_to_string(&f) else {
+        return;
+    };
     let Ok(old) = serde_json::from_str::<LegacyState>(&s) else {
         tracing::warn!("state.json unparseable — left in place, starting with empty state");
         return;
@@ -663,7 +683,10 @@ fn migrate_json(data_dir: &Path) {
     for (name, i) in &old.images {
         // The name lands in a filename — never trust it unvalidated.
         if rustypods_proto::validate_name(&i.name).is_err() {
-            tracing::warn!("migrate: skipping image '{name}' — invalid name '{}'", i.name);
+            tracing::warn!(
+                "migrate: skipping image '{name}' — invalid name '{}'",
+                i.name
+            );
             continue;
         }
         let m = ImageMeta {

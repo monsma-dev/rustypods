@@ -10,7 +10,11 @@ use rustypods_proto::{fmt_bytes, parse_bytes, parse_duration, SOCKET_PATH};
 use tokio_stream::StreamExt;
 
 #[derive(Parser)]
-#[command(name = "rustypods", version, about = "nspawn pods on Btrfs — podman/distrobox-light")]
+#[command(
+    name = "rustypods",
+    version,
+    about = "nspawn pods on Btrfs — podman/distrobox-light"
+)]
 struct Cli {
     /// Path to the daemon socket (remote path when --remote is used).
     #[arg(long, global = true, default_value = SOCKET_PATH)]
@@ -482,7 +486,9 @@ async fn shell_exec(
     use tokio_stream::wrappers::ReceiverStream;
 
     let tty = std::io::stdin().is_terminal();
-    let user = user.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "root".into());
+    let user = user
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".into());
     let (rows, cols) = if tty { term_size() } else { (0, 0) };
     let mut env = Vec::new();
     for k in ["TERM", "COLORTERM", "LANG"] {
@@ -764,7 +770,13 @@ async fn cp_to_pod(
     let (argv, producer) = if dst_is_dir {
         // File or dir → extract inside the remote dir.
         (
-            vec!["tar".into(), "-C".into(), dst.into(), "-xf".into(), "-".into()],
+            vec![
+                "tar".into(),
+                "-C".into(),
+                dst.into(),
+                "-xf".into(),
+                "-".into(),
+            ],
             Producer::Tar { cwd: parent, base },
         )
     } else {
@@ -817,8 +829,7 @@ async fn cp_from_pod(
 
     if src_is_dir {
         // tar stream → extract on the host into dst (created if missing).
-        std::fs::create_dir_all(dst)
-            .with_context(|| format!("create {}", dst.display()))?;
+        std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
         let parent = std::path::Path::new(src)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -829,7 +840,14 @@ async fn cp_from_pod(
             cp_start(
                 pod,
                 user,
-                vec!["tar".into(), "-C".into(), parent, "-cf".into(), "-".into(), base],
+                vec![
+                    "tar".into(),
+                    "-C".into(),
+                    parent,
+                    "-cf".into(),
+                    "-".into(),
+                    base,
+                ],
             ),
         )
         .await?;
@@ -865,7 +883,11 @@ async fn cp_from_pod(
         }
     } else {
         // Single file → cat; dst is a dir → keep basename, else rename.
-        let target = if dst.is_dir() { dst.join(&base) } else { dst.to_path_buf() };
+        let target = if dst.is_dir() {
+            dst.join(&base)
+        } else {
+            dst.to_path_buf()
+        };
         let (tx, mut inbound) = exec_open(
             &sock,
             &remote,
@@ -906,7 +928,9 @@ async fn cp_cmd(
 ) -> Result<()> {
     let src_pod = split_pod_path(&src)?;
     let dst_pod = split_pod_path(&dst)?;
-    let user = user.or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "root".into());
+    let user = user
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".into());
     match (src_pod, dst_pod) {
         (Some((pod, sp)), None) => {
             cp_from_pod(sock, remote, &pod, &user, &sp, &PathBuf::from(&dst)).await
@@ -1282,10 +1306,7 @@ async fn main() -> Result<()> {
             IngressCmd::Init { image, install_ca } => {
                 let d = connect(cli.socket.clone(), cli.remote.clone())
                     .await?
-                    .init_ingress(InitIngressRequest {
-                        image,
-                        install_ca,
-                    })
+                    .init_ingress(InitIngressRequest { image, install_ca })
                     .await?
                     .into_inner();
                 let Some(pod) = d.pod else {
@@ -1308,11 +1329,14 @@ async fn main() -> Result<()> {
                         .into_inner()
                 };
                 println!("ca:    {}", d.ca_cert_path);
-                println!("trust: {}", if d.ca_installed {
-                    "installed into host store"
-                } else {
-                    "not installed (re-run with --install-ca or import the CA yourself)"
-                });
+                println!(
+                    "trust: {}",
+                    if d.ca_installed {
+                        "installed into host store"
+                    } else {
+                        "not installed (re-run with --install-ca or import the CA yourself)"
+                    }
+                );
                 print_pod(&pod);
             }
             IngressCmd::Status => {
@@ -1330,21 +1354,37 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Ping => {
-            let i = connect(cli.socket.clone(), cli.remote.clone()).await?.ping(PingRequest {}).await?.into_inner();
+            let i = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .ping(PingRequest {})
+                .await?
+                .into_inner();
             println!("rustypodsd v{}", i.version);
             println!("socket:   {}", i.socket_path);
             println!("data:     {}", i.data_dir);
             println!("machined: {}   btrfs: {}", i.machined, i.btrfs);
-            println!("storage:  {}   engine: {}", i.storage_driver, i.runtime_engine);
+            println!(
+                "storage:  {}   engine: {}",
+                i.storage_driver, i.runtime_engine
+            );
         }
         Cmd::Images => {
-            let l = connect(cli.socket.clone(), cli.remote.clone()).await?.list_images(ListImagesRequest {}).await?.into_inner();
+            let l = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .list_images(ListImagesRequest {})
+                .await?
+                .into_inner();
             for i in &l.images {
                 let mut extra = String::new();
                 if !i.entrypoint.is_empty() || !i.cmd.is_empty() {
                     extra = format!(
                         "  run: {}",
-                        i.entrypoint.iter().chain(i.cmd.iter()).cloned().collect::<Vec<_>>().join(" ")
+                        i.entrypoint
+                            .iter()
+                            .chain(i.cmd.iter())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" ")
                     );
                 }
                 println!("{:<20} {:<28} {}{}", i.name, i.source, i.path, extra);
@@ -1361,22 +1401,31 @@ async fn main() -> Result<()> {
                 cli.remote.clone(),
                 std::time::Duration::from_secs(600),
             )
-                .await?
-                .pull_image(PullImageRequest {
-                    reference,
-                    name: name.unwrap_or_default(),
-                })
-                .await?
-                .into_inner();
+            .await?
+            .pull_image(PullImageRequest {
+                reference,
+                name: name.unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
             println!("image {} → {}", img.name, img.path);
             if !img.entrypoint.is_empty() || !img.cmd.is_empty() {
                 println!(
                     "  runs non-boot: {}",
-                    img.entrypoint.iter().chain(img.cmd.iter()).cloned().collect::<Vec<_>>().join(" ")
+                    img.entrypoint
+                        .iter()
+                        .chain(img.cmd.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
             }
         }
-        Cmd::Import { from_distrobox, name, user } => {
+        Cmd::Import {
+            from_distrobox,
+            name,
+            user,
+        } => {
             let name = name.unwrap_or_else(|| format!("{from_distrobox}-base"));
             let user = match user {
                 Some(u) => u,
@@ -1388,22 +1437,49 @@ async fn main() -> Result<()> {
                 cli.remote.clone(),
                 std::time::Duration::from_secs(600),
             )
-                .await?
-                .import_image(ImportImageRequest {
-                    name: name.clone(),
-                    distrobox: from_distrobox,
-                    import_user: user,
-                })
-                .await?
-                .into_inner();
+            .await?
+            .import_image(ImportImageRequest {
+                name: name.clone(),
+                distrobox: from_distrobox,
+                import_user: user,
+            })
+            .await?
+            .into_inner();
             println!("image {} → {}", img.name, img.path);
         }
         Cmd::Rmi { name } => {
-            connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
+            connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .remove_image(ImageRef { name: name.clone() })
+                .await?;
             println!("image {name} removed");
         }
-        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, ingress, cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries, env, env_file, volume } => {
-            let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
+        Cmd::Create {
+            name,
+            image,
+            storage_max,
+            port,
+            desktop,
+            bind,
+            autostart,
+            ingress,
+            cmd,
+            restart,
+            health_cmd,
+            health_tcp,
+            health_http,
+            health_interval,
+            health_timeout,
+            health_retries,
+            env,
+            env_file,
+            volume,
+        } => {
+            let storage_max_bytes = storage_max
+                .as_deref()
+                .map(parse_bytes)
+                .transpose()?
+                .unwrap_or(0);
             if !port.is_empty() || !ingress.is_empty() {
                 eprintln!("note: --port/--ingress imply a private netns (--network-veth); the pod no longer shares host networking");
             }
@@ -1425,12 +1501,35 @@ async fn main() -> Result<()> {
             }
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, ingress: ingress_rules, desktop, binds: bind, limits: None, autostart, cmd, restart: restart.unwrap_or_default(), healthcheck, env, volumes: volume })
+                .create_pod(CreatePodRequest {
+                    name,
+                    image,
+                    storage_max_bytes,
+                    ports: port,
+                    ingress: ingress_rules,
+                    desktop,
+                    binds: bind,
+                    limits: None,
+                    autostart,
+                    cmd,
+                    restart: restart.unwrap_or_default(),
+                    healthcheck,
+                    env,
+                    volumes: volume,
+                })
                 .await?
                 .into_inner();
             print_pod(&p);
         }
-        Cmd::Start { name, memory_high, memory_max, cpu, ephemeral, private_users, no_private_users } => {
+        Cmd::Start {
+            name,
+            memory_high,
+            memory_max,
+            cpu,
+            ephemeral,
+            private_users,
+            no_private_users,
+        } => {
             let pu = if private_users {
                 Some(true)
             } else if no_private_users {
@@ -1452,7 +1551,11 @@ async fn main() -> Result<()> {
             println!("shell: rustypods shell {name}");
         }
         Cmd::Stop { name } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone()).await?.stop_pod(PodRef { name }).await?.into_inner();
+            let p = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .stop_pod(PodRef { name })
+                .await?
+                .into_inner();
             print_pod(&p);
         }
         Cmd::Restart { name } => {
@@ -1470,7 +1573,11 @@ async fn main() -> Result<()> {
             print_pod(&p);
         }
         Cmd::Ps => {
-            let l = connect(cli.socket.clone(), cli.remote.clone()).await?.list_pods(ListPodsRequest {}).await?.into_inner();
+            let l = connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .list_pods(ListPodsRequest {})
+                .await?
+                .into_inner();
             for p in &l.pods {
                 print_pod(p);
             }
@@ -1479,7 +1586,10 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Destroy { name } => {
-            connect(cli.socket.clone(), cli.remote.clone()).await?.destroy_pod(PodRef { name: name.clone() }).await?;
+            connect(cli.socket.clone(), cli.remote.clone())
+                .await?
+                .destroy_pod(PodRef { name: name.clone() })
+                .await?;
             println!("pod {name} destroyed");
         }
         Cmd::Clone { source, dest } => {
@@ -1516,7 +1626,12 @@ async fn main() -> Result<()> {
                 })
                 .await?
                 .into_inner();
-            println!("{} rolled back{}", p.name, to.map(|t| format!(" to {t}")).unwrap_or_else(|| " to latest".into()));
+            println!(
+                "{} rolled back{}",
+                p.name,
+                to.map(|t| format!(" to {t}"))
+                    .unwrap_or_else(|| " to latest".into())
+            );
             print_pod(&p);
         }
         Cmd::Snapshots { pod } => {
@@ -1623,19 +1738,26 @@ async fn main() -> Result<()> {
         Cmd::Rmsnap { pod, id } => {
             connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .delete_snapshot(SnapshotRef { pod, id: id.clone() })
+                .delete_snapshot(SnapshotRef {
+                    pod,
+                    id: id.clone(),
+                })
                 .await?;
             println!("snapshot {id} deleted");
         }
         Cmd::Apply { file } => {
-            let toml = std::fs::read(&file)
-                .with_context(|| format!("reading {}", file.display()))?;
+            let toml =
+                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             let r = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .apply_stack(ApplyStackRequest { toml })
                 .await?
                 .into_inner();
-            println!("stack {} applied ({} pods, shared netns)", r.name, r.pods.len());
+            println!(
+                "stack {} applied ({} pods, shared netns)",
+                r.name,
+                r.pods.len()
+            );
             for p in &r.pods {
                 print_pod(p);
             }
@@ -1680,7 +1802,35 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, ingress, clear_ingress, cmd, clear_cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries, clear_health, env, env_file, clear_env, volume, clear_volumes } => {
+        Cmd::Config {
+            name,
+            memory_high,
+            memory_max,
+            cpu,
+            storage_max,
+            bind,
+            clear_binds,
+            snap_keep,
+            snap_max_age,
+            autostart,
+            ingress,
+            clear_ingress,
+            cmd,
+            clear_cmd,
+            restart,
+            health_cmd,
+            health_tcp,
+            health_http,
+            health_interval,
+            health_timeout,
+            health_retries,
+            clear_health,
+            env,
+            env_file,
+            clear_env,
+            volume,
+            clear_volumes,
+        } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -1777,10 +1927,7 @@ async fn main() -> Result<()> {
                     ingress,
                     cmd,
                     snap_keep_last: snap_keep,
-                    snap_max_age_secs: snap_max_age
-                        .as_deref()
-                        .map(parse_duration)
-                        .transpose()?,
+                    snap_max_age_secs: snap_max_age.as_deref().map(parse_duration).transpose()?,
                     autostart,
                     restart,
                     healthcheck,
@@ -1819,9 +1966,7 @@ async fn main() -> Result<()> {
                     Ok(r) => r.into_inner(),
                     Err(e) => {
                         // A pod that doesn't exist will never produce logs.
-                        if !follow
-                            || e.code() == tonic::Code::NotFound
-                            || retries >= MAX_RECONNECTS
+                        if !follow || e.code() == tonic::Code::NotFound || retries >= MAX_RECONNECTS
                         {
                             return Err(e.into());
                         }
@@ -1933,14 +2078,23 @@ async fn main() -> Result<()> {
                 ShmCmd::Ls { pod } => {
                     let l = c.list_shm(PodRef { name: pod }).await?.into_inner();
                     for s in &l.segs {
-                        println!("{:<20} {:>10}  {}", s.name, fmt_bytes(s.size_bytes), s.host_path);
+                        println!(
+                            "{:<20} {:>10}  {}",
+                            s.name,
+                            fmt_bytes(s.size_bytes),
+                            s.host_path
+                        );
                     }
                     if l.segs.is_empty() {
                         println!("no segments");
                     }
                 }
                 ShmCmd::Rm { pod, name } => {
-                    c.remove_shm(ShmRef { pod, name: name.clone() }).await?;
+                    c.remove_shm(ShmRef {
+                        pod,
+                        name: name.clone(),
+                    })
+                    .await?;
                     println!("segment {name} removed");
                 }
             }
@@ -1957,17 +2111,9 @@ mod tests {
     fn collect_env_merges_file_and_flags() {
         let dir = std::env::temp_dir();
         let f = dir.join(format!("rustypods-env-test-{}.env", std::process::id()));
-        std::fs::write(
-            &f,
-            "# comment\n\nA=1\nB=two=parts\n  TRIM= spaced \n",
-        )
-        .unwrap();
+        std::fs::write(&f, "# comment\n\nA=1\nB=two=parts\n  TRIM= spaced \n").unwrap();
         // --env overrides a same-key file entry; new keys append.
-        let env = collect_env(
-            Some(&f),
-            vec!["A=flag".into(), "C=3".into()],
-        )
-        .unwrap();
+        let env = collect_env(Some(&f), vec!["A=flag".into(), "C=3".into()]).unwrap();
         assert_eq!(env, vec!["B=two=parts", "TRIM= spaced", "A=flag", "C=3"]);
         // Malformed file line → error naming file:line.
         std::fs::write(&f, "NOEQ\n").unwrap();
@@ -1984,8 +2130,16 @@ mod tests {
     #[test]
     fn create_cmd_accepts_hyphen_argv() {
         let cli = Cli::try_parse_from([
-            "rustypods", "create", "demo", "--image", "busybox-latest", "--autostart", "--cmd",
-            "sh", "-c", "echo ok",
+            "rustypods",
+            "create",
+            "demo",
+            "--image",
+            "busybox-latest",
+            "--autostart",
+            "--cmd",
+            "sh",
+            "-c",
+            "echo ok",
         ])
         .unwrap();
         let Cmd::Create { autostart, cmd, .. } = cli.cmd else {
@@ -1998,7 +2152,15 @@ mod tests {
     #[test]
     fn config_cmd_accepts_hyphen_argv() {
         let cli = Cli::try_parse_from([
-            "rustypods", "config", "demo", "--autostart", "on", "--cmd", "sh", "-c", "echo ok",
+            "rustypods",
+            "config",
+            "demo",
+            "--autostart",
+            "on",
+            "--cmd",
+            "sh",
+            "-c",
+            "echo ok",
         ])
         .unwrap();
         let Cmd::Config { autostart, cmd, .. } = cli.cmd else {

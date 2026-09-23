@@ -93,8 +93,7 @@ fn canonical_host(req: &Request) -> Result<String, Response> {
     let Some(s) = raw else {
         return Err(bad_request("missing Host"));
     };
-    let authority: http::uri::Authority =
-        s.parse().map_err(|_| bad_request("malformed Host"))?;
+    let authority: http::uri::Authority = s.parse().map_err(|_| bad_request("malformed Host"))?;
     let host = authority.host().to_ascii_lowercase();
     validate_ingress_rule(&IngressRule {
         host: host.clone(),
@@ -290,7 +289,10 @@ mod tests {
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
-            h.insert(HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
         }
         h
     }
@@ -327,10 +329,7 @@ mod tests {
             .uri("https://Demo.Rustypods.Localhost:8443/x")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(
-            canonical_host(&req).unwrap(),
-            "demo.rustypods.localhost"
-        );
+        assert_eq!(canonical_host(&req).unwrap(), "demo.rustypods.localhost");
     }
 
     #[tokio::test]
@@ -531,7 +530,10 @@ mod tests {
         ]);
         assert!(is_websocket_upgrade(&ws));
         assert!(!is_websocket_upgrade(&headers(&[("upgrade", "websocket")])));
-        assert!(!is_websocket_upgrade(&headers(&[("connection", "upgrade")])));
+        assert!(!is_websocket_upgrade(&headers(&[(
+            "connection",
+            "upgrade"
+        )])));
         let mut h = ws.clone();
         strip_hop_headers(&mut h, true);
         // Upgrade traffic keeps its handshake headers, loses spoofables.
@@ -636,7 +638,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let echo = tokio::time::timeout(T, ws.next()).await.unwrap().unwrap().unwrap();
+        let echo = tokio::time::timeout(T, ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(echo, Message::Text("hello-ws".into()));
 
         let blob = vec![0u8, 1, 2, 250, 255];
@@ -644,7 +650,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let echo = tokio::time::timeout(T, ws.next()).await.unwrap().unwrap().unwrap();
+        let echo = tokio::time::timeout(T, ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(echo, Message::Binary(blob.into()));
 
         let _ = tokio::time::timeout(T, ws.close(None)).await;

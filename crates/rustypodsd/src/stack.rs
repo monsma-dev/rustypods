@@ -47,7 +47,11 @@ pub struct StackPod {
     #[serde(default)]
     pub snap_keep_last: u32,
     /// Snapshot GC: drop commits older than this, e.g. "7d" (0 = unlimited).
-    #[serde(rename = "snap_max_age", default, with = "crate::state::duration_field")]
+    #[serde(
+        rename = "snap_max_age",
+        default,
+        with = "crate::state::duration_field"
+    )]
     pub snap_max_age_secs: u64,
     /// Payload override for this member — replaces the image
     /// entrypoint+cmd and forces non-boot mode.
@@ -78,7 +82,10 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
     rustypods_proto::validate_name(&def.name)
         .with_context(|| format!("invalid stack name '{}'", def.name))?;
     if def.pods.is_empty() {
-        bail!("stack '{}' has no pods — add a [pods.<name>] table", def.name);
+        bail!(
+            "stack '{}' has no pods — add a [pods.<name>] table",
+            def.name
+        );
     }
     let mut host_ports: BTreeSet<(u16, &str)> = BTreeSet::new();
     let mut ingress_hosts: BTreeSet<String> = BTreeSet::new();
@@ -131,7 +138,11 @@ fn host_port_key(spec: &str) -> (u16, &'static str) {
         "udp" => "udp",
         _ => "tcp",
     };
-    let hp = ports.split(':').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let hp = ports
+        .split(':')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     (hp, proto)
 }
 
@@ -145,7 +156,11 @@ mod tests {
 
     #[test]
     fn parses_minimal_stack() {
-        let d = parse("name = \"demo\"\n\n[pods.web]\nimage = \"arch-base\"\n", img).unwrap();
+        let d = parse(
+            "name = \"demo\"\n\n[pods.web]\nimage = \"arch-base\"\n",
+            img,
+        )
+        .unwrap();
         assert_eq!(d.name, "demo");
         assert_eq!(d.pods["web"].image, "arch-base");
         assert!(d.pods["web"].ports.is_empty());
@@ -208,7 +223,8 @@ ingress = ["web.rustypods.localhost:80", "web.rustypods.localhost:443"]
 "#;
         assert!(parse(self_dup, img).is_err());
         // Bad grammar surfaces the parse error.
-        let bad = "name = \"x\"\n[pods.a]\nimage = \"i\"\ningress = [\"WEB.rustypods.localhost:80\"]\n";
+        let bad =
+            "name = \"x\"\n[pods.a]\nimage = \"i\"\ningress = [\"WEB.rustypods.localhost:80\"]\n";
         assert!(parse(bad, img).is_err());
     }
 

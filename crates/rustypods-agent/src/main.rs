@@ -91,7 +91,11 @@ async fn run() -> Result<()> {
     let ch = Endpoint::try_from("http://[::]:0")?
         .connect_with_connector(service_fn(move |_: http::Uri| {
             let p = sock.clone();
-            async move { UnixStream::connect(p).await.map(hyper_util::rt::TokioIo::new) }
+            async move {
+                UnixStream::connect(p)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
         }))
         .await?;
     let mut client = AgentClient::new(ch);
@@ -118,7 +122,11 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    tracing::info!("rustypods-agent v{} → {}", env!("CARGO_PKG_VERSION"), POD_AGENT_SOCK);
+    tracing::info!(
+        "rustypods-agent v{} → {}",
+        env!("CARGO_PKG_VERSION"),
+        POD_AGENT_SOCK
+    );
     loop {
         if let Err(e) = run().await {
             tracing::warn!("daemon channel: {e:#}");

@@ -93,7 +93,10 @@ pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
         .pull_manifest_and_config(&image, &auth)
         .await
         .with_context(|| format!("pulling manifest for {image}"))?;
-    tracing::info!("{image}: manifest {digest}, {} layer(s)", manifest.layers.len());
+    tracing::info!(
+        "{image}: manifest {digest}, {} layer(s)",
+        manifest.layers.len()
+    );
     if manifest.layers.len() > MAX_LAYERS {
         bail!(
             "{image}: {} layers exceeds the {MAX_LAYERS}-layer cap",
@@ -205,7 +208,10 @@ async fn pull_layer(
     // The digest lands in the temp filename — a '/' or '..' in a malicious
     // descriptor would escape the images dir.
     if !is_sha256_digest(&layer.digest) {
-        bail!("{image}: layer digest '{}' is not sha256:<64 lowercase hex>", layer.digest);
+        bail!(
+            "{image}: layer digest '{}' is not sha256:<64 lowercase hex>",
+            layer.digest
+        );
     }
     let guard = TmpGuard::new(
         dest.parent().unwrap_or(dest),
@@ -364,7 +370,10 @@ pub(crate) fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
                     Some(l) if normalize_entry_path(&l).is_some()
                 );
                 if !ok {
-                    tracing::warn!("skipping hardlink {} with out-of-tree target", rel.display());
+                    tracing::warn!(
+                        "skipping hardlink {} with out-of-tree target",
+                        rel.display()
+                    );
                     continue;
                 }
             }
@@ -515,7 +524,10 @@ mod tests {
         t.resize(t.len() + 1024, 0); // tar end-of-archive blocks
         unpack_tar(&t[..], &dest).unwrap();
 
-        assert_eq!(std::fs::read_to_string(dest.join("d/f.txt")).unwrap(), "hey");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("d/f.txt")).unwrap(),
+            "hey"
+        );
         assert!(dest.join("d/sy").is_symlink());
         assert_eq!(std::fs::read(dest.join("d/hl-ok")).unwrap(), b"hey");
         assert!(!dest.join("d/pipe").exists());
@@ -682,10 +694,7 @@ mod tests {
         let dest2 = base.join("rootfs2");
         std::fs::create_dir_all(&dest2).unwrap();
         write_machine_id(&dest2).unwrap();
-        assert_eq!(
-            std::fs::read(dest2.join("etc/machine-id")).unwrap(),
-            b""
-        );
+        assert_eq!(std::fs::read(dest2.join("etc/machine-id")).unwrap(), b"");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -693,7 +702,10 @@ mod tests {
     fn digest_validation() {
         let good = format!("sha256:{}", "a".repeat(64));
         assert!(is_sha256_digest(&good));
-        assert!(is_sha256_digest(&format!("sha256:{}", "0123456789abcdef".repeat(4))));
+        assert!(is_sha256_digest(&format!(
+            "sha256:{}",
+            "0123456789abcdef".repeat(4)
+        )));
         assert!(!is_sha256_digest("sha256:abc")); // too short
         assert!(!is_sha256_digest(&format!("sha256:{}", "A".repeat(64)))); // uppercase
         assert!(!is_sha256_digest(&format!("sha512:{}", "a".repeat(64))));

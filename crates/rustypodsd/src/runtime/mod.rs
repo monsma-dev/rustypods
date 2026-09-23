@@ -8,8 +8,8 @@ pub mod nspawn;
 use anyhow::Result;
 use std::path::PathBuf;
 
-pub use nspawn::SystemdNspawn;
 use crate::state::LimitsSpec;
+pub use nspawn::SystemdNspawn;
 use rustypods_proto::BindSpec;
 
 /// Everything an engine needs to boot one pod.

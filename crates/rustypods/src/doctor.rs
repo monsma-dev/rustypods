@@ -52,7 +52,14 @@ fn daemon_path() -> std::ffi::OsString {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    for d in ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
+    for d in [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ] {
         let p = PathBuf::from(d);
         if !dirs.contains(&p) {
             dirs.push(p);
@@ -94,10 +101,7 @@ fn storage_check(target: &Path, fs: Option<&str>, btrfs_progs: Option<&Path>) ->
             ),
             None => (
                 Level::Fail,
-                format!(
-                    "{} is btrfs but btrfs-progs is missing",
-                    target.display()
-                ),
+                format!("{} is btrfs but btrfs-progs is missing", target.display()),
             ),
         },
         Some(fs) => (
@@ -324,7 +328,8 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         );
     } else {
         let fs = mount_fs_type(target);
-        let (level, detail) = storage_check(target, fs.as_deref(), find_executable("btrfs").as_deref());
+        let (level, detail) =
+            storage_check(target, fs.as_deref(), find_executable("btrfs").as_deref());
         chk!(level, "storage", "{detail}");
     }
 
@@ -374,18 +379,43 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         Ok(md) if md.is_file() => {
             use std::os::unix::fs::PermissionsExt;
             if md.permissions().mode() & 0o111 != 0 {
-                chk!(Level::Pass, "ingress", "{} installed + executable", ingress_bin.display());
+                chk!(
+                    Level::Pass,
+                    "ingress",
+                    "{} installed + executable",
+                    ingress_bin.display()
+                );
             } else if daemon_up {
-                chk!(Level::Fail, "ingress", "{} not executable", ingress_bin.display());
+                chk!(
+                    Level::Fail,
+                    "ingress",
+                    "{} not executable",
+                    ingress_bin.display()
+                );
             } else {
-                chk!(Level::Warn, "ingress", "{} not executable", ingress_bin.display());
+                chk!(
+                    Level::Warn,
+                    "ingress",
+                    "{} not executable",
+                    ingress_bin.display()
+                );
             }
         }
         _ => {
             if daemon_up {
-                chk!(Level::Fail, "ingress", "{} missing — reinstall the daemon binaries", ingress_bin.display());
+                chk!(
+                    Level::Fail,
+                    "ingress",
+                    "{} missing — reinstall the daemon binaries",
+                    ingress_bin.display()
+                );
             } else {
-                chk!(Level::Warn, "ingress", "{} not installed yet", ingress_bin.display());
+                chk!(
+                    Level::Warn,
+                    "ingress",
+                    "{} not installed yet",
+                    ingress_bin.display()
+                );
             }
         }
     }

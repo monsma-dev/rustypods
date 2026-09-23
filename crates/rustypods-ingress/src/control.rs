@@ -108,7 +108,13 @@ fn validate_snapshot(snap: &RouteSnapshot) -> Result<Routes> {
         })?;
         let ip = backend_ip(&r.backend_ip)?;
         if next
-            .insert(r.host.clone(), Backend { ip, port: r.backend_port as u16 })
+            .insert(
+                r.host.clone(),
+                Backend {
+                    ip,
+                    port: r.backend_port as u16,
+                },
+            )
             .is_some()
         {
             bail!("duplicate host '{}'", r.host);
@@ -128,10 +134,15 @@ impl IngressControl for ControlSvc {
         req: Request<RouteSnapshot>,
     ) -> Result<Response<RouteSnapshotAck>, Status> {
         let snap = req.into_inner();
-        let routes = validate_snapshot(&snap).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let routes =
+            validate_snapshot(&snap).map_err(|e| Status::invalid_argument(e.to_string()))?;
         let count = routes.len() as u32;
         self.state.commit(snap.generation, routes);
-        tracing::info!(generation = snap.generation, routes = count, "route snapshot applied");
+        tracing::info!(
+            generation = snap.generation,
+            routes = count,
+            "route snapshot applied"
+        );
         Ok(Response::new(RouteSnapshotAck {
             generation: snap.generation,
             route_count: count,
@@ -195,10 +206,7 @@ pub async fn serve(
                 let retry = e
                     .downcast_ref::<std::io::Error>()
                     .map(|io| {
-                        matches!(
-                            io.kind(),
-                            ErrorKind::PermissionDenied | ErrorKind::NotFound
-                        )
+                        matches!(io.kind(), ErrorKind::PermissionDenied | ErrorKind::NotFound)
                     })
                     .unwrap_or(false);
                 if !retry || std::time::Instant::now() >= deadline {
@@ -302,30 +310,49 @@ mod tests {
         assert_untouched(&st);
         // Bad backend port.
         let e = s
-            .replace_routes(snap(9, vec![route("b.rustypods.localhost", "10.220.7.2", 0)]))
+            .replace_routes(snap(
+                9,
+                vec![route("b.rustypods.localhost", "10.220.7.2", 0)],
+            ))
             .await;
         assert!(e.is_err_and(|s| s.code() == tonic::Code::InvalidArgument));
         assert_untouched(&st);
         // Backend IPs outside the pod endpoint shape.
-        for ip in ["192.168.1.2", "10.220.0.2", "10.220.7.1", "10.220.7.3", "::1", "nope"] {
+        for ip in [
+            "192.168.1.2",
+            "10.220.0.2",
+            "10.220.7.1",
+            "10.220.7.3",
+            "::1",
+            "nope",
+        ] {
             let e = s
                 .replace_routes(snap(9, vec![route("b.rustypods.localhost", ip, 80)]))
                 .await;
-            assert!(e.is_err_and(|s| s.code() == tonic::Code::InvalidArgument), "{ip}");
+            assert!(
+                e.is_err_and(|s| s.code() == tonic::Code::InvalidArgument),
+                "{ip}"
+            );
             assert_untouched(&st);
         }
         // Duplicate host within the snapshot.
         let e = s
             .replace_routes(snap(
                 9,
-                vec![ok_route("a.rustypods.localhost"), ok_route("a.rustypods.localhost")],
+                vec![
+                    ok_route("a.rustypods.localhost"),
+                    ok_route("a.rustypods.localhost"),
+                ],
             ))
             .await;
         assert!(e.is_err_and(|s| s.code() == tonic::Code::InvalidArgument));
         assert_untouched(&st);
         // Over the ceiling — build via repeat to keep the test cheap.
         let e = s
-            .replace_routes(snap(9, vec![ok_route("x.rustypods.localhost"); MAX_ROUTES + 1]))
+            .replace_routes(snap(
+                9,
+                vec![ok_route("x.rustypods.localhost"); MAX_ROUTES + 1],
+            ))
             .await;
         assert!(e.is_err_and(|s| s.code() == tonic::Code::InvalidArgument));
         assert_untouched(&st);
@@ -340,9 +367,15 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!((st0.generation, st0.route_count), (0, 0));
-        s.replace_routes(snap(3, vec![ok_route("a.rustypods.localhost"), ok_route("b.rustypods.localhost")]))
-            .await
-            .unwrap();
+        s.replace_routes(snap(
+            3,
+            vec![
+                ok_route("a.rustypods.localhost"),
+                ok_route("b.rustypods.localhost"),
+            ],
+        ))
+        .await
+        .unwrap();
         let st1 = s
             .get_status(Request::new(IngressStatusRequest {}))
             .await
@@ -379,14 +412,21 @@ mod tests {
         assert!(sock.exists());
         // Socket must be root-only.
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         let dial = sock.clone();
         let ch = Endpoint::try_from("http://[::]:0")
             .unwrap()
             .connect_with_connector(service_fn(move |_: http::Uri| {
                 let p = dial.clone();
-                async move { tokio::net::UnixStream::connect(p).await.map(hyper_util::rt::TokioIo::new) }
+                async move {
+                    tokio::net::UnixStream::connect(p)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
+                }
             }))
             .await
             .unwrap();

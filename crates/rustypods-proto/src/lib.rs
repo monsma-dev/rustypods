@@ -107,11 +107,9 @@ pub fn validate_snapshot_id(id: &str) -> anyhow::Result<&str> {
 pub fn validate_container_ref(s: &str) -> anyhow::Result<&str> {
     let ok = !s.is_empty()
         && s.len() <= 64
-        && s
-            .chars()
+        && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
-        && s
-            .chars()
+        && s.chars()
             .next()
             .map(|c| c.is_ascii_alphanumeric())
             .unwrap_or(false);
@@ -138,13 +136,11 @@ pub fn username_for_uid(text: &str, uid: u32) -> Option<String> {
 pub fn validate_unix_user(u: &str) -> anyhow::Result<&str> {
     let ok = !u.is_empty()
         && u.len() <= 32
-        && u
-            .chars()
+        && u.chars()
             .next()
             .map(|c| c.is_ascii_lowercase() || c == '_')
             .unwrap_or(false)
-        && u
-            .chars()
+        && u.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
     if ok {
         Ok(u)
@@ -242,9 +238,7 @@ fn validate_ingress_host(host: &str) -> anyhow::Result<()> {
             anyhow::bail!("host '{host}': label '{label}' may only contain [a-z0-9-]");
         }
         let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-        if !alnum(*label.as_bytes().first().unwrap())
-            || !alnum(*label.as_bytes().last().unwrap())
-        {
+        if !alnum(*label.as_bytes().first().unwrap()) || !alnum(*label.as_bytes().last().unwrap()) {
             anyhow::bail!(
                 "host '{host}': label '{label}' must start and end with a letter or digit"
             );
@@ -290,7 +284,9 @@ pub fn validate_bind(spec: &str) -> anyhow::Result<BindSpec> {
     if ro {
         parts.pop();
     }
-    let bad = |spec: &str| anyhow::anyhow!("invalid bind '{spec}' — expected host[:pod][:ro], absolute paths");
+    let bad = |spec: &str| {
+        anyhow::anyhow!("invalid bind '{spec}' — expected host[:pod][:ro], absolute paths")
+    };
     let (host, pod) = match parts.as_slice() {
         [h] => (*h, *h),
         [h, p] => (*h, *p),
@@ -303,20 +299,41 @@ pub fn validate_bind(spec: &str) -> anyhow::Result<BindSpec> {
     // deny-lists can't be bypassed by spelling a denied path differently.
     // Nonexistent host paths are rejected here — pods can't bind paths that
     // don't exist yet.
-    let resolved = std::fs::canonicalize(host).map_err(|_| {
-        anyhow::anyhow!("invalid bind '{spec}' — host path {host} does not exist")
-    })?;
+    let resolved = std::fs::canonicalize(host)
+        .map_err(|_| anyhow::anyhow!("invalid bind '{spec}' — host path {host} does not exist"))?;
     let host_resolved = resolved.to_string_lossy().into_owned();
     const EXACT_DENY: &[&str] = &[
-        "/", "/proc", "/sys", "/dev", "/boot", "/usr", "/etc", "/var", "/var/lib", "/run",
-        "/root", "/var/run", "/var/spool", "/var/cron",
+        "/",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/boot",
+        "/usr",
+        "/etc",
+        "/var",
+        "/var/lib",
+        "/run",
+        "/root",
+        "/var/run",
+        "/var/spool",
+        "/var/cron",
     ];
     if EXACT_DENY.contains(&host) || EXACT_DENY.contains(&host_resolved.as_str()) {
-        return Err(anyhow::anyhow!("invalid bind '{spec}' — host path {host} may not be bound wholesale"));
+        return Err(anyhow::anyhow!(
+            "invalid bind '{spec}' — host path {host} may not be bound wholesale"
+        ));
     }
     const RW_DENY: &[&str] = &[
-        "/run", "/var/lib/rustypods", "/etc", "/usr", "/boot", "/proc", "/sys", "/dev",
-        "/root", "/var/run",
+        "/run",
+        "/var/lib/rustypods",
+        "/etc",
+        "/usr",
+        "/boot",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/root",
+        "/var/run",
     ];
     if !ro
         && (RW_DENY.iter().any(|p| under(host, p))
@@ -455,7 +472,9 @@ pub fn validate_healthcheck(h: &rpc::HealthCheck) -> anyhow::Result<()> {
                 .map(|(_, p)| p)
                 .unwrap_or(t)
                 .parse::<u16>()
-                .map_err(|_| anyhow::anyhow!("invalid tcp probe target '{t}' — want :port or host:port"))?;
+                .map_err(|_| {
+                    anyhow::anyhow!("invalid tcp probe target '{t}' — want :port or host:port")
+                })?;
             if port == 0 {
                 anyhow::bail!("invalid tcp probe target '{t}' — port 0");
             }
@@ -472,7 +491,9 @@ pub fn validate_healthcheck(h: &rpc::HealthCheck) -> anyhow::Result<()> {
                     anyhow::bail!("invalid http probe target '{t}' — host must be a numeric IP");
                 }
             } else {
-                anyhow::bail!("invalid http probe target '{t}' — want /path or http://ip:port/path");
+                anyhow::bail!(
+                    "invalid http probe target '{t}' — want /path or http://ip:port/path"
+                );
             }
         }
         other => anyhow::bail!("invalid healthcheck kind '{other}' — exec|tcp|http"),
@@ -493,7 +514,9 @@ pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
         Some(b'B') | Some(b'b') => (&s[..s.len() - 1], 1u64),
         _ => (s, 1u64),
     };
-    let v: f64 = num.parse().map_err(|_| anyhow::anyhow!("invalid size '{s}'"))?;
+    let v: f64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid size '{s}'"))?;
     f64_to_u64(v, mult, "size", s)
 }
 
@@ -585,7 +608,10 @@ mod tests {
         assert_eq!(username_for_uid(text, 0).as_deref(), Some("root"));
         assert_eq!(username_for_uid(text, 1234), None);
         // Malformed lines are skipped, not fatal.
-        assert_eq!(username_for_uid("badline\nnick:x:1000:g:::", 1000).as_deref(), Some("nick"));
+        assert_eq!(
+            username_for_uid("badline\nnick:x:1000:g:::", 1000).as_deref(),
+            Some("nick")
+        );
         assert_eq!(username_for_uid("", 1000), None);
     }
 
@@ -635,7 +661,14 @@ mod tests {
     #[test]
     fn bind_validation() {
         let b = validate_bind("/var/tmp").unwrap();
-        assert_eq!(b, BindSpec { host: "/var/tmp".into(), pod: "/var/tmp".into(), ro: false });
+        assert_eq!(
+            b,
+            BindSpec {
+                host: "/var/tmp".into(),
+                pod: "/var/tmp".into(),
+                ro: false
+            }
+        );
         assert!(validate_bind("/tmp").is_ok());
         // /run itself may not be bound wholesale, not even read-only;
         // subpaths are :ro-only.
@@ -692,7 +725,9 @@ mod tests {
         assert!(parse_ingress_rule("web.example.com:80").is_err());
         assert!(parse_ingress_rule("10.0.0.1:80").is_err());
         assert!(parse_ingress_rule(&format!("{}.rustypods.localhost:80", "a".repeat(64))).is_err());
-        assert!(parse_ingress_rule(&format!("{}.rustypods.localhost:80", "a".repeat(240))).is_err());
+        assert!(
+            parse_ingress_rule(&format!("{}.rustypods.localhost:80", "a".repeat(240))).is_err()
+        );
         // Ports: 0, >65535, non-numeric, missing.
         assert!(parse_ingress_rule("web.rustypods.localhost:0").is_err());
         assert!(parse_ingress_rule("web.rustypods.localhost:65536").is_err());
@@ -761,12 +796,12 @@ mod tests {
         assert!(v.ro);
         // RW must not carry the suffix; bad names/targets rejected.
         assert!(parse_volume_spec("data:/x").is_ok());
-        assert!(parse_volume_spec("data").is_err());           // no target
-        assert!(parse_volume_spec("data:relative").is_err());  // not absolute
-        assert!(parse_volume_spec("data:/x:rw").is_err());     // unknown flag
+        assert!(parse_volume_spec("data").is_err()); // no target
+        assert!(parse_volume_spec("data:relative").is_err()); // not absolute
+        assert!(parse_volume_spec("data:/x:rw").is_err()); // unknown flag
         assert!(parse_volume_spec("bad name:/x").is_err());
         assert!(parse_volume_spec("../x:/x").is_err());
-        assert!(parse_volume_spec("data:/").is_err());         // can't mount over /
+        assert!(parse_volume_spec("data:/").is_err()); // can't mount over /
         assert!(parse_volume_spec("data:/x:ro:extra").is_err());
     }
 
@@ -774,14 +809,14 @@ mod tests {
     fn env_validation() {
         assert!(validate_env(&["A=1".into(), "B_TWO=x=y".into()]).is_ok());
         assert!(validate_env(&[]).is_ok());
-        assert!(validate_env(&["=x".into()]).is_err());        // empty key
-        assert!(validate_env(&["NOEQ".into()]).is_err());      // no '='
+        assert!(validate_env(&["=x".into()]).is_err()); // empty key
+        assert!(validate_env(&["NOEQ".into()]).is_err()); // no '='
         assert!(validate_env(&["A".into()]).is_err());
-        assert!(validate_env(&["1A=x".into()]).is_err());      // key starts digit
-        assert!(validate_env(&["A-B=x".into()]).is_err());     // bad key char
-        assert!(validate_env(&["_A=x".into()]).is_ok());       // '_' ok
-        assert!(validate_env(&["A=".into()]).is_ok());         // empty value ok
-        // Duplicate keys are legal — the pod-level merge keeps the last.
+        assert!(validate_env(&["1A=x".into()]).is_err()); // key starts digit
+        assert!(validate_env(&["A-B=x".into()]).is_err()); // bad key char
+        assert!(validate_env(&["_A=x".into()]).is_ok()); // '_' ok
+        assert!(validate_env(&["A=".into()]).is_ok()); // empty value ok
+                                                       // Duplicate keys are legal — the pod-level merge keeps the last.
         assert!(validate_env(&["A=1".into(), "A=2".into()]).is_ok());
     }
 

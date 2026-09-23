@@ -8,7 +8,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rustypods_proto as proto;
 use rustypods_proto::rpc::ingress_control_client::IngressControlClient;
-use rustypods_proto::rpc::{ActiveIngressRoute, IngressStatus, IngressStatusRequest, RouteSnapshot, RouteSnapshotAck};
+use rustypods_proto::rpc::{
+    ActiveIngressRoute, IngressStatus, IngressStatusRequest, RouteSnapshot, RouteSnapshotAck,
+};
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
@@ -52,17 +54,12 @@ pub fn build_snapshot(
     // Deterministic order — pod-map iteration is unordered, and the
     // daemon dedups pushes by comparing route sets for equality.
     routes.sort_by(|a, b| a.host.cmp(&b.host));
-    Ok(RouteSnapshot {
-        generation,
-        routes,
-    })
+    Ok(RouteSnapshot { generation, routes })
 }
 
 /// Connect to the gateway control UDS: 1s connect, 2s per-request bound —
 /// a hung dataplane must not stall the daemon's pod-lock caller forever.
-async fn control_client(
-    data_dir: &Path,
-) -> Result<IngressControlClient<Channel>> {
+async fn control_client(data_dir: &Path) -> Result<IngressControlClient<Channel>> {
     let sock = proto::ingress_socket(data_dir);
     let ch = Endpoint::try_from("http://[::]:0")?
         .connect_timeout(std::time::Duration::from_secs(1))
@@ -105,8 +102,7 @@ pub async fn push_snapshot(data_dir: &Path, snapshot: RouteSnapshot) -> Result<R
 /// Gateway dataplane status (generation + live route count).
 pub async fn gateway_status(data_dir: &Path) -> Result<IngressStatus> {
     let mut c = control_client(data_dir).await?;
-    Ok(c
-        .get_status(IngressStatusRequest {})
+    Ok(c.get_status(IngressStatusRequest {})
         .await
         .context("ingress status")?
         .into_inner())

@@ -18,7 +18,11 @@ use rustypods_proto::rpc::pod_control_client::PodControlClient;
 #[allow(dead_code)] // the Child field is kept for kill_on_drop teardown
 enum Conn {
     Unix(UnixStream),
-    Ssh(tokio::process::ChildStdout, tokio::process::ChildStdin, tokio::process::Child),
+    Ssh(
+        tokio::process::ChildStdout,
+        tokio::process::ChildStdin,
+        tokio::process::Child,
+    ),
 }
 
 impl tokio::io::AsyncRead for Conn {
@@ -112,7 +116,9 @@ pub async fn connect_timeout(
 ) -> Result<PodControlClient<Channel>> {
     let err_hint = match &remote {
         Some(d) => format!("connecting to rustypodsd via {d} — ssh up? socat installed remotely?"),
-        None => "connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)".into(),
+        None => {
+            "connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)".into()
+        }
     };
     let ch = Endpoint::try_from("http://[::]:0")?
         // Bound each call so a wedged daemon can't hang the CLI/GUI

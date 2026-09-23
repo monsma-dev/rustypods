@@ -10,9 +10,9 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
 
+use super::{RuntimeEngine, StartSpec};
 use crate::dbus;
 use crate::state::LimitsSpec;
-use super::{RuntimeEngine, StartSpec};
 
 /// Pure argv builder — unit-testable.
 pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
@@ -180,8 +180,8 @@ mod tests {
             rootfs: PathBuf::from("/pods/dev"),
             ephemeral,
             private_users: pu,
-            agent_bin: PathBuf::from("/bin"),           // exists → agent bind
-            run_dir: PathBuf::from("/bin"),             // exists → run bind
+            agent_bin: PathBuf::from("/bin"), // exists → agent bind
+            run_dir: PathBuf::from("/bin"),   // exists → run bind
             shm_dir: PathBuf::from("/definitely-missing"), // skipped
             ports: vec![],
             network_veth: false,
@@ -279,6 +279,8 @@ mod tests {
         let a = argv(&spec(false, false));
         assert!(a.contains(&"--boot".to_string()));
         assert!(!a.iter().any(|s| s == "--"));
-        assert!(!a.iter().any(|s| s.starts_with("--setenv") || s.starts_with("--chdir")));
+        assert!(!a
+            .iter()
+            .any(|s| s.starts_with("--setenv") || s.starts_with("--chdir")));
     }
 }

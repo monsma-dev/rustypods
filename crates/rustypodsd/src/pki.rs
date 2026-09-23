@@ -36,9 +36,7 @@ impl PkiPaths {
 /// Cert shapes, kept as functions so tests can inspect the parameters
 /// without parsing DER.
 fn ca_params() -> Result<rcgen::CertificateParams> {
-    use rcgen::{
-        BasicConstraints, DnType, IsCa, KeyUsagePurpose,
-    };
+    use rcgen::{BasicConstraints, DnType, IsCa, KeyUsagePurpose};
     let mut p = rcgen::CertificateParams::new(Vec::<String>::new())?;
     p.distinguished_name
         .push(DnType::CommonName, "RustyPods Local Development CA");
@@ -124,7 +122,11 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
     if md.uid() != unsafe { libc::geteuid() } {
-        bail!("{} is owned by uid {} — PKI dir must be daemon-owned", dir.display(), md.uid());
+        bail!(
+            "{} is owned by uid {} — PKI dir must be daemon-owned",
+            dir.display(),
+            md.uid()
+        );
     }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("chmod 0700 {}", dir.display()))?;
@@ -135,8 +137,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// private keys with no group/other bits.
 fn check_existing(paths: &PkiPaths) -> Result<()> {
     for p in paths.all() {
-        let md = std::fs::symlink_metadata(p)
-            .with_context(|| format!("stat {}", p.display()))?;
+        let md = std::fs::symlink_metadata(p).with_context(|| format!("stat {}", p.display()))?;
         if !md.file_type().is_file() {
             bail!("{} is not a regular file", p.display());
         }
@@ -163,11 +164,7 @@ pub fn ensure(data_dir: &Path) -> Result<PkiPaths> {
     let dir = data_dir.join("pki");
     ensure_dir(&dir)?;
     let paths = PkiPaths::at(&dir);
-    let present: Vec<&PathBuf> = paths
-        .all()
-        .into_iter()
-        .filter(|p| p.exists())
-        .collect();
+    let present: Vec<&PathBuf> = paths.all().into_iter().filter(|p| p.exists()).collect();
     match present.len() {
         4 => {
             check_existing(&paths)?;
@@ -217,7 +214,13 @@ fn trust_target(os_release: &str) -> Option<(PathBuf, &'static str, Vec<&'static
     }
     let debian = ["debian", "ubuntu", "linuxmint", "pop"];
     let rhel = [
-        "fedora", "rhel", "centos", "almalinux", "rocky", "ol", "fedora-asahi-remix",
+        "fedora",
+        "rhel",
+        "centos",
+        "almalinux",
+        "rocky",
+        "ol",
+        "fedora-asahi-remix",
     ];
     let arch = ["arch", "manjaro", "endeavouros", "garuda"];
     let has_like = |set: &[&str]| id_like.split_whitespace().any(|t| set.contains(&t));
@@ -250,27 +253,27 @@ fn trust_target(os_release: &str) -> Option<(PathBuf, &'static str, Vec<&'static
 /// restored on update-command failure; a symlinked destination is
 /// refused outright.
 pub fn install_host_trust(paths: &PkiPaths) -> Result<PathBuf> {
-    let os_release = std::fs::read_to_string("/etc/os-release")
-        .context("read /etc/os-release")?;
+    let os_release = std::fs::read_to_string("/etc/os-release").context("read /etc/os-release")?;
     let Some((dest, cmd, args)) = trust_target(&os_release) else {
         bail!("unsupported distro family for system CA trust install");
     };
     if let Ok(md) = std::fs::symlink_metadata(&dest) {
         if md.file_type().is_symlink() {
-            bail!("{} is a symlink — refusing to write through it", dest.display());
+            bail!(
+                "{} is a symlink — refusing to write through it",
+                dest.display()
+            );
         }
     }
-    let ca_pem = std::fs::read(&paths.ca_crt)
-        .with_context(|| format!("read {}", paths.ca_crt.display()))?;
+    let ca_pem =
+        std::fs::read(&paths.ca_crt).with_context(|| format!("read {}", paths.ca_crt.display()))?;
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let backup = dest.with_extension("crt.rustypods-bak");
     let had_prior = dest.exists();
     if had_prior {
-        std::fs::copy(&dest, &backup)
-            .with_context(|| format!("backup {}", dest.display()))?;
+        std::fs::copy(&dest, &backup).with_context(|| format!("backup {}", dest.display()))?;
     }
     let write = atomic_write(&dest, &ca_pem, 0o644);
     let run = write.and_then(|()| {
@@ -388,7 +391,10 @@ mod tests {
         let ca = ca_p.self_signed(&ca_key).unwrap();
         let issuer = rcgen::Issuer::new(ca_p, ca_key);
         let leaf_key = rcgen::KeyPair::generate().unwrap();
-        let leaf = leaf_params().unwrap().signed_by(&leaf_key, &issuer).unwrap();
+        let leaf = leaf_params()
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
         assert!(ca.pem().contains("BEGIN CERTIFICATE"));
         assert!(leaf.pem().contains("BEGIN CERTIFICATE"));
     }
@@ -396,7 +402,10 @@ mod tests {
     #[test]
     fn trust_target_families() {
         let (d, c, a) = trust_target("ID=debian\n").unwrap();
-        assert_eq!(d.to_str().unwrap(), "/usr/local/share/ca-certificates/rustypods-local-ca.crt");
+        assert_eq!(
+            d.to_str().unwrap(),
+            "/usr/local/share/ca-certificates/rustypods-local-ca.crt"
+        );
         assert_eq!(c, "update-ca-certificates");
         assert!(a.is_empty());
         let (_, c, a) = trust_target("ID=\"fedora\"\n").unwrap();
