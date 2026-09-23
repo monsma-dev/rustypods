@@ -336,14 +336,21 @@ rides inside the encrypted tunnel.
   pod/peer lifecycle edges (set_local_names diffs to stay quiet).
 - Trust boundary: datagrams must arrive decapsulated AND with src ==
   exactly `fd<peer>::1`; registry values are sanitized to the
-  announcer's own /48 (sanitize_registry) — a peer can't name our
-  space or a third host's. Entries TTL out after 95s silent.
+  announcer's own /48 AND valid ≤63-char DNS labels, capped at 1024
+  entries (sanitize_registry) — a peer can't name our space, a third
+  host's, or grow our memory unboundedly. Entries TTL out after 95s
+  silent.
+- Name conflicts are deterministic: local registry always wins; among
+  peers claiming the same name the LOWEST peer /48 wins (HashMap
+  iteration is nondeterministic — never first-wins over .values()).
 - DNS responder answers single-label names (`db`, `db.rp`, `db.pods`,
   `db.local` suffixes stripped) with AAAA from the merged registry;
-  A → NODATA (v6-only mesh); everything else relays verbatim to
-  net::upstream_resolver() (prefers /run/systemd/resolve/resolv.conf
-  over the 127.0.0.53 stub) with a 3s timeout. canon_ep again — the
-  upstream is usually a v4 stub.
+  A → NODATA (v6-only mesh); everything else relays verbatim upstream
+  over UDP AND TCP (:53 both — RFC 1035 requires TCP for truncation).
+  Upstream is re-read per query (net::upstream_resolver prefers
+  /run/systemd/resolve/resolv.conf over the 127.0.0.53 stub) — a
+  cached resolver goes stale when the host roams networks. canon_ep
+  again — the upstream is usually a v4 stub.
 - Pod wiring: at start, networked standalone pods get
   run/resolv.conf (`nameserver fd<host>::1` + real upstream fallback
   + `search rp pods`) ro-bound over /etc/resolv.conf; the target is
@@ -360,9 +367,15 @@ rides inside the encrypted tunnel.
   outbound packets made replies "established". ensure_mesh_input
   inserts `iifname { "ve-*", "rp-mesh*" } ip6 saddr fd00::/8` +
   `udp dport <wg_port>` accepts at the top of ip6/inet/ip INPUT
-  chains (marker rustypods-mesh-in). Wildcard iifname values need
-  real quotes in nft — pass rule args as explicit argv tokens, not
-  a whitespace-split string.
+  chains (marker rustypods-mesh-in). Presence is probed PER RULE
+  (iifname wildcard / `udp dport <port>`), not per chain — a changed
+  listen_port must still install, and stale old-port accepts are
+  deleted by handle. Wildcard iifname values need real quotes in
+  nft — pass rule args as explicit argv tokens, not a whitespace-
+  split string.
+- Hard-won: roaming-endpoint rebinds must also DELETE the old
+  endpoint→key map entry — a stale mapping would misattribute future
+  datagrams arriving from the old address.
 
 ## REST API surface (Wave G)
 

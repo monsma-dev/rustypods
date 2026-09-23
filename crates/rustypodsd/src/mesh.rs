@@ -32,7 +32,8 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{watch, Mutex};
 
 use crate::net;
@@ -184,8 +185,10 @@ pub struct Mesh {
     /// --- Mesh-DNS (Wave K) ---
     /// This daemon's addr on the mesh: `fd<host>::1` on the TUN.
     pub host_addr: Ipv6Addr,
-    /// Pod-facing DNS responder bound to [fd<host>::1]:53.
+    /// Pod-facing DNS responder bound to [fd<host>::1]:53 — UDP for
+    /// the fast path, TCP for truncation/robustness (RFC 1035 §4.2).
     dns: UdpSocket,
+    dns_tcp: TcpListener,
     /// Registry gossip bound to [fd<host>::1]:5305 — packets only
     /// arrive here after WireGuard decapsulation, and senders are
     /// validated to be exactly a peer's fd<peer>::1.
@@ -319,6 +322,9 @@ impl Mesh {
         let dns = UdpSocket::bind((host, DNS_PORT))
             .await
             .with_context(|| format!("bind mesh dns [{host}]:{DNS_PORT}"))?;
+        let dns_tcp = TcpListener::bind((host, DNS_PORT))
+            .await
+            .with_context(|| format!("bind mesh dns/tcp [{host}]:{DNS_PORT}"))?;
         let gossip = UdpSocket::bind((host, GOSSIP_PORT))
             .await
             .with_context(|| format!("bind mesh gossip [{host}]:{GOSSIP_PORT}"))?;
@@ -361,6 +367,7 @@ impl Mesh {
             supervisor: Mutex::new(None),
             host_addr: host,
             dns,
+            dns_tcp,
             gossip,
             local_names: Mutex::new(Default::default()),
             remote_names: Mutex::new(Default::default()),
@@ -394,6 +401,7 @@ impl Mesh {
         tasks.push(tokio::spawn(mesh.clone().gossip_rx()));
         tasks.push(tokio::spawn(mesh.clone().announcer()));
         tasks.push(tokio::spawn(mesh.clone().dns_server()));
+        tasks.push(tokio::spawn(mesh.clone().dns_tcp_server()));
         drop(tasks);
         Ok(mesh)
     }
@@ -684,13 +692,17 @@ impl Mesh {
                     }
                 }
                 if let Some(k) = found {
-                    self.endpoints.lock().await.insert(src, k);
+                    let mut eps = self.endpoints.lock().await;
                     if let Some(p) = peers.get_mut(&k) {
                         if p.endpoint != src {
                             tracing::info!("mesh peer {} roamed → {src}", p.pubkey_b64);
+                            // Drop the stale mapping — a future datagram
+                            // from the old endpoint must not re-attribute.
+                            eps.remove(&p.endpoint);
                             p.endpoint = src;
                         }
                     }
+                    eps.insert(src, k);
                 }
                 found
             }
@@ -761,15 +773,20 @@ impl Mesh {
         }
     }
 
-    /// Resolve a pod name across local + remote registries.
+    /// Resolve a pod name across local + remote registries. Local
+    /// always wins; among peers claiming the same name the lowest
+    /// peer /48 wins — HashMap iteration order is nondeterministic,
+    /// so a conflict must resolve the same way on every query.
     async fn resolve(&self, name: &str) -> Option<Ipv6Addr> {
         if let Some(a) = self.local_names.lock().await.get(name) {
             return Some(*a);
         }
         let r = self.remote_names.lock().await;
-        r.values()
-            .filter(|(t, _)| t.elapsed() < NAME_TTL)
-            .find_map(|(_, reg)| reg.get(name).copied())
+        r.iter()
+            .filter(|(_, (t, _))| t.elapsed() < NAME_TTL)
+            .filter_map(|(p, (_, reg))| reg.get(name).map(|a| (*p, *a)))
+            .min_by_key(|(p, _)| *p)
+            .map(|(_, a)| a)
     }
 
     /// Merged name→addr snapshot for `mesh status` / REST.
@@ -778,7 +795,12 @@ impl Mesh {
         for (n, a) in self.local_names.lock().await.iter() {
             out.insert(n.clone(), a.to_string());
         }
-        for (t, reg) in self.remote_names.lock().await.values() {
+        // Sort peers by prefix so the displayed winner matches the
+        // deterministic resolution in resolve().
+        let remote = self.remote_names.lock().await;
+        let mut remotes: Vec<_> = remote.iter().map(|(p, v)| (*p, v)).collect();
+        remotes.sort_by_key(|(p, _)| *p);
+        for (_, (t, reg)) in remotes {
             if t.elapsed() < NAME_TTL {
                 for (n, a) in reg {
                     out.entry(n.clone()).or_insert_with(|| a.to_string());
@@ -877,19 +899,7 @@ impl Mesh {
                 _ = shutdown.changed() => break,
                 r = self.dns.recv_from(&mut buf) => {
                     let Ok((n, src)) = r else { continue };
-                    let reply = match dns_query_name(&buf[..n]) {
-                        Some((qname, qtype)) => {
-                            match self.resolve(&qname).await {
-                                Some(addr) if qtype == 28 => {
-                                    Some(dns_answer_aaaa(&buf[..n], addr))
-                                }
-                                Some(_) => Some(dns_nodata(&buf[..n])),
-                                None => self.dns_forward(&buf[..n]).await,
-                            }
-                        }
-                        None => None,
-                    };
-                    if let Some(rep) = reply {
+                    if let Some(rep) = self.answer_query(&buf[..n]).await {
                         let _ = self.dns.send_to(&rep, src).await;
                     }
                 }
@@ -897,9 +907,56 @@ impl Mesh {
         }
     }
 
+    /// DNS-over-TCP on the same addr — RFC requires it for truncated
+    /// answers and some resolvers probe TCP first. 2-byte length
+    /// prefix framing per RFC 1035 §4.2.2.
+    async fn dns_tcp_server(self: Arc<Self>) {
+        let mut shutdown = self.shutdown_tx.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                r = self.dns_tcp.accept() => {
+                    let Ok((mut s, _)) = r else { continue };
+                    let m = self.clone();
+                    tokio::spawn(async move {
+                        let mut len = [0u8; 2];
+                        while s.read_exact(&mut len).await.is_ok() {
+                            let n = u16::from_be_bytes(len) as usize;
+                            let mut q = vec![0u8; n];
+                            if s.read_exact(&mut q).await.is_err() {
+                                return;
+                            }
+                            if let Some(rep) = m.answer_query(&q).await {
+                                let l = (rep.len() as u16).to_be_bytes();
+                                if s.write_all(&l).await.is_err()
+                                    || s.write_all(&rep).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Shared query path for UDP and TCP: own the mesh names, relay
+    /// the rest upstream.
+    async fn answer_query(&self, pkt: &[u8]) -> Option<Vec<u8>> {
+        let (qname, qtype) = dns_query_name(pkt)?;
+        match self.resolve(&qname).await {
+            Some(addr) if qtype == 28 => Some(dns_answer_aaaa(pkt, addr)),
+            Some(_) => Some(dns_nodata(pkt)),
+            None => self.dns_forward(pkt).await,
+        }
+    }
+
     /// Relay one query verbatim to the host resolver; None on timeout.
+    /// The upstream is re-read per query — the address captured at mesh
+    /// start goes stale when the host roams networks (DHCP/VPN).
     async fn dns_forward(&self, pkt: &[u8]) -> Option<Vec<u8>> {
-        let up = canon_ep(self.upstream?); // v4 stub (127.0.0.53) → mapped-v6
+        let up = canon_ep(net::upstream_resolver().or(self.upstream)?);
         let s = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await.ok()?;
         s.send_to(pkt, up).await.ok()?;
         let mut buf = vec![0u8; 4096];
@@ -989,15 +1046,26 @@ fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Vec<u8> {
 }
 
 /// Registry values must stay inside the announcer's own /48 — never
-/// trust a peer to name OUR space or a third host's.
+/// trust a peer to name OUR space or a third host's. Names must be
+/// valid single DNS labels, and the whole registry is capped so a
+/// hostile or buggy peer can't grow our memory unboundedly.
 fn sanitize_registry(
     peer_prefix: Ipv6Addr,
     names: std::collections::BTreeMap<String, Ipv6Addr>,
 ) -> std::collections::BTreeMap<String, Ipv6Addr> {
     names
         .into_iter()
-        .filter(|(_, a)| in_prefix(peer_prefix, *a))
+        .filter(|(n, a)| valid_dns_label(n) && in_prefix(peer_prefix, *a))
+        .take(1024)
         .collect()
+}
+
+/// Single DNS label: ≤63 chars, alphanumeric plus '-'/'_'.
+fn valid_dns_label(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 63
+        && n.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Build one boringtun session for a peer conf.
@@ -1177,6 +1245,30 @@ mod tests {
         assert!(!clean.contains_key("star"));
         // Every surviving addr is in the announcer's prefix.
         assert!(clean.values().all(|a| in_prefix(theirs, *a)));
+    }
+
+    #[test]
+    fn registry_rejects_bad_names_and_caps_size() {
+        let theirs = Ipv6Addr::new(0xfd51, 0x0b83, 0x5157, 0, 0, 0, 0, 0);
+        let mut names = std::collections::BTreeMap::new();
+        // Invalid labels: empty, dotted, >63 chars, weird bytes.
+        names.insert("".to_string(), mesh_ip(theirs, 1));
+        names.insert("a.b".to_string(), mesh_ip(theirs, 2));
+        names.insert("x".repeat(64), mesh_ip(theirs, 3));
+        names.insert("bad name".to_string(), mesh_ip(theirs, 4));
+        // Valid labels survive.
+        names.insert("db-1".to_string(), mesh_ip(theirs, 5));
+        names.insert("web_2".to_string(), mesh_ip(theirs, 6));
+        let clean = sanitize_registry(theirs, names);
+        assert_eq!(clean.len(), 2);
+        assert!(clean.contains_key("db-1"));
+        assert!(clean.contains_key("web_2"));
+
+        // Cap: a flood of valid entries is bounded at 1024.
+        let flood: std::collections::BTreeMap<String, Ipv6Addr> = (0..5000u32)
+            .map(|i| (format!("pod{i}"), mesh_ip(theirs, i % 200 + 1)))
+            .collect();
+        assert_eq!(sanitize_registry(theirs, flood).len(), 1024);
     }
 
     /// A socket bound to a specific ULA addr — the DNS/gossip bind
