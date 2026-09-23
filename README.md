@@ -56,7 +56,8 @@ Supported distro families — the installer maps each to its package set
 | Family | Distros | Status |
 | --- | --- | --- |
 | Debian/Ubuntu | Debian, Ubuntu, Mint, Pop!_OS, Neon, Raspbian, Kali | runtime + deployment live-tested on Debian 13 |
-| Fedora/RHEL | Fedora, RHEL, CentOS, Alma, Rocky, Oracle | distro detection + installer dry-run validated; runtime unverified — SELinux enforcing explicitly requires validation (`doctor` warns) |
+| Fedora | Fedora 44 | full runtime + deployment live-tested under KVM with SELinux Enforcing, Btrfs, cgroup v2 |
+| RHEL family | RHEL, CentOS, Alma, Rocky, Oracle | package mapping checked; runtime/SELinux unverified |
 | Arch | Arch, Manjaro, EndeavourOS, CachyOS | distro detection + installer dry-run validated; runtime unverified |
 
 Release artifacts are currently built from source and should be compiled
@@ -261,10 +262,23 @@ rustypods start deb-dev                 # payload pod; logs via console log
 
 The override replaces the image's entrypoint+cmd and forces non-boot mode;
 change it later with `rustypods config <pod> --cmd …` / `--clear-cmd`
-(applied at the next start). The host's `LANG` is forwarded on exec — a
-fresh OCI rootfs that hasn't generated it gets `C.UTF-8` instead, so
-locale-aware tools don't die; run `locale-gen` in the pod for the real
-locale.
+(applied at the next start). Multi-word commands work — everything after
+`--cmd` is command argv, so it must be the **final** rustypods option:
+
+```bash
+rustypods create web --image alpine-latest --port 8080:80 \
+  --cmd sh -c 'httpd -f -p 80 -h /www'
+```
+
+The host's `LANG` is forwarded on exec — a fresh OCI rootfs that hasn't
+generated it gets `C.UTF-8` instead, so locale-aware tools don't die; run
+`locale-gen` in the pod for the real locale.
+
+Note: non-userns pods (including `--desktop`) require util-linux `setpriv`
+inside the image for secure exec — the daemon drops the capability
+bounding set through it. Minimal BusyBox images lack a usable `setpriv`,
+so `shell`/`exec` there is intentionally refused rather than retaining
+host-root's bounding set.
 
 or over REST/JSON with the bearer token in `/run/rustypods/http-token`:
 

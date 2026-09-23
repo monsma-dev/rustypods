@@ -80,9 +80,10 @@ enum Cmd {
         /// Boot this pod automatically whenever the daemon starts.
         #[arg(long)]
         autostart: bool,
-        /// Payload command override, e.g. --cmd sleep infinity — replaces
-        /// the image's entrypoint+cmd and forces non-boot mode.
-        #[arg(long, num_args = 1.., value_delimiter = None)]
+        /// Payload command override, e.g. --cmd sh -c '...' — replaces the
+        /// image's entrypoint+cmd and forces non-boot mode. Everything after
+        /// --cmd is command argv, so it must be the final rustypods option.
+        #[arg(long, num_args = 1.., value_delimiter = None, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
     /// Start a pod (nspawn --boot, machined registration).
@@ -175,9 +176,10 @@ enum Cmd {
         /// Boot with the daemon: --autostart on|off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         autostart: Option<bool>,
-        /// Payload command override, e.g. --cmd sleep infinity — replaces
-        /// the whole override (applied at the next start).
-        #[arg(long, num_args = 1.., value_delimiter = None, conflicts_with = "clear_cmd")]
+        /// Payload command override, e.g. --cmd sh -c '...' — replaces the
+        /// whole override (applied at the next start). Everything after --cmd
+        /// is command argv, so it must be the final rustypods option.
+        #[arg(long, num_args = 1.., value_delimiter = None, conflicts_with = "clear_cmd", allow_hyphen_values = true)]
         cmd: Vec<String>,
         /// Remove the payload command override (applied at the next start).
         #[arg(long)]
@@ -1315,4 +1317,38 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --cmd takes hyphen-leading argv (regression: `--cmd sh -c '...'` used
+    // to be rejected, breaking payload scripts like busybox httpd setups).
+    #[test]
+    fn create_cmd_accepts_hyphen_argv() {
+        let cli = Cli::try_parse_from([
+            "rustypods", "create", "demo", "--image", "busybox-latest", "--autostart", "--cmd",
+            "sh", "-c", "echo ok",
+        ])
+        .unwrap();
+        let Cmd::Create { autostart, cmd, .. } = cli.cmd else {
+            panic!("expected Cmd::Create");
+        };
+        assert!(autostart);
+        assert_eq!(cmd, ["sh", "-c", "echo ok"]);
+    }
+
+    #[test]
+    fn config_cmd_accepts_hyphen_argv() {
+        let cli = Cli::try_parse_from([
+            "rustypods", "config", "demo", "--autostart", "on", "--cmd", "sh", "-c", "echo ok",
+        ])
+        .unwrap();
+        let Cmd::Config { autostart, cmd, .. } = cli.cmd else {
+            panic!("expected Cmd::Config");
+        };
+        assert_eq!(autostart, Some(true));
+        assert_eq!(cmd, ["sh", "-c", "echo ok"]);
+    }
 }

@@ -382,7 +382,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         chk!(
             Level::Warn,
             "selinux",
-            "enforcing; Fedora/RHEL policy has not been validated on this host"
+            "enforcing; Fedora 44 validated — inspect AVCs on other SELinux policies"
         );
     } else {
         chk!(Level::Pass, "selinux", "disabled or absent");
