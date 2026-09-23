@@ -219,6 +219,35 @@ async fn wait_host_veth(leader: u32) -> Result<String> {
     bail!("veth peer of pod leader {leader} never appeared (host0@ifN unresolved)");
 }
 
+/// firewalld locks `inet firewalld` with the kernel `owner` flag —
+/// inserts from any other netlink socket get EPERM, so the
+/// foreign-chain path can't coexist with it. The sanctioned interface
+/// is `firewall-cmd`: binding each pod veth to the built-in `trusted`
+/// zone (ACCEPT target) is exactly what the zone model is for — covers
+/// FORWARD and INPUT, runtime-only, inert once the interface dies, and
+/// never mutates the user's firewalld config. Silent when firewalld
+/// isn't running.
+async fn firewalld_bind(veth: &str) {
+    if run_async("firewall-cmd", &["--state"]).await.is_err() {
+        return;
+    }
+    if let Err(e) =
+        run_async("firewall-cmd", &["--zone=trusted", "--add-interface", veth]).await
+    {
+        tracing::warn!("firewalld trusted-bind {veth}: {e:#}");
+    }
+}
+
+/// Blocking variant for the sync stack-net path.
+fn firewalld_bind_sync(veth: &str) {
+    if run("firewall-cmd", &["--state"]).is_err() {
+        return;
+    }
+    if let Err(e) = run("firewall-cmd", &["--zone=trusted", "--add-interface", veth]) {
+        tracing::warn!("firewalld trusted-bind {veth}: {e:#}");
+    }
+}
+
 // --- stacks: one shared netns per stack (the K8s pod model) -----------------
 
 /// Named netns for a stack: `ip netns add rustypods-<stack>`.
@@ -252,6 +281,7 @@ pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
         run("ip", &["link", "add", &host_v, "type", "veth", "peer", "name", &peer])?;
         run("ip", &["link", "set", &peer, "netns", &ns])?;
     }
+    firewalld_bind_sync(&host_v);
     run("ip", &["link", "set", &host_v, "up"])?;
     run(
         "ip",
@@ -325,6 +355,7 @@ pub async fn configure_veth(_pod: &str, idx: u32, leader: u32) -> Result<()> {
         bail!("pod has no usable leader pid yet — cannot enter its netns");
     }
     let veth = wait_host_veth(leader).await?;
+    firewalld_bind(&veth).await;
     run_async("ip", &["link", "set", &veth, "up"]).await?;
     run_async(
         "ip",
@@ -577,12 +608,16 @@ pub fn ensure_forward_accepts() {
         "ip6 daddr fd22:220::/32 accept",
     ];
     // (family, table, chain, rules to insert) — cover ufw's iptables-compat
-    // tables, a plain inet filter table, and firewalld's forward hook.
+    // tables and a plain inet filter table. firewalld is deliberately
+    // absent: its `inet firewalld` table carries the kernel `owner`
+    // flag (EPERM on any foreign insert — see firewalld_bind for the
+    // sanctioned path). Insert whenever the chain exists and lacks our
+    // marker, not only on drop policies — accepts scoped to pod subnets
+    // are harmless where nothing was blocking.
     for (fam, table, chain, rules) in [
         ("ip", "filter", "FORWARD", V4.as_slice()),
         ("ip6", "filter", "FORWARD", V6.as_slice()),
         ("inet", "filter", "FORWARD", BOTH.as_slice()),
-        ("inet", "firewalld", "filter_FORWARD", BOTH.as_slice()),
     ] {
         let out = Command::new("nft")
             .args(["list", "chain", fam, table, chain])
@@ -592,8 +627,7 @@ pub fn ensure_forward_accepts() {
             continue;
         }
         let txt = String::from_utf8_lossy(&out.stdout);
-        let strict = txt.contains("policy drop") || txt.contains("policy reject");
-        if !strict || txt.contains(MARK) {
+        if txt.contains(MARK) {
             continue;
         }
         for r in rules {
@@ -606,7 +640,7 @@ pub fn ensure_forward_accepts() {
                 Err(e) => tracing::warn!("nft insert into {fam} {table} {chain}: {e}"),
             }
         }
-        tracing::info!("installed pod-traffic accepts in {fam} {table} {chain} (drop/reject policy)");
+        tracing::info!("installed pod-traffic accepts in {fam} {table} {chain}");
     }
 }
 

@@ -148,8 +148,18 @@ rustypodsd does it itself:
   install FORWARD base chains with drop policy — pod↔pod and pod egress
   die there, and a RustyPods-owned accept chain can't override a foreign
   drop (each base chain gets its own verdict). `ensure_forward_accepts`
-  inserts marker-commented accepts at the TOP of the foreign chain —
-  same pattern as Docker's DOCKER-USER. Idempotent, absent tables skipped.
+  inserts marker-commented accepts at the TOP of foreign iptables-compat
+  chains (`ip`/`ip6`/`inet filter FORWARD`) — the DOCKER-USER pattern.
+  Insert whenever the chain exists and lacks the marker, NOT only on
+  drop policies: firewalld's filter_FORWARD is policy accept yet still
+  rejects via its zone dispatch.
+- Hard-won: firewalld's `inet firewalld` table carries the kernel
+  `owner` flag — rule inserts from any other netlink socket get EPERM
+  (no AVC, not SELinux — the kernel locks the table to firewalld's
+  portid). The sanctioned path is `firewall-cmd`: `firewalld_bind`
+  adds each pod veth to the built-in `trusted` zone (ACCEPT target) —
+  runtime-only, zero config mutation, inert once the veth dies.
+  Verified on Fedora 44 / firewalld 2.4.4 / SELinux Enforcing.
 - Hard-won: `::1`→pod dnat can NEVER work — the kernel hard-drops
   loopback tuples on non-loopback devices (tcp_v6_rcv; no v6
   `route_localnet` exists — same wall Docker hits). Leaving `::1:80/443`
