@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+http.workspace = true
+hyper-util.workspace = true
 clap.workspace = true
 libc.workspace = true
 rustypods-proto.workspace = true
@@ -25,6 +27,9 @@ tower = { workspace = true, features = ["limit"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 oci-client.workspace = true
+rustls.workspace = true
 tar.workspace = true
 flate2.workspace = true
 zstd.workspace = true
+rcgen = "=0.14.8"
+time = "0.3.55"

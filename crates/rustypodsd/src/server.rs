@@ -1,9 +1,10 @@
 //! tonic server on a Unix socket. Peer credentials gate access:
 //! uid 0 or Config::allowed_uid may connect; everyone else is dropped.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::{Command as SyncCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,7 @@ use crate::oci;
 use crate::runtime::{RuntimeEngine, StartSpec};
 use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State};
 use crate::storage::StorageDriver;
-use crate::{net, runtime, stack, storage, Config};
+use crate::{ingress, net, pki, runtime, stack, storage, Config};
 
 #[derive(Clone)]
 pub struct Svc {
@@ -40,6 +41,20 @@ pub struct Svc {
     /// stack member ops must never interleave on the same pod name. Entries
     /// are never evicted — keyed by ≤32-char pod names, a few bytes each.
     ops: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Monotonic snapshot counter handed to the ingress gateway — the ACK
+    /// must echo it back so a stale push can never look applied.
+    ingress_generation: Arc<AtomicU64>,
+    /// Serializes snapshot BUILD+PUSH+ACK: every push opens its own UDS
+    /// connection, so two concurrent pushes could be reordered on the
+    /// wire — a stale snapshot landing after a newer one would resurrect
+    /// a route whose net_index was already freed. Holding this mutex
+    /// across build+push makes every applied snapshot reflect state at
+    /// push time; the gateway itself accepts any generation (a daemon
+    /// restart resets the counter).
+    ingress_mu: Arc<Mutex<()>>,
+    /// Last periodic-reconcile error string — identical failures are logged
+    /// once, recovery once, instead of every 2s tick.
+    ingress_last_err: Arc<Mutex<Option<String>>>,
 }
 
 /// Hard cap on a single SHM segment — the file lives on /dev/shm (tmpfs),
@@ -94,6 +109,7 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         autostart: m.autostart,
         cmd: m.cmd.clone(),
         ingress: ingress_to_proto(&m.ingress),
+        ingress_gateway: m.ingress_gateway,
     }
 }
 
@@ -428,20 +444,105 @@ impl Svc {
         }
     }
 
-    /// Rebuild the nftables DNAT table from current state (running pods only).
-    async fn sync_nat(&self) {
+    /// Rebuild the nftables DNAT tables from current state (running pods
+    /// only) — strict: an nft failure propagates; callers decide whether
+    /// it unwinds a start or only warns on stop paths.
+    async fn sync_nat(&self) -> Result<(), Status> {
         let pods: Vec<PodMeta> = {
             let st = self.st.lock().await;
             st.pods.values().cloned().collect()
         };
-        let mut running = std::collections::BTreeSet::new();
+        let mut running = BTreeSet::new();
         for m in &pods {
             if self.engine.running_pid(&m.name).await.is_some() {
                 running.insert(m.name.clone());
             }
         }
         // `nft -f -` is a subprocess — off the executor.
-        let _ = tokio::task::spawn_blocking(move || net::rebuild_nat(pods.iter(), &running)).await;
+        Self::blocking(move || net::rebuild_nat(pods.iter(), &running)).await
+    }
+
+    /// Current running set from the engine's point of view.
+    async fn running_set(&self) -> BTreeSet<String> {
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods.values().cloned().collect()
+        };
+        let mut running = BTreeSet::new();
+        for m in &pods {
+            if self.engine.running_pid(&m.name).await.is_some() {
+                running.insert(m.name.clone());
+            }
+        }
+        running
+    }
+
+    /// Push the complete route snapshot to the ingress gateway, if it is
+    /// configured and running. `exclude` is treated as non-running (a pod
+    /// being drained before stop/destroy). `required` makes the absence of
+    /// a usable control endpoint fail instead of degrading to a warning —
+    /// a silent skip would leave stale routes pointing at reused IPs.
+    async fn sync_ingress(&self, exclude: Option<&str>, required: bool) -> Result<(), Status> {
+        // See ingress_mu: build inside the lock so a snapshot can never
+        // carry pre-lock state past a newer push.
+        let _push = self.ingress_mu.lock().await;
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods.values().cloned().collect()
+        };
+        let gateway_configured = pods.iter().any(|m| m.ingress_gateway);
+        let running = self.running_set().await;
+        let gw_running = running.contains(proto::INGRESS_POD);
+        let generation = self.ingress_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let snap =
+            ingress::build_snapshot(pods.iter().collect(), &running, exclude, generation)
+                .map_err(int)?;
+        let want_routes = !snap.routes.is_empty();
+        if !gateway_configured {
+            if want_routes && required {
+                return Err(Status::failed_precondition(
+                    "pods have ingress rules but the gateway isn't initialized — run `rustypods ingress init` and start it",
+                ));
+            }
+            return Ok(());
+        }
+        if !gw_running {
+            let msg = "ingress gateway configured but not running — start it (`rustypods start rustypods-ingress`)";
+            return Err(if required {
+                Status::failed_precondition(msg)
+            } else {
+                Status::unavailable(msg)
+            });
+        }
+        ingress::push_snapshot(&self.cfg.data_dir, snap)
+            .await
+            .map_err(|e| {
+                if required {
+                    Status::failed_precondition(format!("{e:#}"))
+                } else {
+                    Status::unavailable(format!("{e:#}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Wait until the gateway's control UDS answers GetStatus — the
+    /// dataplane needs a moment inside the pod to bind its socket.
+    async fn wait_ingress_ready(&self) -> Result<(), Status> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match ingress::gateway_status(&self.cfg.data_dir).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Status::failed_precondition(format!(
+                            "ingress control socket never came up: {e:#}"
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 }
 
@@ -603,6 +704,11 @@ impl PodControl for Svc {
     async fn create_pod(&self, req: Request<CreatePodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        if name == proto::INGRESS_POD {
+            return Err(Status::failed_precondition(
+                "{name} is reserved — use `rustypods ingress init`",
+            ));
+        }
         let _op = self.pod_op(&name).await;
         let image = proto::validate_name(&req.image).map_err(bad)?.to_string();
         let img_dir = self.cfg.images_dir().join(&image);
@@ -661,6 +767,7 @@ impl PodControl for Svc {
             snap_max_age_secs: 0,
             autostart: req.autostart,
             cmd: req.cmd.clone(),
+            ingress_gateway: false,
         };
         let mut st = self.st.lock().await;
         if let Err(e) = validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress)) {
@@ -684,6 +791,21 @@ impl PodControl for Svc {
         let req = req.into_inner();
         let src = proto::validate_name(&req.source).map_err(bad)?.to_string();
         let dest = proto::validate_name(&req.dest).map_err(bad)?.to_string();
+        // The reserved name may only come from `ingress init` — a cloned
+        // conf here would have ingress_gateway=false and fail the next
+        // state load outright.
+        if dest == proto::INGRESS_POD {
+            return Err(Status::failed_precondition(format!(
+                "{dest} is reserved — use `rustypods ingress init`"
+            )));
+        }
+        // Cloning the gateway would propagate its provisioned TLS key and
+        // the managed identity into an ordinary pod — refuse.
+        if src == proto::INGRESS_POD {
+            return Err(Status::failed_precondition(format!(
+                "{src} is the managed ingress gateway — it cannot be cloned"
+            )));
+        }
         // Source must exist before we touch the append-only ops map.
         {
             let st = self.st.lock().await;
@@ -738,6 +860,8 @@ impl PodControl for Svc {
             net_index: 0,
             stack: String::new(),
             ingress: vec![],
+            // The gateway role is daemon-managed — a clone is never it.
+            ingress_gateway: false,
             ..meta
         };
         let mut st = self.st.lock().await;
@@ -953,6 +1077,17 @@ impl PodControl for Svc {
             }
             member_ingress.insert(stack::member_name(&def.name, member), rules);
         }
+        // A stack/member combo that lands on the reserved gateway name
+        // would squat the managed pod — reject the whole apply.
+        if member_ingress
+            .keys()
+            .any(|n| n == proto::INGRESS_POD)
+        {
+            return Err(Status::failed_precondition(format!(
+                "stack member name {} is reserved",
+                proto::INGRESS_POD
+            )));
+        }
         // Hold every desired member's op lock for the WHOLE apply — a
         // direct config/start/destroy on a member mid-apply would
         // interleave with the atomic desired-set write. BTreeMap keys are
@@ -1120,6 +1255,7 @@ impl PodControl for Svc {
                         // Stack lifecycle is driven by `stack start`, not
                         // the daemon boot path.
                         autostart: false,
+                        ingress_gateway: false,
                     };
                     let mut st = self.st.lock().await;
                     if st.pods.contains_key(&pname) {
@@ -1158,7 +1294,7 @@ impl PodControl for Svc {
         }
         net::ensure_ip_forward().map_err(int)?;
         // Members' ports/net_index may have changed — rebuild the DNAT table.
-        self.sync_nat().await;
+        self.sync_nat().await?;
         let pods = out
             .iter()
             .map(|m| to_pod(m, &self.pod_rootfs(&m.name), None))
@@ -1228,7 +1364,16 @@ impl PodControl for Svc {
             Ok(())
         })
         .await;
-        self.sync_nat().await;
+        if let Err(e) = self.sync_nat().await {
+            tracing::warn!("nft rebuild after stack destroy failed: {e}");
+        }
+        // Members carrying ingress rules are gone — drop their routes
+        // promptly instead of waiting for the next reconcile tick (the
+        // shared net_index is free for reuse now). Best-effort: an
+        // unreachable gateway is healed by the reconciler.
+        if let Err(e) = self.sync_ingress(None, false).await {
+            tracing::warn!("ingress resync after stack {name} destroy failed: {e}");
+        }
         // Evict op-lock entries for the destroyed members and the stack key —
         // the pods are gone, so ops stays bounded by live pod names. Held
         // guards keep working on their (now orphaned) Arc harmlessly.
@@ -1263,6 +1408,14 @@ impl PodControl for Svc {
             let Some(meta) = st.pods.get_mut(&name) else {
                 return Err(Status::not_found(format!("pod {name} not found")));
             };
+            // The gateway's isolation shape is managed: a private-users
+            // downgrade would break the control-socket chown, and an
+            // ephemeral gateway would silently drop provisioned files.
+            if meta.ingress_gateway && (req.ephemeral || req.private_users.is_some()) {
+                return Err(Status::failed_precondition(
+                    "the ingress gateway is managed — ephemeral/private-users overrides are not allowed",
+                ));
+            }
             let lim = limits_from(req.limits);
             if !lim.is_empty() {
                 meta.limits = lim;
@@ -1276,9 +1429,12 @@ impl PodControl for Svc {
                 meta.private_users = pu;
             }
             // Private networking is needed for published ports, ingress
-            // rules (routed to the pod's private IP), or stack membership.
-            let needs_network =
-                !meta.ports.is_empty() || !meta.ingress.is_empty() || !meta.stack.is_empty();
+            // rules (routed to the pod's private IP), stack membership, or
+            // the ingress gateway itself (loopback 80/443 dnat target).
+            let needs_network = !meta.ports.is_empty()
+                || !meta.ingress.is_empty()
+                || !meta.stack.is_empty()
+                || meta.ingress_gateway;
             if needs_network && meta.net_index == 0 {
                 meta.net_index = next_idx;
             }
@@ -1376,8 +1532,10 @@ impl PodControl for Svc {
             Some(self.cfg.allowed_uid),
             Some(self.cfg.allowed_uid),
         );
-        let needs_network =
-            !meta.ports.is_empty() || !meta.ingress.is_empty() || !meta.stack.is_empty();
+        let needs_network = !meta.ports.is_empty()
+            || !meta.ingress.is_empty()
+            || !meta.stack.is_empty()
+            || meta.ingress_gateway;
         // Networking is wired BEFORE spawn: stack members join a pre-made
         // netns (nspawn opens the path at exec), standalone networked pods
         // get their static host0 config written into the rootfs. Everything
@@ -1411,6 +1569,12 @@ impl PodControl for Svc {
         // fail BEFORE the listener spawns / engine starts.
         if needs_network {
             net::ensure_ip_forward().map_err(int)?;
+        }
+        // The gateway claims host :80/:443 via nft redirect — refuse to
+        // start if something already listens on either loopback stack;
+        // nft doesn't take a userspace bind, so it would silently hijack.
+        if meta.ingress_gateway {
+            Self::blocking(net::check_ingress_ports_free).await?;
         }
         // Last fallible step before spawn: the agent listener. From here on
         // the only failure path is engine.start below, which stops it.
@@ -1450,10 +1614,14 @@ impl PodControl for Svc {
         };
         // agent.sock is root:root 0660 — in a userns pod the in-pod agent's
         // "root" is a host subuid and couldn't connect; re-own the socket
-        // to the kuid container-uid-0 maps to.
+        // to the kuid container-uid-0 maps to. The gateway also manages its
+        // own control socket inside the run dir → chown the whole dir.
         if meta.private_users {
             if let Some(pid) = leader {
                 agent::chown_sock_for_userns(&spec.run_dir, pid);
+                if meta.ingress_gateway {
+                    agent::chown_run_dir_for_userns(&spec.run_dir, pid);
+                }
             }
         }
         // Btrfs qgroup cap: quota accounting doesn't survive a remount, so
@@ -1470,17 +1638,54 @@ impl PodControl for Svc {
         // wired at apply/first-member-start; everyone then gets the DNAT
         // table rebuilt from live state. A veth failure unwinds the
         // start rather than leaving a half-networked "running" pod.
+        if needs_network && meta.stack.is_empty() {
+            if let Err(e) =
+                net::configure_veth(&name, meta.net_index, leader.unwrap_or(0)).await
+            {
+                agent::stop_listener(&self.listeners, &self.metrics, &name).await;
+                let _ = self.engine.stop(&name).await;
+                return Err(int(e));
+            }
+        }
+        // Gateway control-plane readiness before NAT: the snapshot push
+        // below needs a live UDS, and a gateway whose dataplane never
+        // bound its socket must not stay half-started.
+        if meta.ingress_gateway {
+            if let Err(e) = self.wait_ingress_ready().await {
+                agent::stop_listener(&self.listeners, &self.metrics, &name).await;
+                let _ = self.engine.stop(&name).await;
+                return Err(e);
+            }
+        }
         if needs_network {
-            if meta.stack.is_empty() {
-                if let Err(e) =
-                    net::configure_veth(&name, meta.net_index, leader.unwrap_or(0)).await
-                {
+            match self.sync_nat().await {
+                Ok(()) => {}
+                Err(e) if meta.ingress_gateway || !meta.ingress.is_empty() => {
+                    // NAT is what makes ingress reachable — a failed
+                    // rebuild means a "running" pod that's dark. Unwind.
                     agent::stop_listener(&self.listeners, &self.metrics, &name).await;
                     let _ = self.engine.stop(&name).await;
-                    return Err(int(e));
+                    let _ = self.sync_nat().await;
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::warn!("nft rebuild after {name} start failed: {e}");
                 }
             }
-            self.sync_nat().await;
+        }
+        // Route synchronization is part of "started": the gateway takes a
+        // fresh complete snapshot (it routes nothing itself), an ingress
+        // backend must be ACKed before we report it up. running_pid
+        // already sees this pod, so the snapshot includes it.
+        if meta.ingress_gateway || !meta.ingress.is_empty() {
+            if let Err(e) = self.sync_ingress(None, true).await {
+                agent::stop_listener(&self.listeners, &self.metrics, &name).await;
+                let _ = self.engine.stop(&name).await;
+                if needs_network {
+                    let _ = self.sync_nat().await;
+                }
+                return Err(e);
+            }
         }
         let mut st = self.st.lock().await;
         if let Some(m) = st.pods.get_mut(&name) {
@@ -1503,6 +1708,49 @@ impl PodControl for Svc {
             }
         }
         let _op = self.pod_op(&name).await;
+        let meta = {
+            let st = self.st.lock().await;
+            st.pods.get(&name).cloned()
+        };
+        let ingress_gateway = meta.as_ref().is_some_and(|m| m.ingress_gateway);
+        let has_ingress = meta.as_ref().is_some_and(|m| !m.ingress.is_empty());
+        if ingress_gateway {
+            // Draining the gateway while a backend still depends on it
+            // would leave dead hostnames pointed at live IPs — refuse.
+            let running = self.running_set().await;
+            let dependent = {
+                let st = self.st.lock().await;
+                st.pods
+                    .values()
+                    .any(|m| m.name != name && !m.ingress.is_empty() && running.contains(&m.name))
+            };
+            if dependent {
+                return Err(Status::failed_precondition(
+                    "running pods still have ingress rules — stop them or clear their rules before stopping the gateway",
+                ));
+            }
+            // Nobody needs routes anymore — clear the dataplane so nothing
+            // lingers while the gateway is down. Best-effort: the stop
+            // itself must still proceed.
+            let gen = self.ingress_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Err(e) = ingress::push_snapshot(
+                &self.cfg.data_dir,
+                RouteSnapshot {
+                    generation: gen,
+                    routes: vec![],
+                },
+            )
+            .await
+            {
+                tracing::warn!("empty ingress snapshot before gateway stop: {e:#}");
+            }
+        } else if has_ingress {
+            // Drain this pod's routes BEFORE it stops so clients never hit
+            // a dead backend. Best-effort — the stop must proceed.
+            if let Err(e) = self.sync_ingress(Some(&name), false).await {
+                tracing::warn!("ingress drain before {name} stop: {e}");
+            }
+        }
         self.engine.stop(&name).await.map_err(int)?;
         agent::stop_listener(&self.listeners, &self.metrics, &name).await;
         let st = self.st.lock().await;
@@ -1511,7 +1759,16 @@ impl PodControl for Svc {
         };
         let p = to_pod(m, &self.pod_rootfs(&name), None);
         drop(st);
-        self.sync_nat().await;
+        if let Err(e) = self.sync_nat().await {
+            tracing::warn!("nft rebuild after {name} stop failed: {e}");
+        }
+        // Second drain pass: the pod is confirmed down now, so the
+        // post-stop snapshot can't race its next start (pod_op held).
+        if has_ingress {
+            if let Err(e) = self.sync_ingress(None, false).await {
+                tracing::warn!("ingress resync after {name} stop: {e}");
+            }
+        }
         Ok(Response::new(p))
     }
 
@@ -1548,6 +1805,28 @@ impl PodControl for Svc {
             }
         }
         let _op = self.pod_op(&name).await;
+        let meta = {
+            let st = self.st.lock().await;
+            st.pods.get(&name).cloned()
+        };
+        let ingress_gateway = meta.as_ref().is_some_and(|m| m.ingress_gateway);
+        let has_ingress = meta.as_ref().is_some_and(|m| !m.ingress.is_empty());
+        if ingress_gateway {
+            // Destroying the gateway while ANY other pod still carries
+            // ingress rules would strand them — rules must be cleared or
+            // the pods destroyed first, even if they're all stopped.
+            let dependent = {
+                let st = self.st.lock().await;
+                st.pods
+                    .values()
+                    .any(|m| m.name != name && !m.ingress.is_empty())
+            };
+            if dependent {
+                return Err(Status::failed_precondition(
+                    "pods still have ingress rules — clear their rules or destroy them before destroying the gateway",
+                ));
+            }
+        }
         self.engine.stop(&name).await.map_err(int)?;
         // Never delete the rootfs of a pod machined still knows about —
         // a failed/busy bus must not look like "pod is gone".
@@ -1557,6 +1836,12 @@ impl PodControl for Svc {
             )));
         }
         agent::stop_listener(&self.listeners, &self.metrics, &name).await;
+        if has_ingress && !ingress_gateway {
+            // Route removal must be ACKed before the pod's identity (and
+            // its reusable net_index) disappears — an unreachable gateway
+            // means a stale route could point at a recycled IP later.
+            self.sync_ingress(Some(&name), true).await?;
+        }
         self.st_delete(&self.pod_rootfs(&name)).await?;
         state::remove_pod(&self.cfg.data_dir, &name);
         agent::cleanup_pod_dirs(
@@ -1587,7 +1872,9 @@ impl PodControl for Svc {
             })
             .await;
         }
-        self.sync_nat().await;
+        if let Err(e) = self.sync_nat().await {
+            tracing::warn!("nft rebuild after {name} destroy failed: {e}");
+        }
         // The pod is gone for good — drop its op-lock entry so ops stays
         // bounded by live pod names. Guard must drop first: removing while
         // locked is harmless (the guard just holds a dead Arc), but
@@ -1611,6 +1898,23 @@ impl PodControl for Svc {
             }
         }
         let _op = self.pod_op(&name).await;
+        // The gateway's identity is daemon-managed — its cmd, ports,
+        // binds and ingress rules are provisioned by InitIngress and must
+        // not be rewritable through the ordinary config path. Resource
+        // limits and autostart stay tunable.
+        {
+            let st = self.st.lock().await;
+            if st.pods.get(&name).is_some_and(|m| m.ingress_gateway)
+                && (req.ports.is_some()
+                    || req.binds.is_some()
+                    || req.cmd.is_some()
+                    || req.ingress.is_some())
+            {
+                return Err(Status::failed_precondition(
+                    "the ingress gateway is managed — cmd/ports/binds/ingress are not configurable; re-run `rustypods ingress init`",
+                ));
+            }
+        }
         let lim = limits_from(req.limits);
         if let Some(pm) = &req.ports {
             for spec in &pm.ports {
@@ -1693,7 +1997,9 @@ impl PodControl for Svc {
         }
         self.apply_storage_cap(&meta).await.map_err(int)?;
         if ports_changed {
-            self.sync_nat().await;
+            if let Err(e) = self.sync_nat().await {
+                tracing::warn!("nft rebuild after {name} config failed: {e}");
+            }
         }
         let leader = self.engine.running_pid(&name).await;
         Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
@@ -1715,6 +2021,28 @@ impl PodControl for Svc {
         }
         let _op = self.pod_op(&name).await;
         let meta = state::load_pod(&self.cfg.data_dir, &name).map_err(int)?;
+        // A hand-edited gateway conf must not smuggle in managed-field
+        // changes — compare against the running identity and reject drift.
+        {
+            let st = self.st.lock().await;
+            if let Some(cur) = st.pods.get(&name) {
+                if cur.ingress_gateway
+                    && (!meta.ingress_gateway
+                        || meta.image != cur.image
+                        || meta.cmd != cur.cmd
+                        || !meta.ports.is_empty()
+                        || !meta.ingress.is_empty()
+                        || !meta.binds.is_empty()
+                        || meta.stack != cur.stack
+                        || meta.net_index != cur.net_index
+                        || meta.private_users != cur.private_users)
+                {
+                    return Err(Status::failed_precondition(
+                        "the ingress gateway is managed — refusing conf drift on its managed fields",
+                    ));
+                }
+            }
+        }
         for spec in &meta.ports {
             proto::validate_port(spec).map_err(bad)?;
         }
@@ -1750,6 +2078,259 @@ impl PodControl for Svc {
         self.apply_storage_cap(&meta).await.map_err(int)?;
         let leader = self.engine.running_pid(&name).await;
         Ok(Response::new(to_pod(&meta, &self.pod_rootfs(&name), leader)))
+    }
+
+    /// `rustypods ingress init`: provision the managed gateway pod —
+    /// local PKI, dataplane binary + leaf cert copied into a rootfs
+    /// cloned from the chosen image. Idempotent: a stopped gateway gets
+    /// its binary/certs refreshed, a running one is left alone, and a
+    /// foreign pod under the reserved name can't exist (load() enforces
+    /// the name↔flag invariant).
+    async fn init_ingress(
+        &self,
+        req: Request<InitIngressRequest>,
+    ) -> Result<Response<IngressDeployment>, Status> {
+        let req = req.into_inner();
+        let image = proto::validate_name(&req.image).map_err(bad)?.to_string();
+        let img_dir = self.cfg.images_dir().join(&image);
+        if !img_dir.is_dir() {
+            return Err(Status::not_found(format!("image {image} not found")));
+        }
+        let _op = self.pod_op(proto::INGRESS_POD).await;
+        // Host loopback :80/:443 must be free BEFORE we wire nft
+        // redirects — nft never takes a userspace bind, so an existing
+        // listener would be hijacked silently.
+        Self::blocking(net::check_ingress_ports_free).await?;
+        // PKI + trust install are filesystem/crypto work — off-executor.
+        let data_dir = self.cfg.data_dir.clone();
+        let paths = Self::blocking(move || pki::ensure(&data_dir)).await?;
+        let ca_installed = if req.install_ca {
+            let p = paths.clone();
+            Self::blocking(move || pki::install_host_trust(&p).map(|_| ())).await?;
+            true
+        } else {
+            false
+        };
+        // The host-built dataplane binary — real file, executable, sane
+        // size (never a symlink, never a giant planted blob).
+        let bin = self.cfg.bin_dir().join("rustypods-ingress");
+        let bin_bytes = Self::blocking(move || {
+            let md = std::fs::symlink_metadata(&bin)
+                .with_context(|| format!("stat {}", bin.display()))?;
+            if !md.file_type().is_file() {
+                bail!("{} is not a regular file", bin.display());
+            }
+            if md.len() == 0 || md.len() > 128 * 1024 * 1024 {
+                bail!("{} has an unexpected size ({})", bin.display(), md.len());
+            }
+            use std::os::unix::fs::PermissionsExt;
+            if md.permissions().mode() & 0o111 == 0 {
+                bail!("{} is not executable", bin.display());
+            }
+            std::fs::read(&bin).with_context(|| format!("read {}", bin.display()))
+        })
+        .await?;
+        let tls_crt = Self::blocking({
+            let p = paths.tls_crt.clone();
+            move || std::fs::read(&p).with_context(|| format!("read {}", p.display()))
+        })
+        .await?;
+        let tls_key = Self::blocking({
+            let p = paths.tls_key.clone();
+            move || std::fs::read(&p).with_context(|| format!("read {}", p.display()))
+        })
+        .await?;
+        let rootfs = self.pod_rootfs(proto::INGRESS_POD);
+        let existing = {
+            let st = self.st.lock().await;
+            st.pods.get(proto::INGRESS_POD).cloned()
+        };
+        // Managed identity — InitIngress owns every field that defines
+        // WHAT the gateway is; created_unix/net_index/started are
+        // preserved across re-inits.
+        let managed = |prev: Option<&PodMeta>| PodMeta {
+            name: proto::INGRESS_POD.into(),
+            image: image.clone(),
+            created_unix: prev.map(|m| m.created_unix).unwrap_or_else(state::now_unix),
+            limits: LimitsSpec {
+                memory_high_bytes: 256 << 20,
+                memory_max_bytes: 512 << 20,
+                cpu_quota_percent: 100,
+            },
+            ephemeral: false,
+            private_users: true,
+            started: prev.map(|m| m.started).unwrap_or(false),
+            storage_max_bytes: 0,
+            ports: vec![],
+            ingress: vec![],
+            net_index: prev.map(|m| m.net_index).unwrap_or(0),
+            stack: String::new(),
+            binds: vec![],
+            cmd: vec!["/usr/local/bin/rustypods-ingress".into()],
+            snap_keep_last: 0,
+            snap_max_age_secs: 0,
+            ingress_gateway: true,
+            autostart: true,
+        };
+        // Copy the dataplane binary + LEAF pair into the rootfs via
+        // symlink-safe helpers. The CA key NEVER leaves the host.
+        let provision = |rootfs: &Path| {
+            let (bin, crt, key) = (bin_bytes.clone(), tls_crt.clone(), tls_key.clone());
+            let rootfs = rootfs.to_path_buf();
+            async move {
+                Self::blocking(move || {
+                    crate::rootfs::mkdir_in_rootfs(&rootfs, "usr/local/bin")?;
+                    crate::rootfs::mkdir_in_rootfs(&rootfs, "etc/rustypods-ingress")?;
+                    crate::rootfs::write_in_rootfs(
+                        &rootfs,
+                        "usr/local/bin/rustypods-ingress",
+                        &bin,
+                        Some(0o755),
+                    )?;
+                    crate::rootfs::write_in_rootfs(
+                        &rootfs,
+                        "etc/rustypods-ingress/tls.crt",
+                        &crt,
+                        Some(0o644),
+                    )?;
+                    crate::rootfs::write_in_rootfs(
+                        &rootfs,
+                        "etc/rustypods-ingress/tls.key",
+                        &key,
+                        Some(0o600),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+                Ok::<(), Status>(())
+            }
+        };
+        let meta = match existing {
+            Some(m) => {
+                if !m.ingress_gateway {
+                    return Err(Status::failed_precondition(format!(
+                        "{} exists but is not the managed gateway — refusing to replace it",
+                        proto::INGRESS_POD
+                    )));
+                }
+                if m.image != image {
+                    return Err(Status::failed_precondition(format!(
+                        "ingress gateway is provisioned from image '{}' — destroy it first to switch images",
+                        m.image
+                    )));
+                }
+                if self.engine.running_pid(&m.name).await.is_some() {
+                    // Running: managed files are in use — return state as
+                    // it is; the CLI start-step becomes a no-op. Warn if
+                    // the PKI rotated under it: the in-pod leaf is stale
+                    // until the next gateway restart.
+                    let rf = rootfs.clone();
+                    let want = tls_crt.clone();
+                    let drift = Self::blocking(move || -> Result<bool> {
+                        match crate::rootfs::safe_join_if_exists(
+                            &rf,
+                            "etc/rustypods-ingress/tls.crt",
+                        )? {
+                            Some(p) => Ok(std::fs::read(&p)? != want),
+                            None => Ok(true),
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if drift {
+                        tracing::warn!(
+                            "ingress PKI changed while the gateway is running — restart {} to load the current leaf certificate",
+                            proto::INGRESS_POD
+                        );
+                    }
+                    m
+                } else {
+                    // Conf without a rootfs = a partial destroy — the
+                    // managed pod has no user data, so re-clone cleanly.
+                    if !rootfs.exists() {
+                        if let Err(e) = self.st_clone(&img_dir, &rootfs).await {
+                            let _ = self.st_delete(&rootfs).await;
+                            return Err(e);
+                        }
+                    }
+                    provision(&rootfs).await?;
+                    let meta = managed(Some(&m));
+                    {
+                        let mut st = self.st.lock().await;
+                        st.pods.insert(proto::INGRESS_POD.into(), meta.clone());
+                    }
+                    self.save_pod(&meta).map_err(int)?;
+                    meta
+                }
+            }
+            None => {
+                // A stray rootfs without conf is a partial init — it's the
+                // managed name, so cleaning it is safe.
+                if rootfs.exists() {
+                    self.st_delete(&rootfs).await?;
+                }
+                if let Err(e) = self.st_clone(&img_dir, &rootfs).await {
+                    let _ = self.st_delete(&rootfs).await;
+                    return Err(e);
+                }
+                if let Err(e) = provision(&rootfs).await {
+                    let _ = self.st_delete(&rootfs).await;
+                    return Err(e);
+                }
+                let meta = managed(None);
+                {
+                    let mut st = self.st.lock().await;
+                    st.pods.insert(proto::INGRESS_POD.into(), meta.clone());
+                }
+                self.save_pod(&meta).map_err(int)?;
+                meta
+            }
+        };
+        let leader = self.engine.running_pid(&meta.name).await;
+        Ok(Response::new(IngressDeployment {
+            pod: Some(to_pod(&meta, &rootfs, leader)),
+            ca_cert_path: paths.ca_crt.display().to_string(),
+            ca_installed,
+        }))
+    }
+
+    /// `rustypods ingress status`: gateway shape + dataplane liveness.
+    async fn ingress_gateway_status(
+        &self,
+        _req: Request<IngressGatewayStatusRequest>,
+    ) -> Result<Response<IngressGatewayStatusResponse>, Status> {
+        let configured = {
+            let st = self.st.lock().await;
+            st.pods.values().any(|m| m.ingress_gateway)
+        };
+        let running = configured
+            && self
+                .engine
+                .running_pid(proto::INGRESS_POD)
+                .await
+                .is_some();
+        let (control_ready, generation, route_count) = if running {
+            match ingress::gateway_status(&self.cfg.data_dir).await {
+                Ok(s) => (true, s.generation, s.route_count),
+                Err(_) => (false, 0, 0),
+            }
+        } else {
+            (false, 0, 0)
+        };
+        Ok(Response::new(IngressGatewayStatusResponse {
+            configured,
+            running,
+            control_ready,
+            generation,
+            route_count,
+            ca_cert_path: self
+                .cfg
+                .data_dir
+                .join("pki")
+                .join("ca.crt")
+                .display()
+                .to_string(),
+        }))
     }
 
     async fn create_shm(
@@ -2470,6 +3051,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
         engine: engine.clone(),
         storage,
         ops: Default::default(),
+        ingress_generation: Arc::new(AtomicU64::new(0)),
+        ingress_mu: Arc::new(Mutex::new(())),
+        ingress_last_err: Arc::new(Mutex::new(None)),
     };
 
     // Daemon restarted while pods kept running → rebind their agent channels.
@@ -2512,6 +3096,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
                     .map(|m| m.name.clone())
                     .collect()
             };
+            // The gateway goes first: backends' start-time route sync
+            // needs its control socket up.
+            let mut flagged = flagged;
+            flagged.sort_by_key(|n| (n != proto::INGRESS_POD, n.clone()));
             for name in flagged {
                 // Pods that survived a daemon restart are already up.
                 if svc.engine.running_pid(&name).await.is_some() {
@@ -2528,6 +3116,51 @@ pub async fn serve(cfg: Config) -> Result<()> {
                     .await
                 {
                     tracing::warn!("autostart {name}: {e}");
+                }
+            }
+        });
+    }
+
+    // Periodic ingress reconciliation: while a gateway pod is configured
+    // and running, push a fresh snapshot every 2s — heals daemon/gateway
+    // restarts and any drift between starts/stops and the dataplane's
+    // route table. Errors are throttled: identical messages log once,
+    // recovery logs once.
+    {
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let gw_name = {
+                    let st = svc.st.lock().await;
+                    st.pods
+                        .get(proto::INGRESS_POD)
+                        .filter(|m| m.ingress_gateway)
+                        .map(|m| m.name.clone())
+                };
+                let (configured, gw_running) = match gw_name {
+                    Some(n) => (true, svc.engine.running_pid(&n).await.is_some()),
+                    None => (false, false),
+                };
+                if !configured || !gw_running {
+                    continue;
+                }
+                match svc.sync_ingress(None, false).await {
+                    Ok(()) => {
+                        let mut last = svc.ingress_last_err.lock().await;
+                        if last.take().is_some() {
+                            tracing::info!("ingress reconciliation recovered");
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        let mut last = svc.ingress_last_err.lock().await;
+                        if last.as_deref() != Some(msg.as_str()) {
+                            tracing::warn!("ingress reconciliation: {msg}");
+                            *last = Some(msg);
+                        }
+                    }
                 }
             }
         });
@@ -2647,6 +3280,7 @@ mod tests {
             snap_keep_last: 0,
             snap_max_age_secs: 0,
             autostart: false,
+            ingress_gateway: false,
         }
     }
 

@@ -226,6 +226,10 @@ pub struct PodMeta {
     /// Serialized as `snap_max_age = "7d"`.
     #[serde(rename = "snap_max_age", default, with = "duration_field")]
     pub snap_max_age_secs: u64,
+    /// This pod is the managed ingress gateway (rustypods-ingress proxy).
+    /// Only set via InitIngress — conf misuse is checked at load().
+    #[serde(default)]
+    pub ingress_gateway: bool,
     /// Boot with the daemon: serve() start_pod's every flagged pod after
     /// the state scan (failures are logged, never fatal).
     #[serde(default)]
@@ -431,6 +435,36 @@ pub fn load(data_dir: &Path) -> Result<State> {
             }
         }
     }
+    // Exactly one managed ingress gateway may exist, and only under the
+    // reserved name — a hand-edited conf claiming the flag elsewhere
+    // would hijack the managed role, so abort startup (fail closed).
+    let gateways: Vec<&str> = st
+        .pods
+        .values()
+        .filter(|m| m.ingress_gateway)
+        .map(|m| m.name.as_str())
+        .collect();
+    for name in &gateways {
+        if *name != rustypods_proto::INGRESS_POD {
+            anyhow::bail!(
+                "pod {name} claims ingress_gateway but only {} may hold it",
+                rustypods_proto::INGRESS_POD
+            );
+        }
+    }
+    if gateways.len() > 1 {
+        anyhow::bail!("multiple pods claim ingress_gateway ({})", gateways.join(", "));
+    }
+    // …and the reserved name may ONLY be the gateway: an ordinary pod
+    // conf squatting on it would shadow the managed one.
+    if let Some(m) = st.pods.get(rustypods_proto::INGRESS_POD) {
+        if !m.ingress_gateway {
+            anyhow::bail!(
+                "pod {} must be the managed ingress gateway (ingress_gateway = true) — the name is reserved",
+                rustypods_proto::INGRESS_POD
+            );
+        }
+    }
     Ok(st)
 }
 
@@ -528,6 +562,7 @@ fn migrate_json(data_dir: &Path) {
             snap_keep_last: 0,
             snap_max_age_secs: 0,
             autostart: false,
+            ingress_gateway: false,
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");
@@ -570,6 +605,7 @@ mod tests {
             snap_keep_last: 0,
             snap_max_age_secs: 0,
             autostart: false,
+            ingress_gateway: false,
         }
     }
 
@@ -586,6 +622,40 @@ mod tests {
         save_pod(&dir, &meta("b", "a.rustypods.localhost")).unwrap();
         let e = load(&dir).expect_err("shared host must abort load");
         assert!(e.to_string().contains("a.rustypods.localhost"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reserved gateway name and the flag are a two-way lock: a
+    /// gateway under any other name, more than one gateway, or an
+    /// ordinary pod squatting on the reserved name all abort startup —
+    /// none of them can be auto-corrected safely.
+    #[test]
+    fn load_enforces_gateway_invariants() {
+        let dir = std::env::temp_dir().join(format!("rp-gw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Legit gateway loads.
+        let mut gw = meta("rustypods-ingress", "");
+        gw.ingress.clear();
+        gw.ingress_gateway = true;
+        save_pod(&dir, &gw).unwrap();
+        save_pod(&dir, &meta("a", "a.rustypods.localhost")).unwrap();
+        assert!(load(&dir).is_ok(), "single gateway under reserved name");
+
+        // Flag on the wrong name → fail.
+        let mut bad = meta("evil", "");
+        bad.ingress.clear();
+        bad.ingress_gateway = true;
+        save_pod(&dir, &bad).unwrap();
+        assert!(load(&dir).is_err(), "gateway flag on wrong name");
+        std::fs::remove_file(dir.join("conf/pods/evil.conf")).unwrap();
+
+        // Reserved name without the flag → fail.
+        let mut squatter = meta("rustypods-ingress", "");
+        squatter.ingress.clear();
+        save_pod(&dir, &squatter).unwrap();
+        assert!(load(&dir).is_err(), "reserved name without gateway flag");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

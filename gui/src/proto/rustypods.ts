@@ -199,6 +199,11 @@ export interface Pod {
    * across all pods.
    */
   ingress: IngressRule[];
+  /**
+   * This pod IS the ingress gateway (the rustypods-ingress proxy
+   * itself). Managed pod — created only via InitIngress.
+   */
+  ingressGateway: boolean;
 }
 
 export interface PodList {
@@ -460,6 +465,42 @@ export interface IngressStatusRequest {
 export interface IngressStatus {
   generation: number;
   routeCount: number;
+}
+
+/**
+ * InitIngress: image must carry the host-built rustypods-ingress binary
+ * ABI (the daemon copies it in — pick an image matching the host libc,
+ * e.g. debian for a Debian host). install_ca also drops the generated CA
+ * into the host trust store (explicit opt-in — it mutates system trust).
+ */
+export interface InitIngressRequest {
+  image: string;
+  installCa: boolean;
+}
+
+export interface IngressDeployment {
+  pod?:
+    | Pod
+    | undefined;
+  /** Where the local CA cert lives inside the daemon's pki dir. */
+  caCertPath: string;
+  /** Whether the CA was also installed into the host trust store. */
+  caInstalled: boolean;
+}
+
+export interface IngressGatewayStatusRequest {
+}
+
+export interface IngressGatewayStatusResponse {
+  /** The managed gateway pod exists in state. */
+  configured: boolean;
+  /** It currently has a live leader pid. */
+  running: boolean;
+  /** Its control socket answers GetStatus. */
+  controlReady: boolean;
+  generation: number;
+  routeCount: number;
+  caCertPath: string;
 }
 
 function createBaseAgentInfo(): AgentInfo {
@@ -1872,6 +1913,7 @@ function createBasePod(): Pod {
     autostart: false,
     cmd: [],
     ingress: [],
+    ingressGateway: false,
   };
 }
 
@@ -1930,6 +1972,9 @@ export const Pod: MessageFns<Pod> = {
     }
     for (const v of message.ingress) {
       IngressRule.encode(v!, writer.uint32(146).fork()).join();
+    }
+    if (message.ingressGateway !== false) {
+      writer.uint32(152).bool(message.ingressGateway);
     }
     return writer;
   },
@@ -2091,6 +2136,14 @@ export const Pod: MessageFns<Pod> = {
             message.ingress.push(IngressRule.decode(reader, reader.uint32()));
             continue;
           }
+          case 19: {
+            if (tag !== 152) {
+              break;
+            }
+
+            message.ingressGateway = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2151,6 +2204,11 @@ export const Pod: MessageFns<Pod> = {
       ingress: globalThis.Array.isArray(object?.ingress)
         ? object.ingress.map((e: any) => IngressRule.fromJSON(e))
         : [],
+      ingressGateway: isSet(object.ingressGateway)
+        ? globalThis.Boolean(object.ingressGateway)
+        : isSet(object.ingress_gateway)
+        ? globalThis.Boolean(object.ingress_gateway)
+        : false,
     };
   },
 
@@ -2210,6 +2268,9 @@ export const Pod: MessageFns<Pod> = {
     if (message.ingress?.length) {
       obj.ingress = message.ingress.map((e) => IngressRule.toJSON(e));
     }
+    if (message.ingressGateway !== false) {
+      obj.ingressGateway = message.ingressGateway;
+    }
     return obj;
   },
 
@@ -2238,6 +2299,7 @@ export const Pod: MessageFns<Pod> = {
     message.autostart = object.autostart ?? false;
     message.cmd = object.cmd?.map((e) => e) || [];
     message.ingress = object.ingress?.map((e) => IngressRule.fromPartial(e)) || [];
+    message.ingressGateway = object.ingressGateway ?? false;
     return message;
   },
 };
@@ -5310,6 +5372,417 @@ export const IngressStatus: MessageFns<IngressStatus> = {
   },
 };
 
+function createBaseInitIngressRequest(): InitIngressRequest {
+  return { image: "", installCa: false };
+}
+
+export const InitIngressRequest: MessageFns<InitIngressRequest> = {
+  encode(message: InitIngressRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.image !== "") {
+      writer.uint32(10).string(message.image);
+    }
+    if (message.installCa !== false) {
+      writer.uint32(16).bool(message.installCa);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): InitIngressRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseInitIngressRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.image = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.installCa = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): InitIngressRequest {
+    return {
+      image: isSet(object.image) ? globalThis.String(object.image) : "",
+      installCa: isSet(object.installCa)
+        ? globalThis.Boolean(object.installCa)
+        : isSet(object.install_ca)
+        ? globalThis.Boolean(object.install_ca)
+        : false,
+    };
+  },
+
+  toJSON(message: InitIngressRequest): unknown {
+    const obj: any = {};
+    if (message.image !== "") {
+      obj.image = message.image;
+    }
+    if (message.installCa !== false) {
+      obj.installCa = message.installCa;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<InitIngressRequest>, I>>(base?: I): InitIngressRequest {
+    return InitIngressRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<InitIngressRequest>, I>>(object: I): InitIngressRequest {
+    const message = createBaseInitIngressRequest();
+    message.image = object.image ?? "";
+    message.installCa = object.installCa ?? false;
+    return message;
+  },
+};
+
+function createBaseIngressDeployment(): IngressDeployment {
+  return { pod: undefined, caCertPath: "", caInstalled: false };
+}
+
+export const IngressDeployment: MessageFns<IngressDeployment> = {
+  encode(message: IngressDeployment, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.pod !== undefined) {
+      Pod.encode(message.pod, writer.uint32(10).fork()).join();
+    }
+    if (message.caCertPath !== "") {
+      writer.uint32(18).string(message.caCertPath);
+    }
+    if (message.caInstalled !== false) {
+      writer.uint32(24).bool(message.caInstalled);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressDeployment {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressDeployment();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.pod = Pod.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.caCertPath = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.caInstalled = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): IngressDeployment {
+    return {
+      pod: isSet(object.pod) ? Pod.fromJSON(object.pod) : undefined,
+      caCertPath: isSet(object.caCertPath)
+        ? globalThis.String(object.caCertPath)
+        : isSet(object.ca_cert_path)
+        ? globalThis.String(object.ca_cert_path)
+        : "",
+      caInstalled: isSet(object.caInstalled)
+        ? globalThis.Boolean(object.caInstalled)
+        : isSet(object.ca_installed)
+        ? globalThis.Boolean(object.ca_installed)
+        : false,
+    };
+  },
+
+  toJSON(message: IngressDeployment): unknown {
+    const obj: any = {};
+    if (message.pod !== undefined) {
+      obj.pod = Pod.toJSON(message.pod);
+    }
+    if (message.caCertPath !== "") {
+      obj.caCertPath = message.caCertPath;
+    }
+    if (message.caInstalled !== false) {
+      obj.caInstalled = message.caInstalled;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressDeployment>, I>>(base?: I): IngressDeployment {
+    return IngressDeployment.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressDeployment>, I>>(object: I): IngressDeployment {
+    const message = createBaseIngressDeployment();
+    message.pod = (object.pod !== undefined && object.pod !== null) ? Pod.fromPartial(object.pod) : undefined;
+    message.caCertPath = object.caCertPath ?? "";
+    message.caInstalled = object.caInstalled ?? false;
+    return message;
+  },
+};
+
+function createBaseIngressGatewayStatusRequest(): IngressGatewayStatusRequest {
+  return {};
+}
+
+export const IngressGatewayStatusRequest: MessageFns<IngressGatewayStatusRequest> = {
+  encode(_: IngressGatewayStatusRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressGatewayStatusRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressGatewayStatusRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(_: any): IngressGatewayStatusRequest {
+    return {};
+  },
+
+  toJSON(_: IngressGatewayStatusRequest): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressGatewayStatusRequest>, I>>(base?: I): IngressGatewayStatusRequest {
+    return IngressGatewayStatusRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressGatewayStatusRequest>, I>>(_: I): IngressGatewayStatusRequest {
+    const message = createBaseIngressGatewayStatusRequest();
+    return message;
+  },
+};
+
+function createBaseIngressGatewayStatusResponse(): IngressGatewayStatusResponse {
+  return { configured: false, running: false, controlReady: false, generation: 0, routeCount: 0, caCertPath: "" };
+}
+
+export const IngressGatewayStatusResponse: MessageFns<IngressGatewayStatusResponse> = {
+  encode(message: IngressGatewayStatusResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.configured !== false) {
+      writer.uint32(8).bool(message.configured);
+    }
+    if (message.running !== false) {
+      writer.uint32(16).bool(message.running);
+    }
+    if (message.controlReady !== false) {
+      writer.uint32(24).bool(message.controlReady);
+    }
+    if (message.generation !== 0) {
+      writer.uint32(32).uint64(message.generation);
+    }
+    if (message.routeCount !== 0) {
+      writer.uint32(40).uint32(message.routeCount);
+    }
+    if (message.caCertPath !== "") {
+      writer.uint32(50).string(message.caCertPath);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressGatewayStatusResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressGatewayStatusResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.configured = reader.bool();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.running = reader.bool();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.controlReady = reader.bool();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.generation = longToNumber(reader.uint64());
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.routeCount = reader.uint32();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.caCertPath = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): IngressGatewayStatusResponse {
+    return {
+      configured: isSet(object.configured) ? globalThis.Boolean(object.configured) : false,
+      running: isSet(object.running) ? globalThis.Boolean(object.running) : false,
+      controlReady: isSet(object.controlReady)
+        ? globalThis.Boolean(object.controlReady)
+        : isSet(object.control_ready)
+        ? globalThis.Boolean(object.control_ready)
+        : false,
+      generation: isSet(object.generation) ? globalThis.Number(object.generation) : 0,
+      routeCount: isSet(object.routeCount)
+        ? globalThis.Number(object.routeCount)
+        : isSet(object.route_count)
+        ? globalThis.Number(object.route_count)
+        : 0,
+      caCertPath: isSet(object.caCertPath)
+        ? globalThis.String(object.caCertPath)
+        : isSet(object.ca_cert_path)
+        ? globalThis.String(object.ca_cert_path)
+        : "",
+    };
+  },
+
+  toJSON(message: IngressGatewayStatusResponse): unknown {
+    const obj: any = {};
+    if (message.configured !== false) {
+      obj.configured = message.configured;
+    }
+    if (message.running !== false) {
+      obj.running = message.running;
+    }
+    if (message.controlReady !== false) {
+      obj.controlReady = message.controlReady;
+    }
+    if (message.generation !== 0) {
+      obj.generation = Math.round(message.generation);
+    }
+    if (message.routeCount !== 0) {
+      obj.routeCount = Math.round(message.routeCount);
+    }
+    if (message.caCertPath !== "") {
+      obj.caCertPath = message.caCertPath;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressGatewayStatusResponse>, I>>(base?: I): IngressGatewayStatusResponse {
+    return IngressGatewayStatusResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressGatewayStatusResponse>, I>>(object: I): IngressGatewayStatusResponse {
+    const message = createBaseIngressGatewayStatusResponse();
+    message.configured = object.configured ?? false;
+    message.running = object.running ?? false;
+    message.controlReady = object.controlReady ?? false;
+    message.generation = object.generation ?? 0;
+    message.routeCount = object.routeCount ?? 0;
+    message.caCertPath = object.caCertPath ?? "";
+    return message;
+  },
+};
+
 /**
  * Control plane: pod lifecycle over a Unix domain socket.
  * Phase-2 RPCs (Exec, PodMetrics, StreamLogs) are declared now for API
@@ -5535,6 +6008,26 @@ export const PodControlDefinition = {
       requestType: ShmRef as typeof ShmRef,
       requestStream: false,
       responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Provision/start the managed ingress gateway pod (local PKI + the
+     * rustypods-ingress proxy), and report its health/route table.
+     */
+    initIngress: {
+      name: "InitIngress",
+      requestType: InitIngressRequest as typeof InitIngressRequest,
+      requestStream: false,
+      responseType: IngressDeployment as typeof IngressDeployment,
+      responseStream: false,
+      options: {},
+    },
+    ingressGatewayStatus: {
+      name: "IngressGatewayStatus",
+      requestType: IngressGatewayStatusRequest as typeof IngressGatewayStatusRequest,
+      requestStream: false,
+      responseType: IngressGatewayStatusResponse as typeof IngressGatewayStatusResponse,
       responseStream: false,
       options: {},
     },

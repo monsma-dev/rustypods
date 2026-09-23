@@ -295,10 +295,8 @@ mod tests {
             canonical_host(&headers(&[("host", "Web.Rustypods.Localhost:8443")])).unwrap(),
             "web.rustypods.localhost"
         );
-        assert_eq!(
-            canonical_host(&headers(&[("host", "api.dev.rustypods.localhost")])).unwrap(),
-            "api.dev.rustypods.localhost"
-        );
+        // Nested names are malformed — one label only (wildcard SAN).
+        assert!(canonical_host(&headers(&[("host", "api.dev.rustypods.localhost")])).is_err());
     }
 
     #[tokio::test]

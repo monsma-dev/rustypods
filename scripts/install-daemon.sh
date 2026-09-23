@@ -208,7 +208,7 @@ TARGET_UID="$(id -u "$USER_NAME" 2>/dev/null)" \
   || die "user $USER_NAME has non-positive/invalid uid"
 
 MISSING=()
-for b in rustypodsd rustypods rustypods-agent; do
+for b in rustypodsd rustypods rustypods-agent rustypods-ingress; do
   [[ -x "$REPO_ROOT/target/release/$b" ]] || MISSING+=("$b")
 done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
@@ -227,14 +227,16 @@ ENV_DST=/etc/rustypods/daemon.env
 POLKIT_DST=/etc/polkit-1/rules.d/49-rustypods.rules
 # Every file the install may overwrite — backed up before first mutation.
 MANAGED=(/usr/local/bin/rustypodsd /usr/local/bin/rustypods \
-         /var/lib/rustypods/bin/rustypods-agent "$UNIT_DST" "$ENV_DST")
+         /var/lib/rustypods/bin/rustypods-agent \
+         /var/lib/rustypods/bin/rustypods-ingress "$UNIT_DST" "$ENV_DST")
 if [[ $INSTALL_POLKIT -eq 1 ]]; then
   MANAGED+=("$POLKIT_DST")
 fi
 DATA_DIRS=(/var/lib/rustypods/images /var/lib/rustypods/pods \
            /var/lib/rustypods/logs /var/lib/rustypods/bin \
            /var/lib/rustypods/conf /var/lib/rustypods/conf/pods \
-           /var/lib/rustypods/conf/images /var/lib/rustypods/snapshots)
+           /var/lib/rustypods/conf/images /var/lib/rustypods/snapshots \
+           /var/lib/rustypods/pki)
 
 # ── dry run ──────────────────────────────────────────────────────────────
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -250,7 +252,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   fi
   echo "    user:          $USER_NAME (uid $TARGET_UID)"
   echo "    binaries:      install -Dm755 target/release/{rustypodsd,rustypods} → /usr/local/bin/"
-  echo "                   install -Dm755 target/release/rustypods-agent → /var/lib/rustypods/bin/"
+  echo "                   install -Dm755 target/release/rustypods-{agent,ingress} → /var/lib/rustypods/bin/"
   printf '    data dirs:     %s\n' "${DATA_DIRS[*]}"
   echo "    unit:          deploy/rustypodsd.service → $UNIT_DST"
   echo "    env file:      $ENV_DST → RUSTYPODS_ALLOWED_UID=$TARGET_UID"
@@ -292,6 +294,7 @@ MUTATED=1
 install -Dm755 "$REPO_ROOT/target/release/rustypodsd" /usr/local/bin/rustypodsd
 install -Dm755 "$REPO_ROOT/target/release/rustypods" /usr/local/bin/rustypods
 install -Dm755 "$REPO_ROOT/target/release/rustypods-agent" /var/lib/rustypods/bin/rustypods-agent
+install -Dm755 "$REPO_ROOT/target/release/rustypods-ingress" /var/lib/rustypods/bin/rustypods-ingress
 
 # ── data dirs ────────────────────────────────────────────────────────────
 echo "==> [3/6] data dirs (btrfs CoW lives here)"

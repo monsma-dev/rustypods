@@ -244,6 +244,36 @@ enum Cmd {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Managed ingress gateway: TLS-terminating reverse proxy for
+    /// `*.rustypods.localhost` backed by a local PKI.
+    Ingress {
+        #[command(subcommand)]
+        sub: IngressCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum IngressCmd {
+    /// Provision the gateway pod (local PKI + dataplane binary) and start
+    /// it. The image must be ABI-compatible with the host-built
+    /// `rustypods-ingress` binary that gets copied in — it RUNS inside
+    /// this rootfs. Debian host → a Debian-family image, Fedora →
+    /// Fedora-family; on this machine `arch-base` matches the dev pod
+    /// toolchain.
+    Init {
+        /// Image to clone the gateway rootfs from (ABI-compatible with
+        /// the host's binary build — see above).
+        #[arg(long)]
+        image: String,
+        /// Also install the generated CA into the HOST system trust
+        /// store (update-ca-certificates / update-ca-trust — mutates
+        /// system trust; skip it to import the CA yourself).
+        #[arg(long)]
+        install_ca: bool,
+    },
+    /// Show gateway state: configured/running, dataplane liveness,
+    /// applied snapshot generation and route count, CA path.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -870,6 +900,57 @@ async fn main() -> Result<()> {
         Cmd::Cp { src, dst, user } => {
             cp_cmd(cli.socket, cli.remote, src, dst, user).await?;
         }
+        Cmd::Ingress { sub } => match sub {
+            IngressCmd::Init { image, install_ca } => {
+                let d = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .init_ingress(InitIngressRequest {
+                        image,
+                        install_ca,
+                    })
+                    .await?
+                    .into_inner();
+                let Some(pod) = d.pod else {
+                    anyhow::bail!("daemon returned no gateway pod");
+                };
+                // Init provisions but doesn't boot — start it like
+                // `rustypods start` would (already-running is a no-op).
+                let pod = if pod.state == PodState::Running as i32 {
+                    pod
+                } else {
+                    connect(cli.socket.clone(), cli.remote.clone())
+                        .await?
+                        .start_pod(StartPodRequest {
+                            name: pod.name.clone(),
+                            limits: None,
+                            ephemeral: false,
+                            private_users: None,
+                        })
+                        .await?
+                        .into_inner()
+                };
+                println!("ca:    {}", d.ca_cert_path);
+                println!("trust: {}", if d.ca_installed {
+                    "installed into host store"
+                } else {
+                    "not installed (re-run with --install-ca or import the CA yourself)"
+                });
+                print_pod(&pod);
+            }
+            IngressCmd::Status => {
+                let s = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .ingress_gateway_status(IngressGatewayStatusRequest {})
+                    .await?
+                    .into_inner();
+                println!("configured:    {}", s.configured);
+                println!("running:       {}", s.running);
+                println!("control ready: {}", s.control_ready);
+                println!("generation:    {}", s.generation);
+                println!("routes:        {}", s.route_count);
+                println!("ca:            {}", s.ca_cert_path);
+            }
+        },
         Cmd::Ping => {
             let i = connect(cli.socket.clone(), cli.remote.clone()).await?.ping(PingRequest {}).await?.into_inner();
             println!("rustypodsd v{}", i.version);

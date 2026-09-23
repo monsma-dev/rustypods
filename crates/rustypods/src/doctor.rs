@@ -341,10 +341,12 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         ),
     }
 
+    let mut daemon_up = false;
     match rustypods_client::connect_timeout(socket.clone(), None, Duration::from_secs(2)).await {
         Ok(mut c) => match c.ping(rustypods_proto::rpc::PingRequest {}).await {
             Ok(i) => {
                 let i = i.into_inner();
+                daemon_up = true;
                 chk!(
                     Level::Pass,
                     "daemon",
@@ -362,6 +364,30 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             "not reachable at {} ({e:#}) — install/start rustypodsd",
             socket.display()
         ),
+    }
+
+    // The ingress gateway binary ships next to the daemon — the installer
+    // plants it under <data>/bin. Once the daemon is up its absence is a
+    // real defect (init can't provision); before install it's expected.
+    let ingress_bin = Path::new("/var/lib/rustypods/bin/rustypods-ingress");
+    match std::fs::metadata(ingress_bin) {
+        Ok(md) if md.is_file() => {
+            use std::os::unix::fs::PermissionsExt;
+            if md.permissions().mode() & 0o111 != 0 {
+                chk!(Level::Pass, "ingress", "{} installed + executable", ingress_bin.display());
+            } else if daemon_up {
+                chk!(Level::Fail, "ingress", "{} not executable", ingress_bin.display());
+            } else {
+                chk!(Level::Warn, "ingress", "{} not executable", ingress_bin.display());
+            }
+        }
+        _ => {
+            if daemon_up {
+                chk!(Level::Fail, "ingress", "{} missing — reinstall the daemon binaries", ingress_bin.display());
+            } else {
+                chk!(Level::Warn, "ingress", "{} not installed yet", ingress_bin.display());
+            }
+        }
     }
 
     let ver =

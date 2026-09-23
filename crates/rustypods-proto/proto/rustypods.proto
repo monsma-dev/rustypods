@@ -47,6 +47,11 @@ service PodControl {
   rpc CreateShm(ShmRequest) returns (ShmSegment);
   rpc ListShm(PodRef) returns (ShmList);
   rpc RemoveShm(ShmRef) returns (Empty);
+
+  // Provision/start the managed ingress gateway pod (local PKI + the
+  // rustypods-ingress proxy), and report its health/route table.
+  rpc InitIngress(InitIngressRequest) returns (IngressDeployment);
+  rpc IngressGatewayStatus(IngressGatewayStatusRequest) returns (IngressGatewayStatusResponse);
 }
 
 // In-pod agent → daemon, on the per-pod socket /run/rustypods/run/agent.sock.
@@ -181,6 +186,9 @@ message Pod {
   // address once the ingress proxy lands; each host is globally unique
   // across all pods.
   repeated IngressRule ingress = 18;
+  // This pod IS the ingress gateway (the rustypods-ingress proxy
+  // itself). Managed pod — created only via InitIngress.
+  bool ingress_gateway = 19;
 }
 
 message PodList {
@@ -409,4 +417,35 @@ message IngressStatusRequest {}
 message IngressStatus {
   uint64 generation = 1;
   uint32 route_count = 2;
+}
+
+// InitIngress: image must carry the host-built rustypods-ingress binary
+// ABI (the daemon copies it in — pick an image matching the host libc,
+// e.g. debian for a Debian host). install_ca also drops the generated CA
+// into the host trust store (explicit opt-in — it mutates system trust).
+message InitIngressRequest {
+  string image = 1;
+  bool install_ca = 2;
+}
+
+message IngressDeployment {
+  Pod pod = 1;
+  // Where the local CA cert lives inside the daemon's pki dir.
+  string ca_cert_path = 2;
+  // Whether the CA was also installed into the host trust store.
+  bool ca_installed = 3;
+}
+
+message IngressGatewayStatusRequest {}
+
+message IngressGatewayStatusResponse {
+  // The managed gateway pod exists in state.
+  bool configured = 1;
+  // It currently has a live leader pid.
+  bool running = 2;
+  // Its control socket answers GetStatus.
+  bool control_ready = 3;
+  uint64 generation = 4;
+  uint32 route_count = 5;
+  string ca_cert_path = 6;
 }

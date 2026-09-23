@@ -42,9 +42,18 @@ pub fn conf_dir(data_dir: &std::path::Path) -> PathBuf {
 /// In-pod paths (container side of the binds).
 pub const POD_RUN_DIR: &str = "/run/rustypods/run";
 pub const POD_AGENT_SOCK: &str = "/run/rustypods/run/agent.sock";
-/// rustypods-ingress control socket (host side; root-only 0600).
+/// In-pod control socket path of the rustypods-ingress gateway — the
+/// daemon reaches it at [`ingress_socket`] on the host side.
 pub const POD_INGRESS_SOCK: &str = "/run/rustypods/run/ingress.sock";
 pub const POD_SHM_DIR: &str = "/run/rustypods/shm";
+
+/// The managed gateway pod's reserved name.
+pub const INGRESS_POD: &str = "rustypods-ingress";
+/// Host path of the gateway's control socket (inside the pod it is
+/// [`POD_INGRESS_SOCK`] on the bound run dir).
+pub fn ingress_socket(data_dir: &std::path::Path) -> PathBuf {
+    run_dir(data_dir, INGRESS_POD).join("ingress.sock")
+}
 
 /// Pod/image names double as nspawn machine names and directory names.
 /// Keep them to a strict hostname-ish slug.
@@ -208,6 +217,11 @@ fn validate_ingress_host(host: &str) -> anyhow::Result<()> {
     };
     if prefix.is_empty() {
         anyhow::bail!("host '{host}' needs at least one label before {INGRESS_SUFFIX}");
+    }
+    // Exactly ONE label: the local TLS cert carries a single wildcard SAN
+    // (*.rustypods.localhost), which only matches first-level names.
+    if prefix.contains('.') {
+        anyhow::bail!("host '{host}' must be exactly one label before {INGRESS_SUFFIX}");
     }
     for label in prefix.split('.') {
         if label.is_empty() {
@@ -493,9 +507,8 @@ mod tests {
         let r = parse_ingress_rule("web.rustypods.localhost:8080").unwrap();
         assert_eq!(r.host, "web.rustypods.localhost");
         assert_eq!(r.pod_port, 8080);
-        let r = parse_ingress_rule("api.dev.rustypods.localhost:443").unwrap();
-        assert_eq!(r.host, "api.dev.rustypods.localhost");
-        assert_eq!(r.pod_port, 443);
+        // Exactly one label: nested names can't match the wildcard SAN.
+        assert!(parse_ingress_rule("api.dev.rustypods.localhost:443").is_err());
         // Suffix-only, no label in front.
         assert!(parse_ingress_rule(".rustypods.localhost:80").is_err());
         assert!(parse_ingress_rule("rustypods.localhost:80").is_err());

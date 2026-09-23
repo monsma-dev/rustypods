@@ -49,7 +49,9 @@ socket2 = "=0.5.10"
 libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 axum = "=0.8.9"
-oci-client = "=0.18.0"
+# no-provider + rustypodsd's ring install_default() keeps aws-lc-rs out
+# of the whole tree — same provider choice as the ingress dataplane.
+oci-client = { version = "=0.18.0", default-features = false, features = ["rustls-tls-no-provider"] }
 tar = "=0.4.46"
 flate2 = "=1.1.10"
 zstd = "=0.13.3"

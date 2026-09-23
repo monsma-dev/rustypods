@@ -176,14 +176,38 @@ fn prepare_socket_path(sock: &Path) -> Result<()> {
 }
 
 /// Serve IngressControl on `sock` (0600, root-only) until `shutdown`.
+/// The pod's runtime binds its run dir root-owned before our userns
+/// chown lands — a transient PermissionDenied isn't a failure yet, so
+/// retry it (and a missing parent) for up to 15s. Any non-socket
+/// squatter still fails immediately: that's corruption, not timing.
 pub async fn serve(
     sock: &Path,
     state: Arc<RouteState>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    prepare_socket_path(sock)?;
-    let listener = UnixListener::bind(sock)
-        .with_context(|| format!("bind {}", sock.display()))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let listener = loop {
+        match prepare_socket_path(sock).and_then(|()| {
+            UnixListener::bind(sock).with_context(|| format!("bind {}", sock.display()))
+        }) {
+            Ok(l) => break l,
+            Err(e) => {
+                let retry = e
+                    .downcast_ref::<std::io::Error>()
+                    .map(|io| {
+                        matches!(
+                            io.kind(),
+                            ErrorKind::PermissionDenied | ErrorKind::NotFound
+                        )
+                    })
+                    .unwrap_or(false);
+                if !retry || std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    };
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", sock.display()))?;

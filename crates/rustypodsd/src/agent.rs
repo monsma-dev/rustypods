@@ -106,17 +106,24 @@ pub async fn spawn_listener(
     Ok(())
 }
 
+/// The kuid/kgid that container root (0) maps to for this leader's userns
+/// — first line of /proc/<leader>/{u,g}id_map, second column. `None` when
+/// the map can't be read (leader exited, or unreadable).
+pub fn mapped_root_ids(leader: u32) -> Option<(u32, u32)> {
+    let mapped = |kind: &str| -> Option<u32> {
+        let m = std::fs::read_to_string(format!("/proc/{leader}/{kind}_map")).ok()?;
+        m.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+    };
+    Some((mapped("uid")?, mapped("gid")?))
+}
+
 /// For a userns pod, re-own `<run_dir>/agent.sock` to the kuid/kgid that
 /// container uid/gid 0 map to (first line of the leader's {u,g}id_map) —
 /// the socket is root:root 0660 and would otherwise be unreachable for
 /// the in-pod agent. Pods on the identity map (private_users=false) map
 /// 0→0: nothing to do.
 pub fn chown_sock_for_userns(run_dir: &Path, leader: u32) {
-    let mapped = |kind: &str| -> Option<u32> {
-        let m = std::fs::read_to_string(format!("/proc/{leader}/{kind}_map")).ok()?;
-        m.lines().next()?.split_whitespace().nth(1)?.parse().ok()
-    };
-    let (Some(uid), Some(gid)) = (mapped("uid"), mapped("gid")) else {
+    let Some((uid, gid)) = mapped_root_ids(leader) else {
         // Usually the leader exited before we read /proc — the socket then
         // stays root:root 0660 and the in-pod agent can't connect, so
         // metrics stay absent until the next start. Loud, not silent.
@@ -132,6 +139,36 @@ pub fn chown_sock_for_userns(run_dir: &Path, leader: u32) {
     let sock = run_dir.join("agent.sock");
     if let Err(e) = std::os::unix::fs::chown(&sock, Some(uid), Some(gid)) {
         tracing::warn!("chown {} for userns pod: {e}", sock.display());
+    }
+}
+
+/// For a userns pod, re-own the whole run dir (not just agent.sock) to
+/// the mapped container root — the ingress gateway's control socket and
+/// other in-pod-managed runtime artifacts land here. The dir must be a
+/// real directory (symlink metadata, never follows).
+pub fn chown_run_dir_for_userns(run_dir: &Path, leader: u32) {
+    let Some((uid, gid)) = mapped_root_ids(leader) else {
+        tracing::warn!(
+            "userns map for leader {leader} unreadable; skipping run-dir chown — pod-managed sockets in {} may be unreachable",
+            run_dir.display()
+        );
+        return;
+    };
+    if uid == 0 {
+        return; // identity map — container root IS host root
+    }
+    match std::fs::symlink_metadata(run_dir) {
+        Ok(md) if !md.file_type().is_dir() => {
+            tracing::warn!("{} is not a real directory — run-dir chown skipped", run_dir.display());
+        }
+        Err(e) => {
+            tracing::warn!("stat {} for run-dir chown: {e}", run_dir.display());
+        }
+        Ok(_) => {
+            if let Err(e) = std::os::unix::fs::chown(run_dir, Some(uid), Some(gid)) {
+                tracing::warn!("chown {} for userns pod: {e}", run_dir.display());
+            }
+        }
     }
 }
 

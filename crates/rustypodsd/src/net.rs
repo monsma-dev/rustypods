@@ -369,12 +369,31 @@ fn port_rule_ports(spec: &str) -> Option<(u16, u16, &'static str)> {
 /// Rebuild the `ip rustypods` table from scratch for `pods` — every running
 /// pod with a net_index contributes DNAT rules; masquerade covers outbound.
 /// Idempotent and self-healing: any drift is corrected on the next call.
-pub fn rebuild_nat<'a>(
+/// The whole nft transaction for both managed tables, generated from
+/// state. Pure so tests (and `nft --check`) can inspect it.
+///
+/// Tables:
+/// - `ip rustypods`: user port DNAT (prerouting + fib-local output),
+///   host→pod and pod-egress masquerade — unchanged semantics. When the
+///   ingress gateway runs it ALSO gets loopback-only OUTPUT rules for
+///   80/443 → gateway :8080/:8443. Ingress rules live in OUTPUT only —
+///   never prerouting, so nothing off-LAN can reach them.
+/// - `ip6 rustypods6`: always managed (created+flushed even without a
+///   gateway so stale rules die). ::1 OUTPUT dnat for the gateway plus
+///   ULA postrouting masquerade covering loopback→pod and pod egress.
+pub fn nat_script<'a>(
     pods: impl Iterator<Item = &'a PodMeta>,
     running: &std::collections::BTreeSet<String>,
-) {
+) -> String {
     let mut dnat = String::new();
+    let mut gw: Option<u32> = None;
     for m in pods.filter(|m| m.net_index > 0 && running.contains(&m.name)) {
+        if m.ingress_gateway {
+            // Exactly one gateway is enforced at load; last one wins if
+            // a hand-built state slips through — harmless, same shape.
+            gw = Some(m.net_index);
+            continue;
+        }
         for spec in &m.ports {
             let Some((hp, pp, proto)) = port_rule_ports(spec) else {
                 continue;
@@ -388,6 +407,22 @@ pub fn rebuild_nat<'a>(
             ));
         }
     }
+    // Loopback-only ingress redirects — OUTPUT hook, 127/8 + ::1
+    // destinations, so a packet that arrived on any interface can never
+    // match (no prerouting chain carries these at all).
+    let (mut gw_v4, mut gw_v6_out) = (String::new(), String::new());
+    if let Some(idx) = gw {
+        let v4 = pod_ip(idx);
+        let v6 = pod_ip6(idx);
+        gw_v4.push_str(&format!(
+            "    ip daddr 127.0.0.0/8 tcp dport 80 dnat ip to {v4}:8080\n\
+             \x20   ip daddr 127.0.0.0/8 tcp dport 443 dnat ip to {v4}:8443\n"
+        ));
+        gw_v6_out.push_str(&format!(
+            "    ip6 daddr ::1 tcp dport 80 dnat ip6 to [{v6}]:8080\n\
+             \x20   ip6 daddr ::1 tcp dport 443 dnat ip6 to [{v6}]:8443\n"
+        ));
+    }
     let rules = format!(
         "table ip rustypods {{\n\
          \x20 chain prerouting {{\n\
@@ -396,6 +431,7 @@ pub fn rebuild_nat<'a>(
          \x20 }}\n\
          \x20 chain output {{\n\
          \x20   type nat hook output priority -100; policy accept;\n\
+         {gw_v4}\
          {dnat}\
          \x20 }}\n\
          \x20 chain postrouting {{\n\
@@ -406,34 +442,138 @@ pub fn rebuild_nat<'a>(
          \x20   # pod egress onto the real network\n\
          \x20   ip saddr 10.220.0.0/16 oifname != \"ve-*\" masquerade\n\
          \x20 }}\n\
+         }}\n\
+         table ip6 rustypods6 {{\n\
+         \x20 chain output {{\n\
+         \x20   type nat hook output priority -100; policy accept;\n\
+         {gw_v6_out}\
+         \x20 }}\n\
+         \x20 chain postrouting {{\n\
+         \x20   type nat hook postrouting priority srcnat; policy accept;\n\
+         \x20   # ::1-originated traffic dnat'd to a pod ULA needs SNAT\n\
+         \x20   ip6 saddr ::1 ip6 daddr fd22:220::/32 masquerade\n\
+         \x20   # ULA pod egress onto the real network\n\
+         \x20   ip6 saddr fd22:220::/32 oifname != \"ve-*\" masquerade\n\
+         \x20 }}\n\
          }}\n"
     );
-    // Flush+replace atomically: declare the table (idempotent), delete its
-    // old ruleset, recreate from live state.
-    let script =
-        format!("add table ip rustypods\ndelete table ip rustypods\n{rules}");
-    let res = (|| -> Result<()> {
-        use std::io::Write;
-        let mut c = Command::new("nft")
-            .args(["-f", "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("spawn nft")?;
-        c.stdin.take().unwrap().write_all(script.as_bytes())?;
-        let st = c.wait()?;
-        if !st.success() {
-            bail!("nft -f exited {st}");
-        }
-        Ok(())
-    })();
-    if let Err(e) = res {
-        tracing::warn!("nft rebuild failed: {e:#}");
+    // Flush+replace atomically: declare each table (idempotent), delete
+    // the old ruleset, recreate from live state.
+    format!(
+        "add table ip rustypods\ndelete table ip rustypods\n\
+         add table ip6 rustypods6\ndelete table ip6 rustypods6\n\
+         {rules}"
+    )
+}
+
+/// Apply the generated transaction — strict: nft failures propagate
+/// (callers decide whether a NAT failure unwinds a start or only warns
+/// on stop paths).
+pub fn rebuild_nat<'a>(
+    pods: impl Iterator<Item = &'a PodMeta>,
+    running: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let script = nat_script(pods, running);
+    use std::io::Write;
+    let mut c = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn nft")?;
+    c.stdin.take().unwrap().write_all(script.as_bytes())?;
+    let st = c.wait()?;
+    if !st.success() {
+        bail!("nft -f exited {st}");
     }
+    Ok(())
+}
+
+/// TCP 80+443 on BOTH loopback stacks must be free before the gateway
+/// claims them via nft redirect — nft doesn't take a userspace bind, so
+/// an existing listener would be silently hijacked otherwise. Bind tests
+/// only; closed immediately.
+pub fn check_ingress_ports_free() -> Result<()> {
+    for (ip, port) in [
+        (std::net::IpAddr::from([127, 0, 0, 1]), 80u16),
+        (std::net::IpAddr::from([127, 0, 0, 1]), 443),
+        (std::net::IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]), 80),
+        (std::net::IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]), 443),
+    ] {
+        let addr = std::net::SocketAddr::new(ip, port);
+        match std::net::TcpListener::bind(addr) {
+            Ok(l) => drop(l),
+            Err(e) => {
+                bail!("ingress needs {addr} free on the host — {e}");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gw_meta() -> PodMeta {
+        use crate::state::LimitsSpec;
+        PodMeta {
+            name: "rustypods-ingress".into(),
+            image: "img".into(),
+            created_unix: 0,
+            limits: LimitsSpec::default(),
+            ephemeral: false,
+            private_users: true,
+            started: false,
+            storage_max_bytes: 0,
+            ports: vec![],
+            ingress: vec![],
+            net_index: 7,
+            stack: String::new(),
+            binds: vec![],
+            cmd: vec![],
+            snap_keep_last: 0,
+            snap_max_age_secs: 0,
+            autostart: false,
+            ingress_gateway: true,
+        }
+    }
+
+    fn running(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn gateway_rules_are_local_only() {
+        let gw = gw_meta();
+        let s = nat_script([&gw].into_iter(), &running(&["rustypods-ingress"]));
+        assert!(s.contains("ip daddr 127.0.0.0/8 tcp dport 80 dnat ip to 10.220.7.2:8080"));
+        assert!(s.contains("ip daddr 127.0.0.0/8 tcp dport 443 dnat ip to 10.220.7.2:8443"));
+        assert!(s.contains("ip6 daddr ::1 tcp dport 80 dnat ip6 to [fd22:220:7::2]:8080"));
+        // The gateway rules sit ONLY in the output chain: the prerouting
+        // block must not contain dport 80/443 redirects at all.
+        let prerouting = &s[s.find("chain prerouting").unwrap()..s.find("chain output").unwrap()];
+        assert!(!prerouting.contains("8080") && !prerouting.contains("8443"));
+        // Both managed tables always emitted.
+        assert!(s.contains("add table ip6 rustypods6"));
+        assert!(s.contains("delete table ip6 rustypods6"));
+    }
+
+    #[test]
+    fn gateway_rules_absent_when_stopped() {
+        let gw = gw_meta();
+        let s = nat_script([&gw].into_iter(), &running(&[]));
+        assert!(!s.contains("8080") && !s.contains("8443"));
+        assert!(!s.contains("tcp dport 80"));
+        // v6 table still managed (stale rules get flushed).
+        assert!(s.contains("table ip6 rustypods6"));
+    }
+
+    #[test]
+    fn gateway_rules_absent_without_gateway() {
+        let s = nat_script(std::iter::empty(), &running(&[]));
+        assert!(!s.contains("8080"));
+        assert!(s.contains("add table ip rustypods"));
+    }
 
     #[test]
     fn address_helpers() {

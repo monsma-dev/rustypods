@@ -170,7 +170,7 @@ cpu_quota_percent = 50
 name = "shop"
 [pods.web]
 image = "arch-base"
-ingress = ["web.rustypods.localhost:8080", "api.dev.rustypods.localhost:443"]
+ingress = ["web.rustypods.localhost:8080", "api.rustypods.localhost:443"]
 [pods.db]
 image = "arch-base"
 "#;

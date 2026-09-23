@@ -182,6 +182,29 @@ automatically. Privileged pod ports (<1024) need `--user root` inside the
 pod, same as anywhere. Note: pods with ports lose host-net parity — DNS and
 outbound go through the NAT, and the pod's own IP replaces `localhost`.
 
+### Ingress gateway (local HTTPS for `*.rustypods.localhost`)
+
+A managed `rustypods-ingress` pod terminates TLS and reverse-proxies to
+pods' `--ingress` rules; the daemon pushes complete route snapshots over
+its control socket whenever pods start/stop. Provision it once:
+
+```bash
+# --image must be ABI-compatible with the HOST-built rustypods-ingress
+# binary that gets copied into the rootfs: Debian host → a Debian-family
+# image, Fedora → Fedora-family; on this machine use `arch-base`.
+rustypods ingress init --image arch-base          # provisions + starts
+rustypods ingress init --image arch-base --install-ca
+rustypods ingress status
+```
+
+`--install-ca` writes the generated CA (`/var/lib/rustypods/pki/ca.crt`)
+into the host's system trust store (`update-ca-certificates` /
+`update-ca-trust`) — it **mutates system trust**; skip it and import the
+CA into your browser/store yourself if you prefer. Host loopback
+`127.0.0.0/8` and `::1` ports 80/443 are redirected to the gateway via
+nft OUTPUT rules only — nothing on the LAN can reach it, and init/start
+refuses if either port is already bound.
+
 ## Stacks (Compose / K8s-pod model)
 
 ```toml

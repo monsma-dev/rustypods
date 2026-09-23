@@ -37,14 +37,26 @@ struct Args {
     /// Snapshot GC sweep interval in seconds.
     #[arg(long, default_value_t = 300)]
     gc_interval_secs: u64,
+
+    /// Print the nftables transaction the daemon would apply (every
+    /// networked pod treated as running) and exit — for piping into
+    /// `nft --check -f -` on the host. Applies nothing.
+    #[arg(long, hide = true)]
+    print_nat: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
+    // reqwest (oci-client) is built with rustls-no-provider — install the
+    // ring backend process-wide before any OCI pull touches TLS.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("rustls ring provider already installed"))?;
     // The REST API is bearer-token gated but carries root-equivalent power
     // over plain HTTP — keep it on loopback unless the operator opts out.
     if !args.http_addr.is_empty() {
@@ -79,6 +91,19 @@ async fn main() -> Result<()> {
         }
     };
     rustypods_proto::validate_unix_user(&import_user)?;
+    if args.print_nat {
+        let st = rustypodsd::state::load(&args.data_dir)?;
+        // Treat every networked pod as running so the generated script
+        // shows the FULL rule shape (incl. gateway redirects) for check.
+        let running: std::collections::BTreeSet<String> = st
+            .pods
+            .values()
+            .filter(|m| m.net_index > 0)
+            .map(|m| m.name.clone())
+            .collect();
+        print!("{}", rustypodsd::net::nat_script(st.pods.values(), &running));
+        return Ok(());
+    }
     server::serve(Config {
         data_dir: args.data_dir,
         socket: args.socket,
