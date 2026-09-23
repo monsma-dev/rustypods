@@ -80,6 +80,10 @@ enum Cmd {
         /// Boot this pod automatically whenever the daemon starts.
         #[arg(long)]
         autostart: bool,
+        /// Ingress rule <host>.rustypods.localhost:<pod-port>; repeatable.
+        /// Implies private networking (--network-veth).
+        #[arg(long)]
+        ingress: Vec<String>,
         /// Payload command override, e.g. --cmd sh -c '...' — replaces the
         /// image's entrypoint+cmd and forces non-boot mode. Everything after
         /// --cmd is command argv, so it must be the final rustypods option.
@@ -176,6 +180,13 @@ enum Cmd {
         /// Boot with the daemon: --autostart on|off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         autostart: Option<bool>,
+        /// Ingress rule <host>.rustypods.localhost:<pod-port>; repeatable.
+        /// Replaces the whole list — the pod must be stopped.
+        #[arg(long, conflicts_with = "clear_ingress")]
+        ingress: Vec<String>,
+        /// Remove all ingress rules (the pod must be stopped).
+        #[arg(long)]
+        clear_ingress: bool,
         /// Payload command override, e.g. --cmd sh -c '...' — replaces the
         /// whole override (applied at the next start). Everything after --cmd
         /// is command argv, so it must be the final rustypods option.
@@ -808,6 +819,14 @@ fn print_pod(p: &Pod) {
     if !p.ports.is_empty() {
         extra.push_str(&format!(" ports=[{}]", p.ports.join(",")));
     }
+    if !p.ingress.is_empty() {
+        let rules: Vec<String> = p
+            .ingress
+            .iter()
+            .map(|r| format!("{}:{}", r.host, r.pod_port))
+            .collect();
+        extra.push_str(&format!(" ingress=[{}]", rules.join(",")));
+    }
     if !p.cmd.is_empty() {
         extra.push_str(&format!(" cmd={}", p.cmd.join(" ")));
     }
@@ -924,14 +943,18 @@ async fn main() -> Result<()> {
             connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
             println!("image {name} removed");
         }
-        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, cmd } => {
+        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, ingress, cmd } => {
             let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
-            if !port.is_empty() {
-                eprintln!("note: --port implies a private netns (--network-veth); the pod no longer shares host networking");
+            if !port.is_empty() || !ingress.is_empty() {
+                eprintln!("note: --port/--ingress imply a private netns (--network-veth); the pod no longer shares host networking");
+            }
+            let mut ingress_rules = Vec::with_capacity(ingress.len());
+            for spec in &ingress {
+                ingress_rules.push(rustypods_proto::parse_ingress_rule(spec)?);
             }
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, desktop, binds: bind, limits: None, autostart, cmd })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, ingress: ingress_rules, desktop, binds: bind, limits: None, autostart, cmd })
                 .await?
                 .into_inner();
             print_pod(&p);
@@ -1098,7 +1121,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, cmd, clear_cmd } => {
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, ingress, clear_ingress, cmd, clear_cmd } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -1135,6 +1158,17 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            let ingress = if clear_ingress {
+                Some(IngressList { rules: vec![] })
+            } else if !ingress.is_empty() {
+                let mut rules = Vec::with_capacity(ingress.len());
+                for spec in &ingress {
+                    rules.push(rustypods_proto::parse_ingress_rule(spec)?);
+                }
+                Some(IngressList { rules })
+            } else {
+                None
+            };
             let cmd = if clear_cmd {
                 Some(CmdList { argv: vec![] })
             } else if !cmd.is_empty() {
@@ -1149,6 +1183,7 @@ async fn main() -> Result<()> {
                     storage_max_bytes,
                     ports: None,
                     binds,
+                    ingress,
                     cmd,
                     snap_keep_last: snap_keep,
                     snap_max_age_secs: snap_max_age

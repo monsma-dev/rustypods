@@ -177,6 +177,10 @@ message Pod {
   // forces non-boot mode, even on boot-capable images (e.g.
   // ["sleep", "infinity"] to keep a bare OCI image alive as a dev pod).
   repeated string cmd = 17;
+  // Hostname-based ingress rules — routed by the pod's private-network
+  // address once the ingress proxy lands; each host is globally unique
+  // across all pods.
+  repeated IngressRule ingress = 18;
 }
 
 message PodList {
@@ -206,6 +210,8 @@ message CreatePodRequest {
   bool autostart = 8;
   // Per-pod payload override (see Pod.cmd); empty = image default.
   repeated string cmd = 9;
+  // Ingress rules (see Pod.ingress); imply private networking.
+  repeated IngressRule ingress = 10;
 }
 
 message ClonePodRequest {
@@ -267,6 +273,18 @@ message CmdList {
   repeated string argv = 1;
 }
 
+// A hostname routed to one in-pod port. The host must be a lowercase DNS
+// name ending in .rustypods.localhost with at least one label in front.
+message IngressRule {
+  string host = 1;
+  uint32 pod_port = 2;
+}
+
+message IngressList {
+  // Full desired rule set, replaces current. Empty = clear ingress.
+  repeated IngressRule rules = 1;
+}
+
 message UpdatePodConfigRequest {
   string name = 1;
   Limits limits = 2;
@@ -287,6 +305,9 @@ message UpdatePodConfigRequest {
   // Absent = keep; present (even empty) = replace the payload override.
   // Takes effect on the next pod start.
   optional CmdList cmd = 9;
+  // Absent = keep current ingress rules; present (even empty) = replace.
+  // Ingress changes require a stopped pod.
+  optional IngressList ingress = 10;
 }
 
 message StartPodRequest {

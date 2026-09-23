@@ -162,6 +162,15 @@ pub struct ImageMeta {
     pub working_dir: String,
 }
 
+/// One hostname→pod-port ingress rule, persisted in the pod conf.
+/// Hostnames are unique across ALL pods — enforced server-side at
+/// create/config/apply time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngressSpec {
+    pub host: String,
+    pub pod_port: u16,
+}
+
 /// A missing `private_users` key must mean ON: serde's default(false)
 /// would silently drop userns isolation on a hand-edited conf. Explicit
 /// `private_users = false` (stack members, desktop pods) still parses.
@@ -190,6 +199,10 @@ pub struct PodMeta {
     /// Only applied at start; changing them requires a pod restart.
     #[serde(default)]
     pub ports: Vec<String>,
+    /// Hostname-based ingress rules (see proto IngressRule); imply private
+    /// networking and a net_index like ports do.
+    #[serde(default)]
+    pub ingress: Vec<IngressSpec>,
     /// Index into the 10.220.<idx>.0/30 pool for veth addressing; 0 = none.
     /// Allocated at first start when ports are configured, or at apply
     /// time for stack members (one index shared by the whole stack).
@@ -306,6 +319,22 @@ fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Result<()> {
         rustypods_proto::validate_port(spec)
             .with_context(|| format!("invalid port '{spec}'"))?;
     }
+    // Ingress rules: full grammar check + no duplicate hosts within a pod
+    // (global uniqueness across pods needs live state — the server does it).
+    {
+        let mut hosts = std::collections::BTreeSet::new();
+        for i in &m.ingress {
+            let rule = rustypods_proto::rpc::IngressRule {
+                host: i.host.clone(),
+                pod_port: i.pod_port as u32,
+            };
+            rustypods_proto::validate_ingress_rule(&rule)
+                .with_context(|| format!("invalid ingress '{}:{}'", i.host, i.pod_port))?;
+            if !hosts.insert(&i.host) {
+                anyhow::bail!("duplicate ingress host '{}'", i.host);
+            }
+        }
+    }
     if check_binds {
         for spec in &m.binds {
             rustypods_proto::validate_bind(spec)
@@ -370,7 +399,7 @@ fn check_image_meta(m: &ImageMeta, stem: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load(data_dir: &Path) -> State {
+pub fn load(data_dir: &Path) -> Result<State> {
     migrate_json(data_dir);
     let mut st = State::default();
     scan(
@@ -385,7 +414,24 @@ pub fn load(data_dir: &Path) -> State {
         |m: &ImageMeta| m.name.as_str(),
         check_image_meta,
     );
-    st
+    // Ingress hostnames are globally unique — a hand-edited conf pair
+    // claiming the same host would silently split traffic between pods,
+    // so a cross-conf collision aborts startup (fail closed). A single
+    // malformed conf is still just skipped+warned above.
+    let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
+    for m in st.pods.values() {
+        for i in &m.ingress {
+            if let Some(other) = claimed.insert(i.host.as_str(), m.name.as_str()) {
+                anyhow::bail!(
+                    "ingress host '{}' is claimed by both pod {} and pod {}",
+                    i.host,
+                    other,
+                    m.name
+                );
+            }
+        }
+    }
+    Ok(st)
 }
 
 // --- one-time migration from the central state.json ---------------------------
@@ -474,6 +520,7 @@ fn migrate_json(data_dir: &Path) {
             started: false,
             storage_max_bytes: 0,
             ports: vec![],
+            ingress: vec![],
             net_index: 0,
             stack: String::new(),
             binds: vec![],
@@ -495,4 +542,50 @@ pub fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(name: &str, host: &str) -> PodMeta {
+        PodMeta {
+            name: name.into(),
+            image: "img".into(),
+            created_unix: 0,
+            limits: LimitsSpec::default(),
+            ephemeral: false,
+            private_users: true,
+            started: false,
+            storage_max_bytes: 0,
+            ports: vec![],
+            ingress: vec![IngressSpec {
+                host: host.into(),
+                pod_port: 80,
+            }],
+            net_index: 0,
+            stack: String::new(),
+            binds: vec![],
+            cmd: vec![],
+            snap_keep_last: 0,
+            snap_max_age_secs: 0,
+            autostart: false,
+        }
+    }
+
+    /// A cross-conf ingress collision is the one state error that must
+    /// abort daemon startup — hand edits could otherwise silently split
+    /// one hostname across two pods.
+    #[test]
+    fn load_fails_closed_on_global_ingress_collision() {
+        let dir = std::env::temp_dir().join(format!("rp-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        save_pod(&dir, &meta("a", "a.rustypods.localhost")).unwrap();
+        assert!(load(&dir).is_ok(), "distinct hosts must load");
+        save_pod(&dir, &meta("b", "a.rustypods.localhost")).unwrap();
+        let e = load(&dir).expect_err("shared host must abort load");
+        assert!(e.to_string().contains("a.rustypods.localhost"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

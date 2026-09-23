@@ -193,6 +193,12 @@ export interface Pod {
    * ["sleep", "infinity"] to keep a bare OCI image alive as a dev pod).
    */
   cmd: string[];
+  /**
+   * Hostname-based ingress rules — routed by the pod's private-network
+   * address once the ingress proxy lands; each host is globally unique
+   * across all pods.
+   */
+  ingress: IngressRule[];
 }
 
 export interface PodList {
@@ -229,6 +235,8 @@ export interface CreatePodRequest {
   autostart: boolean;
   /** Per-pod payload override (see Pod.cmd); empty = image default. */
   cmd: string[];
+  /** Ingress rules (see Pod.ingress); imply private networking. */
+  ingress: IngressRule[];
 }
 
 export interface ClonePodRequest {
@@ -291,6 +299,20 @@ export interface CmdList {
   argv: string[];
 }
 
+/**
+ * A hostname routed to one in-pod port. The host must be a lowercase DNS
+ * name ending in .rustypods.localhost with at least one label in front.
+ */
+export interface IngressRule {
+  host: string;
+  podPort: number;
+}
+
+export interface IngressList {
+  /** Full desired rule set, replaces current. Empty = clear ingress. */
+  rules: IngressRule[];
+}
+
 export interface UpdatePodConfigRequest {
   name: string;
   limits?:
@@ -328,7 +350,14 @@ export interface UpdatePodConfigRequest {
    * Absent = keep; present (even empty) = replace the payload override.
    * Takes effect on the next pod start.
    */
-  cmd?: CmdList | undefined;
+  cmd?:
+    | CmdList
+    | undefined;
+  /**
+   * Absent = keep current ingress rules; present (even empty) = replace.
+   * Ingress changes require a stopped pod.
+   */
+  ingress?: IngressList | undefined;
 }
 
 export interface StartPodRequest {
@@ -1811,6 +1840,7 @@ function createBasePod(): Pod {
     snapMaxAgeSecs: 0,
     autostart: false,
     cmd: [],
+    ingress: [],
   };
 }
 
@@ -1866,6 +1896,9 @@ export const Pod: MessageFns<Pod> = {
     }
     for (const v of message.cmd) {
       writer.uint32(138).string(v!);
+    }
+    for (const v of message.ingress) {
+      IngressRule.encode(v!, writer.uint32(146).fork()).join();
     }
     return writer;
   },
@@ -2019,6 +2052,14 @@ export const Pod: MessageFns<Pod> = {
             message.cmd.push(reader.string());
             continue;
           }
+          case 18: {
+            if (tag !== 146) {
+              break;
+            }
+
+            message.ingress.push(IngressRule.decode(reader, reader.uint32()));
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2076,6 +2117,9 @@ export const Pod: MessageFns<Pod> = {
       cmd: globalThis.Array.isArray(object?.cmd)
         ? object.cmd.map((e: any) => globalThis.String(e))
         : [],
+      ingress: globalThis.Array.isArray(object?.ingress)
+        ? object.ingress.map((e: any) => IngressRule.fromJSON(e))
+        : [],
     };
   },
 
@@ -2132,6 +2176,9 @@ export const Pod: MessageFns<Pod> = {
     if (message.cmd?.length) {
       obj.cmd = message.cmd;
     }
+    if (message.ingress?.length) {
+      obj.ingress = message.ingress.map((e) => IngressRule.toJSON(e));
+    }
     return obj;
   },
 
@@ -2159,6 +2206,7 @@ export const Pod: MessageFns<Pod> = {
     message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? 0;
     message.autostart = object.autostart ?? false;
     message.cmd = object.cmd?.map((e) => e) || [];
+    message.ingress = object.ingress?.map((e) => IngressRule.fromPartial(e)) || [];
     return message;
   },
 };
@@ -2360,6 +2408,7 @@ function createBaseCreatePodRequest(): CreatePodRequest {
     limits: undefined,
     autostart: false,
     cmd: [],
+    ingress: [],
   };
 }
 
@@ -2391,6 +2440,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     }
     for (const v of message.cmd) {
       writer.uint32(74).string(v!);
+    }
+    for (const v of message.ingress) {
+      IngressRule.encode(v!, writer.uint32(82).fork()).join();
     }
     return writer;
   },
@@ -2480,6 +2532,14 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
             message.cmd.push(reader.string());
             continue;
           }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.ingress.push(IngressRule.decode(reader, reader.uint32()));
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2507,6 +2567,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       limits: isSet(object.limits) ? Limits.fromJSON(object.limits) : undefined,
       autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : false,
       cmd: globalThis.Array.isArray(object?.cmd) ? object.cmd.map((e: any) => globalThis.String(e)) : [],
+      ingress: globalThis.Array.isArray(object?.ingress) ? object.ingress.map((e: any) => IngressRule.fromJSON(e)) : [],
     };
   },
 
@@ -2539,6 +2600,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     if (message.cmd?.length) {
       obj.cmd = message.cmd;
     }
+    if (message.ingress?.length) {
+      obj.ingress = message.ingress.map((e) => IngressRule.toJSON(e));
+    }
     return obj;
   },
 
@@ -2558,6 +2622,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       : undefined;
     message.autostart = object.autostart ?? false;
     message.cmd = object.cmd?.map((e) => e) || [];
+    message.ingress = object.ingress?.map((e) => IngressRule.fromPartial(e)) || [];
     return message;
   },
 };
@@ -3463,6 +3528,164 @@ export const CmdList: MessageFns<CmdList> = {
   },
 };
 
+function createBaseIngressRule(): IngressRule {
+  return { host: "", podPort: 0 };
+}
+
+export const IngressRule: MessageFns<IngressRule> = {
+  encode(message: IngressRule, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.host !== "") {
+      writer.uint32(10).string(message.host);
+    }
+    if (message.podPort !== 0) {
+      writer.uint32(16).uint32(message.podPort);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressRule {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressRule();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.host = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.podPort = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): IngressRule {
+    return {
+      host: isSet(object.host) ? globalThis.String(object.host) : "",
+      podPort: isSet(object.podPort)
+        ? globalThis.Number(object.podPort)
+        : isSet(object.pod_port)
+        ? globalThis.Number(object.pod_port)
+        : 0,
+    };
+  },
+
+  toJSON(message: IngressRule): unknown {
+    const obj: any = {};
+    if (message.host !== "") {
+      obj.host = message.host;
+    }
+    if (message.podPort !== 0) {
+      obj.podPort = Math.round(message.podPort);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressRule>, I>>(base?: I): IngressRule {
+    return IngressRule.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressRule>, I>>(object: I): IngressRule {
+    const message = createBaseIngressRule();
+    message.host = object.host ?? "";
+    message.podPort = object.podPort ?? 0;
+    return message;
+  },
+};
+
+function createBaseIngressList(): IngressList {
+  return { rules: [] };
+}
+
+export const IngressList: MessageFns<IngressList> = {
+  encode(message: IngressList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.rules) {
+      IngressRule.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.rules.push(IngressRule.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): IngressList {
+    return {
+      rules: globalThis.Array.isArray(object?.rules) ? object.rules.map((e: any) => IngressRule.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: IngressList): unknown {
+    const obj: any = {};
+    if (message.rules?.length) {
+      obj.rules = message.rules.map((e) => IngressRule.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressList>, I>>(base?: I): IngressList {
+    return IngressList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressList>, I>>(object: I): IngressList {
+    const message = createBaseIngressList();
+    message.rules = object.rules?.map((e) => IngressRule.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
   return {
     name: "",
@@ -3474,6 +3697,7 @@ function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
     snapMaxAgeSecs: undefined,
     autostart: undefined,
     cmd: undefined,
+    ingress: undefined,
   };
 }
 
@@ -3505,6 +3729,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     }
     if (message.cmd !== undefined) {
       CmdList.encode(message.cmd, writer.uint32(74).fork()).join();
+    }
+    if (message.ingress !== undefined) {
+      IngressList.encode(message.ingress, writer.uint32(82).fork()).join();
     }
     return writer;
   },
@@ -3594,6 +3821,14 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
             message.cmd = CmdList.decode(reader, reader.uint32());
             continue;
           }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.ingress = IngressList.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3629,6 +3864,7 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
         : undefined,
       autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : undefined,
       cmd: isSet(object.cmd) ? CmdList.fromJSON(object.cmd) : undefined,
+      ingress: isSet(object.ingress) ? IngressList.fromJSON(object.ingress) : undefined,
     };
   },
 
@@ -3661,6 +3897,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     if (message.cmd !== undefined) {
       obj.cmd = CmdList.toJSON(message.cmd);
     }
+    if (message.ingress !== undefined) {
+      obj.ingress = IngressList.toJSON(message.ingress);
+    }
     return obj;
   },
 
@@ -3684,6 +3923,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     message.snapMaxAgeSecs = object.snapMaxAgeSecs ?? undefined;
     message.autostart = object.autostart ?? undefined;
     message.cmd = (object.cmd !== undefined && object.cmd !== null) ? CmdList.fromPartial(object.cmd) : undefined;
+    message.ingress = (object.ingress !== undefined && object.ingress !== null)
+      ? IngressList.fromPartial(object.ingress)
+      : undefined;
     return message;
   },
 };

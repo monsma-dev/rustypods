@@ -297,6 +297,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     for s in [
         "/proc/sys/net/ipv4/ip_forward",
         "/proc/sys/net/ipv4/conf/all/route_localnet",
+        "/proc/sys/net/ipv6/conf/all/forwarding",
     ] {
         chk!(
             if Path::new(s).exists() {

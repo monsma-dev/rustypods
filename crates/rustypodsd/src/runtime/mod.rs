@@ -25,8 +25,13 @@ pub struct StartSpec {
     pub run_dir: PathBuf,
     /// Host SHM dir → /run/rustypods/shm.
     pub shm_dir: PathBuf,
-    /// "hostPort:podPort" — engine decides the netns strategy.
+    /// "hostPort:podPort" — kept for the DNAT table; the veth decision is
+    /// `network_veth` (ports OR ingress need private networking).
     pub ports: Vec<String>,
+    /// Standalone pods needing private networking (ports and/or ingress)
+    /// get --network-veth; the daemon configures both ends itself.
+    /// Stack members never set this — they join `netns` instead.
+    pub network_veth: bool,
     /// User-configured bind mounts (validated BindSpec).
     pub binds: Vec<BindSpec>,
     /// Stack members join this pre-made netns instead of getting a veth.

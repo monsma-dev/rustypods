@@ -53,6 +53,10 @@ pub struct StackPod {
     /// entrypoint+cmd and forces non-boot mode.
     #[serde(default)]
     pub cmd: Vec<String>,
+    /// Ingress rules, "<host>.rustypods.localhost:<port>". Hostnames must
+    /// be unique across all members of the stack AND all other pods.
+    #[serde(default)]
+    pub ingress: Vec<String>,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.
@@ -71,6 +75,7 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
         bail!("stack '{}' has no pods — add a [pods.<name>] table", def.name);
     }
     let mut host_ports: BTreeSet<(u16, &str)> = BTreeSet::new();
+    let mut ingress_hosts: BTreeSet<String> = BTreeSet::new();
     for (member, p) in &def.pods {
         let full = member_name(&def.name, member);
         rustypods_proto::validate_name(&full)
@@ -92,6 +97,16 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
             let (hp, proto) = host_port_key(spec);
             if !host_ports.insert((hp, proto)) {
                 bail!("pods.{member}: host port {hp}/{proto} is already used by another member");
+            }
+        }
+        for spec in &p.ingress {
+            let rule = rustypods_proto::parse_ingress_rule(spec)
+                .with_context(|| format!("pods.{member}"))?;
+            if !ingress_hosts.insert(rule.host.clone()) {
+                bail!(
+                    "pods.{member}: ingress host '{}' is already used by another member",
+                    rule.host
+                );
             }
         }
     }
@@ -147,6 +162,42 @@ cpu_quota_percent = 50
         assert_eq!(d.pods["db"].snap_max_age_secs, 7 * 86400);
         assert_eq!(d.pods["db"].snap_keep_last, 3);
         assert_eq!(member_name("shop", "web"), "shop-web");
+    }
+
+    #[test]
+    fn parses_and_dedups_ingress() {
+        let ok = r#"
+name = "shop"
+[pods.web]
+image = "arch-base"
+ingress = ["web.rustypods.localhost:8080", "api.dev.rustypods.localhost:443"]
+[pods.db]
+image = "arch-base"
+"#;
+        let d = parse(ok, img).unwrap();
+        assert_eq!(d.pods["web"].ingress.len(), 2);
+        // Same host claimed by two members of one stack.
+        let dup = r#"
+name = "dup"
+[pods.a]
+image = "arch-base"
+ingress = ["web.rustypods.localhost:80"]
+[pods.b]
+image = "arch-base"
+ingress = ["web.rustypods.localhost:8080"]
+"#;
+        assert!(parse(dup, img).is_err());
+        // Same host twice on ONE member.
+        let self_dup = r#"
+name = "selfdup"
+[pods.a]
+image = "arch-base"
+ingress = ["web.rustypods.localhost:80", "web.rustypods.localhost:443"]
+"#;
+        assert!(parse(self_dup, img).is_err());
+        // Bad grammar surfaces the parse error.
+        let bad = "name = \"x\"\n[pods.a]\nimage = \"i\"\ningress = [\"WEB.rustypods.localhost:80\"]\n";
+        assert!(parse(bad, img).is_err());
     }
 
     #[test]

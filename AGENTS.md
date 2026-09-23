@@ -115,19 +115,20 @@ nspawn's `--port` needs systemd-networkd **on the host** (its
 NetworkManager/Netplan → host veth never gets an address → no NAT. So
 rustypodsd does it itself:
 
-- Pod with ports → `--network-veth` (private netns, no host-net parity).
-- Static /30 pair per pod: host `ve-<name>` = 10.220.<idx>.1, pod `host0` =
-  10.220.<idx>.2. `net_index` is persisted in the pod conf (stable).
-- A static `etc/systemd/network/80-container-host0.network` is written into
-  the rootfs before boot (same filename overrides the stock /usr/lib one);
-  networkd + its socket get enabled via wants symlinks.
+- Pods with ports or ingress rules → `--network-veth` (private netns, no
+  host-net parity).
+- Dual-stack pair per pod: host `ve-<name>` = 10.220.<idx>.1 plus
+  fd22:220:<idx>::1; pod `host0` = .2 / ::2. `net_index` is persisted.
+- The daemon configures both veth ends through the leader's netns before
+  start returns, so bare OCI payloads need no in-image `ip` or networkd.
+  Boot images also get a matching dual-stack networkd file as persistence.
 - NAT = own `ip rustypods` nftables table, rebuilt from state on every
   change: DNAT in prerouting+output, masquerade for pod egress, and
   `fib saddr type local … masquerade` for host-originated traffic (without
   it the pod answers 127.0.0.1 on ITS loopback).
-- Required sysctls: `net.ipv4.ip_forward=1` and
-  `net.ipv4.conf.{all,<veth>}.route_localnet=1` — without the latter,
-  localhost→pod replies get dropped as martians (empirically proven).
+- Required sysctls: `net.ipv4.ip_forward=1`,
+  `net.ipv6.conf.all.forwarding=1`, and per-veth IPv4 `route_localnet=1` —
+  without the latter, localhost→pod replies are dropped as martians.
 - nft scripts use `#` comments — `//` is a syntax error (broke a rebuild).
 - `pkexec` strips PATH to sbin-less dirs → always use absolute paths for
   nft/sysctl/tcpdump in scripts and one-off checks.

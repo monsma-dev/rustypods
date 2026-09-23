@@ -155,6 +155,83 @@ pub fn validate_port(spec: &str) -> anyhow::Result<()> {
     }
 }
 
+/// The domain suffix every ingress hostname must live under.
+pub const INGRESS_SUFFIX: &str = ".rustypods.localhost";
+
+/// "<host>:<port>" → a typed ingress rule. Split on the LAST colon so a
+/// stray colon in the host can't smuggle extra fields; the grammar itself
+/// (validate_ingress_rule) forbids them anyway.
+pub fn parse_ingress_rule(spec: &str) -> anyhow::Result<rpc::IngressRule> {
+    let Some((host, port)) = spec.rsplit_once(':') else {
+        anyhow::bail!("invalid ingress '{spec}' — expected <host>{INGRESS_SUFFIX}:<port>");
+    };
+    if host.is_empty() || port.is_empty() {
+        anyhow::bail!("invalid ingress '{spec}' — expected <host>{INGRESS_SUFFIX}:<port>");
+    }
+    let pod_port: u32 = port
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid ingress '{spec}' — port '{port}' is not numeric"))?;
+    let rule = rpc::IngressRule {
+        host: host.to_string(),
+        pod_port,
+    };
+    validate_ingress_rule(&rule)
+        .map_err(|e| anyhow::anyhow!("invalid ingress '{spec}' — {e:#}"))?;
+    Ok(rule)
+}
+
+/// Ingress rule grammar: a lowercase DNS name under .rustypods.localhost
+/// (at least one label in front, RFC-1035 label rules, no wildcards, no
+/// IPs, no Unicode) plus a pod port in 1..=65535. Hostnames are matched by
+/// a future L7 proxy — anything looser would be a routing ambiguity.
+pub fn validate_ingress_rule(rule: &rpc::IngressRule) -> anyhow::Result<()> {
+    if !(1..=65535).contains(&rule.pod_port) {
+        anyhow::bail!("pod port {} out of range (1..=65535)", rule.pod_port);
+    }
+    validate_ingress_host(&rule.host)
+}
+
+fn validate_ingress_host(host: &str) -> anyhow::Result<()> {
+    if host.is_empty() || host.len() > 253 {
+        anyhow::bail!("host '{host}' must be 1..=253 characters");
+    }
+    if !host.is_ascii() {
+        anyhow::bail!("host '{host}' must be ASCII");
+    }
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        anyhow::bail!("host '{host}' must be lowercase");
+    }
+    let Some(prefix) = host.strip_suffix(INGRESS_SUFFIX) else {
+        anyhow::bail!("host '{host}' must end with {INGRESS_SUFFIX}");
+    };
+    if prefix.is_empty() {
+        anyhow::bail!("host '{host}' needs at least one label before {INGRESS_SUFFIX}");
+    }
+    for label in prefix.split('.') {
+        if label.is_empty() {
+            anyhow::bail!("host '{host}' has an empty label");
+        }
+        if label.len() > 63 {
+            anyhow::bail!("host '{host}': label '{label}' is longer than 63 characters");
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            anyhow::bail!("host '{host}': label '{label}' may only contain [a-z0-9-]");
+        }
+        let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        if !alnum(*label.as_bytes().first().unwrap())
+            || !alnum(*label.as_bytes().last().unwrap())
+        {
+            anyhow::bail!(
+                "host '{host}': label '{label}' must start and end with a letter or digit"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A parsed bind-mount spec (`host[:pod][:ro]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindSpec {
@@ -407,6 +484,42 @@ mod tests {
         assert!(validate_argv(&[]).is_err());
         assert!(validate_argv(&["".into()]).is_err());
         assert!(validate_argv(&["sh".into(), "a\0b".into()]).is_err());
+    }
+
+    #[test]
+    fn ingress_parsing_and_validation() {
+        let r = parse_ingress_rule("web.rustypods.localhost:8080").unwrap();
+        assert_eq!(r.host, "web.rustypods.localhost");
+        assert_eq!(r.pod_port, 8080);
+        let r = parse_ingress_rule("api.dev.rustypods.localhost:443").unwrap();
+        assert_eq!(r.host, "api.dev.rustypods.localhost");
+        assert_eq!(r.pod_port, 443);
+        // Suffix-only, no label in front.
+        assert!(parse_ingress_rule(".rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("rustypods.localhost:80").is_err());
+        // Uppercase, wildcard, underscore, bad hyphens, empty labels.
+        assert!(parse_ingress_rule("Web.rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("*.rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("my_app.rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("-web.rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("web-.rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("a..b.rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("wéb.rustypods.localhost:80").is_err());
+        assert!(parse_ingress_rule("web.rustypods.localhost.:80").is_err());
+        // Wrong suffix, IP literal, over-long label / host.
+        assert!(parse_ingress_rule("web.example.com:80").is_err());
+        assert!(parse_ingress_rule("10.0.0.1:80").is_err());
+        assert!(parse_ingress_rule(&format!("{}.rustypods.localhost:80", "a".repeat(64))).is_err());
+        assert!(parse_ingress_rule(&format!("{}.rustypods.localhost:80", "a".repeat(240))).is_err());
+        // Ports: 0, >65535, non-numeric, missing.
+        assert!(parse_ingress_rule("web.rustypods.localhost:0").is_err());
+        assert!(parse_ingress_rule("web.rustypods.localhost:65536").is_err());
+        assert!(parse_ingress_rule("web.rustypods.localhost:http").is_err());
+        assert!(parse_ingress_rule("web.rustypods.localhost").is_err());
+        assert!(parse_ingress_rule("web.rustypods.localhost:").is_err());
+        // Boundary ports are fine.
+        assert!(parse_ingress_rule("web.rustypods.localhost:1").is_ok());
+        assert!(parse_ingress_rule("web.rustypods.localhost:65535").is_ok());
     }
 
     #[test]

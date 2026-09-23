@@ -10,7 +10,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -29,6 +29,15 @@ pub fn host_ip(idx: u32) -> Ipv4Addr {
 }
 pub fn pod_ip(idx: u32) -> Ipv4Addr {
     Ipv4Addr::new(POOL_BASE[0], POOL_BASE[1], idx as u8, 2)
+}
+/// Same per-pod pairing in IPv6 ULA space: fd22:0220:<idx>::1 (host) and
+/// ::2 (pod) on a /64. `idx as u16` keeps the pool aligned with the v4
+/// 1..=255 indexes.
+pub fn host_ip6(idx: u32) -> Ipv6Addr {
+    Ipv6Addr::new(0xfd22, 0x0220, idx as u16, 0, 0, 0, 0, 1)
+}
+pub fn pod_ip6(idx: u32) -> Ipv6Addr {
+    Ipv6Addr::new(0xfd22, 0x0220, idx as u16, 0, 0, 0, 0, 2)
 }
 /// Lowest free index in 1..=255 across all pods.
 pub fn alloc_index(pods: &BTreeMap<String, PodMeta>) -> u32 {
@@ -49,9 +58,11 @@ pub fn write_pod_network(rootfs: &Path, idx: u32) -> Result<()> {
         rootfs,
         "etc/systemd/network/80-container-host0.network",
         format!(
-            "[Match]\nName=host0\n\n[Network]\nAddress={}/30\nGateway={}\n",
+            "[Match]\nName=host0\n\n[Network]\nAddress={}/30\nAddress={}/64\nGateway={}\nGateway={}\n",
             pod_ip(idx),
-            host_ip(idx)
+            pod_ip6(idx),
+            host_ip(idx),
+            host_ip6(idx)
         )
         .as_bytes(),
         None,
@@ -101,13 +112,32 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
 }
 
 /// `run` on the blocking pool — for the one async caller
-/// (configure_host_veth) that can't itself be wrapped in spawn_blocking
+/// (configure_veth) that can't itself be wrapped in spawn_blocking
 /// because it interleaves `ip` calls with async sleeps.
 async fn run_async(cmd: &'static str, args: &[&str]) -> Result<()> {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         run(cmd, &refs)
+    })
+    .await
+    .context("blocking task")?
+}
+
+/// `nsenter --target <pid> --net -- <args>` — run the host's `ip` inside
+/// one process's network namespace only. Used to wire host0 on pods whose
+/// payload has no networkd (bare OCI images).
+async fn nsenter_net(leader: u32, args: &[&str]) -> Result<()> {
+    let mut argv: Vec<String> = vec![
+        "--target".into(),
+        leader.to_string(),
+        "--net".into(),
+        "--".into(),
+    ];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run("nsenter", &refs)
     })
     .await
     .context("blocking task")?
@@ -151,6 +181,19 @@ pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
         "ip",
         &["addr", "replace", &format!("{}/30", host_ip(idx)), "dev", &host_v],
     )?;
+    // `nodad`: skip Duplicate Address Detection — the ULA space is
+    // daemon-owned, and a tentative address would be unusable for ~1s.
+    run(
+        "ip",
+        &[
+            "addr",
+            "replace",
+            &format!("{}/64", host_ip6(idx)),
+            "dev",
+            &host_v,
+            "nodad",
+        ],
+    )?;
     // Same localhost-DNAT martian guard as standalone pods.
     let _ = std::fs::write(
         format!("/proc/sys/net/ipv4/conf/{host_v}/route_localnet"),
@@ -167,7 +210,21 @@ pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
     )?;
     run(
         "ip",
+        &[
+            "netns", "exec", &ns, "ip", "addr", "replace",
+            &format!("{}/64", pod_ip6(idx)), "dev", &peer, "nodad",
+        ],
+    )?;
+    run(
+        "ip",
         &["netns", "exec", &ns, "ip", "route", "replace", "default", "via", &host_ip(idx).to_string()],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns", "exec", &ns, "ip", "-6", "route", "replace", "default", "via",
+            &host_ip6(idx).to_string(),
+        ],
     )?;
     Ok(())
 }
@@ -179,8 +236,18 @@ pub fn teardown_stack_net(stack: &str) {
     let _ = run("ip", &["netns", "del", &netns_name(stack)]);
 }
 
-/// Wait for nspawn to create the veth, then give the host end its address.
-pub async fn configure_host_veth(pod: &str, idx: u32) -> Result<()> {
+/// Wait for nspawn to create the veth, configure the host end, then finish
+/// the pod end inside the pod's netns via nsenter (entering ONLY the net
+/// namespace — never the mount ns). The pod side matters for bare OCI
+/// payload pods: they have no systemd-networkd to configure host0, so
+/// without this they get a dead link. On booted pods it converges to the
+/// same state networkd would reach — every step is idempotent.
+/// `leader` is the pod init pid; 0 means "registered but no pid yet" and
+/// is refused — start must not report success before the link is usable.
+pub async fn configure_veth(pod: &str, idx: u32, leader: u32) -> Result<()> {
+    if leader == 0 {
+        bail!("pod has no usable leader pid yet — cannot enter its netns");
+    }
     let veth = veth_name(pod);
     let sys = format!("/sys/class/net/{veth}");
     for _ in 0..150 {
@@ -198,22 +265,87 @@ pub async fn configure_host_veth(pod: &str, idx: u32) -> Result<()> {
         &["addr", "replace", &format!("{}/30", host_ip(idx)), "dev", &veth],
     )
     .await?;
+    // `nodad` as on the stack path — the daemon owns this ULA space.
+    run_async(
+        "ip",
+        &[
+            "addr",
+            "replace",
+            &format!("{}/64", host_ip6(idx)),
+            "dev",
+            &veth,
+            "nodad",
+        ],
+    )
+    .await?;
     // Replies to localhost-DNAT'd flows arrive with a 127/8 source — dropped
     // as martian unless the receiving iface allows it.
     let _ = std::fs::write(
         format!("/proc/sys/net/ipv4/conf/{veth}/route_localnet"),
         "1",
     );
+    // Pod side: host root's nsenter into the leader's netns only, then the
+    // host's `ip` binary (an in-pod iproute isn't guaranteed to exist).
+    nsenter_net(leader, &["ip", "link", "set", "lo", "up"]).await?;
+    nsenter_net(leader, &["ip", "link", "set", "host0", "up"]).await?;
+    nsenter_net(
+        leader,
+        &[
+            "ip",
+            "addr",
+            "replace",
+            &format!("{}/30", pod_ip(idx)),
+            "dev",
+            "host0",
+        ],
+    )
+    .await?;
+    nsenter_net(
+        leader,
+        &[
+            "ip",
+            "addr",
+            "replace",
+            &format!("{}/64", pod_ip6(idx)),
+            "dev",
+            "host0",
+            "nodad",
+        ],
+    )
+    .await?;
+    nsenter_net(
+        leader,
+        &["ip", "route", "replace", "default", "via", &host_ip(idx).to_string()],
+    )
+    .await?;
+    nsenter_net(
+        leader,
+        &[
+            "ip",
+            "-6",
+            "route",
+            "replace",
+            "default",
+            "via",
+            &host_ip6(idx).to_string(),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
-/// Kernel knobs required for DNAT into the veth — ip_forward for routed
-/// traffic, route_localnet so localhost→pod flows survive (Docker does the
-/// same on container hosts). Idempotent.
+/// Kernel knobs required for DNAT into the veth — ip_forward (v4 and v6)
+/// for routed traffic, route_localnet so localhost→pod flows survive
+/// (Docker does the same on container hosts). Idempotent; a kernel
+/// without IPv6 fails hard rather than leaving half-configured stacks.
 pub fn ensure_ip_forward() -> Result<()> {
     let fwd = "/proc/sys/net/ipv4/ip_forward";
     if std::fs::read_to_string(fwd).ok().as_deref() != Some("1\n") {
         std::fs::write(fwd, "1").context("enable net.ipv4.ip_forward")?;
+    }
+    let fwd6 = "/proc/sys/net/ipv6/conf/all/forwarding";
+    if std::fs::read_to_string(fwd6).ok().as_deref() != Some("1\n") {
+        std::fs::write(fwd6, "1").context("enable net.ipv6.conf.all.forwarding")?;
     }
     Ok(())
 }
@@ -296,5 +428,40 @@ pub fn rebuild_nat<'a>(
     })();
     if let Err(e) = res {
         tracing::warn!("nft rebuild failed: {e:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_helpers() {
+        assert_eq!(host_ip(1).to_string(), "10.220.1.1");
+        assert_eq!(pod_ip(1).to_string(), "10.220.1.2");
+        assert_eq!(host_ip(255).to_string(), "10.220.255.1");
+        assert_eq!(host_ip6(1).to_string(), "fd22:220:1::1");
+        assert_eq!(pod_ip6(1).to_string(), "fd22:220:1::2");
+        assert_eq!(pod_ip6(255).to_string(), "fd22:220:ff::2");
+    }
+
+    /// The in-rootfs networkd file must configure host0 dual-stack so
+    /// booted pods get both families; payload pods get the same values
+    /// via configure_veth's nsenter calls.
+    #[test]
+    fn networkd_file_is_dual_stack() {
+        let dir = std::env::temp_dir().join(format!("rp-net-{}", std::process::id()));
+        let rootfs = dir.join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        write_pod_network(&rootfs, 7).unwrap();
+        let text = std::fs::read_to_string(
+            rootfs.join("etc/systemd/network/80-container-host0.network"),
+        )
+        .unwrap();
+        assert!(text.contains("Address=10.220.7.2/30"));
+        assert!(text.contains("Address=fd22:220:7::2/64"));
+        assert!(text.contains("Gateway=10.220.7.1"));
+        assert!(text.contains("Gateway=fd22:220:7::1"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

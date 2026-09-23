@@ -58,10 +58,11 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
         // Stack member: join the shared netns — all stack pods share lo and
         // the stack IP (K8s pod model). The daemon wires the netns itself.
         a.push(format!("--network-namespace-path={}", ns.display()).into());
-    } else if !spec.ports.is_empty() {
-        // Port mappings require private networking: --network-veth gives the
-        // pod its own netns on ve-<name> (no host-net parity anymore). The
-        // actual DNAT is ours (crate::net) — nspawn's --port relies on
+    } else if spec.network_veth {
+        // Private networking (port mappings and/or ingress rules):
+        // --network-veth gives the pod its own netns on ve-<name> (no
+        // host-net parity anymore). The daemon configures both veth ends
+        // and owns the DNAT (crate::net) — nspawn's --port relies on
         // systemd-networkd managing the host side, which most desktop
         // distros (NetworkManager, Netplan) don't run.
         a.push("--network-veth".into());
@@ -179,6 +180,7 @@ mod tests {
             run_dir: PathBuf::from("/bin"),             // exists → run bind
             shm_dir: PathBuf::from("/definitely-missing"), // skipped
             ports: vec![],
+            network_veth: false,
             binds: vec![],
             netns: None,
             log: PathBuf::from("/tmp/x.log"),
@@ -228,18 +230,24 @@ mod tests {
     }
 
     #[test]
-    fn argv_ports_imply_veth() {
+    fn argv_veth_only_via_flag() {
+        // The flag, not the ports data, drives --network-veth: ingress-only
+        // pods (empty ports) must get a veth, and the engine trusts the
+        // server's needs_network decision either way.
+        let mut s = spec(false, false);
+        s.network_veth = true;
+        assert!(argv(&s).contains(&"--network-veth".to_string()));
         let mut s = spec(false, false);
         s.ports = vec!["8080:80".into(), "53:53/udp".into()];
-        let a = argv(&s);
-        assert!(a.contains(&"--network-veth".to_string()));
+        assert!(!argv(&s).contains(&"--network-veth".to_string()));
     }
 
     #[test]
     fn argv_stack_joins_shared_netns() {
         let mut s = spec(false, false);
         s.name = "demo-web".into();
-        s.ports = vec!["8080:80".into()]; // ports on a stack must NOT imply veth
+        s.ports = vec!["8080:80".into()];
+        s.network_veth = true; // must not win over an explicit netns
         s.netns = Some(PathBuf::from("/var/run/netns/rustypods-demo"));
         let a = argv(&s);
         assert!(a.contains(&"--network-namespace-path=/var/run/netns/rustypods-demo".to_string()));

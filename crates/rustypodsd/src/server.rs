@@ -21,7 +21,7 @@ use rustypods_proto::{self as proto};
 use crate::agent::{self, ListenerMap, MetricsMap};
 use crate::oci;
 use crate::runtime::{RuntimeEngine, StartSpec};
-use crate::state::{self, ImageMeta, LimitsSpec, PodMeta, State};
+use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State};
 use crate::storage::StorageDriver;
 use crate::{net, runtime, stack, storage, Config};
 
@@ -93,7 +93,28 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>) -> Pod {
         snap_max_age_secs: m.snap_max_age_secs,
         autostart: m.autostart,
         cmd: m.cmd.clone(),
+        ingress: ingress_to_proto(&m.ingress),
     }
+}
+
+fn ingress_to_proto(specs: &[IngressSpec]) -> Vec<IngressRule> {
+    specs
+        .iter()
+        .map(|i| IngressRule {
+            host: i.host.clone(),
+            pod_port: i.pod_port as u32,
+        })
+        .collect()
+}
+
+fn ingress_from_proto(rules: &[IngressRule]) -> Vec<IngressSpec> {
+    rules
+        .iter()
+        .map(|r| IngressSpec {
+            host: r.host.clone(),
+            pod_port: r.pod_port as u16,
+        })
+        .collect()
 }
 
 /// Payload (non-boot) pods: a conf-level cmd override always wins and
@@ -177,6 +198,65 @@ fn validate_host_ports(
         }
     }
     Ok(())
+}
+
+/// Ingress hostnames are a global namespace: no duplicates inside one
+/// request, and no host already claimed by another persisted pod — stopped
+/// ones included (their rules survive until config clears them). Call ONLY
+/// while holding the state lock, right before the insert/update.
+fn validate_ingress_conflicts(
+    st: &State,
+    pod_name: &str,
+    rules: &[IngressRule],
+) -> Result<(), Status> {
+    validate_ingress_conflicts_excluding(st, pod_name, rules, &std::collections::BTreeSet::new())
+}
+
+/// Same as validate_ingress_conflicts, but persisted pods named in
+/// `ignore` are skipped — used by apply_stack, whose desired members are
+/// all being rewritten atomically (their stale rules must not block a
+/// swap) while anything OUTSIDE the desired set still counts as a racer.
+fn validate_ingress_conflicts_excluding(
+    st: &State,
+    pod_name: &str,
+    rules: &[IngressRule],
+    ignore: &std::collections::BTreeSet<String>,
+) -> Result<(), Status> {
+    let mut seen = std::collections::BTreeSet::new();
+    for r in rules {
+        proto::validate_ingress_rule(r).map_err(bad)?;
+        if !seen.insert(r.host.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate ingress host '{}' in request",
+                r.host
+            )));
+        }
+    }
+    for m in st.pods.values() {
+        if m.name == pod_name || ignore.contains(&m.name) {
+            continue;
+        }
+        for i in &m.ingress {
+            if seen.contains(i.host.as_str()) {
+                return Err(Status::already_exists(format!(
+                    "ingress host '{}' is already claimed by pod {}",
+                    i.host, m.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Order-insensitive ingress-set equality — rule order in the conf isn't
+/// semantically meaningful, so a TOML reshuffle isn't a "change".
+fn same_ingress(a: &[IngressSpec], b: &[IngressSpec]) -> bool {
+    fn set(v: &[IngressSpec]) -> std::collections::BTreeSet<(&str, u16)> {
+        v.iter()
+            .map(|i| (i.host.as_str(), i.pod_port))
+            .collect()
+    }
+    set(a) == set(b)
 }
 
 impl Svc {
@@ -539,6 +619,7 @@ impl PodControl for Svc {
         {
             let st = self.st.lock().await;
             validate_host_ports(&st, &name, "", &req.ports)?;
+            validate_ingress_conflicts(&st, &name, &req.ingress)?;
         }
         for b in &req.binds {
             proto::validate_bind(b).map_err(bad)?;
@@ -572,6 +653,7 @@ impl PodControl for Svc {
             started: false,
             storage_max_bytes: req.storage_max_bytes,
             ports: req.ports.clone(),
+            ingress: ingress_from_proto(&req.ingress),
             net_index: 0,
             stack: String::new(),
             binds,
@@ -581,7 +663,15 @@ impl PodControl for Svc {
             cmd: req.cmd.clone(),
         };
         let mut st = self.st.lock().await;
+        if let Err(e) = validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress)) {
+            // A racing create claimed a host after the early check — drop
+            // the freshly cloned rootfs rather than wedging the name.
+            drop(st);
+            let _ = self.st_delete(&dest).await;
+            return Err(e);
+        }
         st.pods.insert(name.clone(), meta.clone());
+        drop(st);
         self.save_pod(&meta).map_err(int)?;
         Ok(Response::new(to_pod(&meta, &dest, None)))
     }
@@ -642,9 +732,12 @@ impl PodControl for Svc {
             // clones can run side by side. Ports are kept — running BOTH
             // clones with identical host ports is a user-visible conflict.
             // Stack membership is dropped: a clone is standalone, not a
-            // silent extra member of the source's shared netns.
+            // silent extra member of the source's shared netns. Ingress
+            // hostnames are globally unique — a clone must NOT inherit
+            // them, or it would collide with its own source.
             net_index: 0,
             stack: String::new(),
+            ingress: vec![],
             ..meta
         };
         let mut st = self.st.lock().await;
@@ -849,13 +942,81 @@ impl PodControl for Svc {
         // and split the members across /30 pairs. The `stack:` prefix keeps
         // this key distinct from a pod literally named after the stack.
         let _stack_op = self.pod_op(&format!("stack:{}", def.name)).await;
-        // Host-port policy vs everything OUTSIDE this stack before any
-        // state changes (stack::parse already deduped within the stack).
+        // Desired ingress per member as typed rules (stack::parse already
+        // validated grammar + intra-stack dupes; re-parse to get IngressRule).
+        let mut member_ingress: std::collections::BTreeMap<String, Vec<IngressRule>> =
+            std::collections::BTreeMap::new();
+        for (member, sp) in &def.pods {
+            let mut rules = Vec::with_capacity(sp.ingress.len());
+            for spec in &sp.ingress {
+                rules.push(proto::parse_ingress_rule(spec).map_err(bad)?);
+            }
+            member_ingress.insert(stack::member_name(&def.name, member), rules);
+        }
+        // Hold every desired member's op lock for the WHOLE apply — a
+        // direct config/start/destroy on a member mid-apply would
+        // interleave with the atomic desired-set write. BTreeMap keys are
+        // already sorted, matching the lock-ordering used by destroy_stack.
+        let desired_names: Vec<String> = member_ingress.keys().cloned().collect();
+        let desired_set: std::collections::BTreeSet<String> =
+            desired_names.iter().cloned().collect();
+        let mut _member_ops = Vec::with_capacity(desired_names.len());
+        for n in &desired_names {
+            _member_ops.push(self.pod_op(n).await);
+        }
+        // Host-port + ingress policy vs everything OUTSIDE this stack
+        // before any state changes (stack::parse already deduped within
+        // the stack).
         {
             let st = self.st.lock().await;
             for (member, sp) in &def.pods {
                 let pname = stack::member_name(&def.name, member);
                 validate_host_ports(&st, &pname, &def.name, &sp.ports)?;
+            }
+            // Ingress hostnames are global — but members of THIS apply are
+            // being (re)written, so compare desired rules only against pods
+            // outside the apply set, not against members' old persisted
+            // rules.
+            let mut claimed: std::collections::BTreeMap<&str, &str> =
+                std::collections::BTreeMap::new();
+            for (pname, rules) in &member_ingress {
+                for r in rules {
+                    if let Some(other) = claimed.insert(r.host.as_str(), pname.as_str()) {
+                        return Err(Status::already_exists(format!(
+                            "ingress host '{}' is claimed by both {other} and {pname}",
+                            r.host
+                        )));
+                    }
+                }
+            }
+            for m in st.pods.values() {
+                if member_ingress.contains_key(&m.name) {
+                    continue;
+                }
+                for i in &m.ingress {
+                    if claimed.contains_key(i.host.as_str()) {
+                        return Err(Status::already_exists(format!(
+                            "ingress host '{}' is already claimed by pod {}",
+                            i.host, m.name
+                        )));
+                    }
+                }
+            }
+        }
+        // Changing a RUNNING member's ingress would drift persisted vs
+        // runtime state — refuse before any rootfs/state mutation.
+        for (pname, rules) in &member_ingress {
+            let changed = {
+                let st = self.st.lock().await;
+                st.pods
+                    .get(pname)
+                    .map(|m| !same_ingress(&m.ingress, &ingress_from_proto(rules)))
+                    .unwrap_or(false)
+            };
+            if changed && self.engine.running_pid(pname).await.is_some() {
+                return Err(Status::failed_precondition(format!(
+                    "stop stack member {pname} before changing ingress"
+                )));
             }
         }
         // One index per stack: reuse a live member's, else allocate fresh.
@@ -877,7 +1038,6 @@ impl PodControl for Svc {
         for (member, sp) in &def.pods {
             let pname = stack::member_name(&def.name, member);
             let rootfs = self.pod_rootfs(&pname);
-            let _member_op = self.pod_op(&pname).await;
             // Check existence under the state lock — but never clone a
             // rootfs holding it: the reflink-fallback cp can copy gigabytes.
             let existing = {
@@ -903,6 +1063,7 @@ impl PodControl for Svc {
             let meta = match existing {
                 Some(mut m) => {
                     m.ports = sp.ports.clone();
+                    m.ingress = ingress_from_proto(&member_ingress[&pname]);
                     m.limits = sp.limits;
                     m.storage_max_bytes = sp.storage_max_bytes;
                     m.stack = def.name.clone();
@@ -910,7 +1071,18 @@ impl PodControl for Svc {
                     m.snap_keep_last = sp.snap_keep_last;
                     m.snap_max_age_secs = sp.snap_max_age_secs;
                     m.cmd = sp.cmd.clone();
-                    self.st.lock().await.pods.insert(pname.clone(), m.clone());
+                    {
+                        let mut st = self.st.lock().await;
+                        // Desired siblings are all being rewritten — ignore
+                        // their stale rules; outsiders still count.
+                        validate_ingress_conflicts_excluding(
+                            &st,
+                            &pname,
+                            &member_ingress[&pname],
+                            &desired_set,
+                        )?;
+                        st.pods.insert(pname.clone(), m.clone());
+                    }
                     m
                 }
                 None => {
@@ -938,6 +1110,7 @@ impl PodControl for Svc {
                         started: false,
                         storage_max_bytes: sp.storage_max_bytes,
                         ports: sp.ports.clone(),
+                        ingress: ingress_from_proto(&member_ingress[&pname]),
                         net_index: idx,
                         stack: def.name.clone(),
                         binds: vec![],
@@ -957,6 +1130,18 @@ impl PodControl for Svc {
                         return Err(Status::already_exists(format!(
                             "pod {pname} was created concurrently — re-apply the stack"
                         )));
+                    }
+                    if let Err(e) = validate_ingress_conflicts_excluding(
+                        &st,
+                        &pname,
+                        &member_ingress[&pname],
+                        &desired_set,
+                    ) {
+                        // A racing create claimed this host after the
+                        // pre-apply check — same cleanup as above.
+                        drop(st);
+                        let _ = self.st_delete(&rootfs).await;
+                        return Err(e);
                     }
                     st.pods.insert(pname.clone(), m.clone());
                     m
@@ -1090,7 +1275,11 @@ impl PodControl for Svc {
             if let Some(pu) = req.private_users {
                 meta.private_users = pu;
             }
-            if (!meta.ports.is_empty() || !meta.stack.is_empty()) && meta.net_index == 0 {
+            // Private networking is needed for published ports, ingress
+            // rules (routed to the pod's private IP), or stack membership.
+            let needs_network =
+                !meta.ports.is_empty() || !meta.ingress.is_empty() || !meta.stack.is_empty();
+            if needs_network && meta.net_index == 0 {
                 meta.net_index = next_idx;
             }
             let m = meta.clone();
@@ -1187,16 +1376,18 @@ impl PodControl for Svc {
             Some(self.cfg.allowed_uid),
             Some(self.cfg.allowed_uid),
         );
+        let needs_network =
+            !meta.ports.is_empty() || !meta.ingress.is_empty() || !meta.stack.is_empty();
         // Networking is wired BEFORE spawn: stack members join a pre-made
-        // netns (nspawn opens the path at exec), standalone port-pods get
-        // their static host0 config written into the rootfs. Everything
+        // netns (nspawn opens the path at exec), standalone networked pods
+        // get their static host0 config written into the rootfs. Everything
         // fallible happens BEFORE the agent listener is spawned — an early
         // return here must not leak a listener task + its stale socket.
         let netns = if meta.stack.is_empty() {
-            if !meta.ports.is_empty() {
+            if needs_network {
                 if meta.net_index == 0 {
                     return Err(Status::failed_precondition(
-                        "port pool exhausted (255 port-mapped pods max)",
+                        "network pool exhausted (255 private-network pods max)",
                     ));
                 }
                 net::write_pod_network(&rootfs, meta.net_index).map_err(int)?;
@@ -1213,11 +1404,14 @@ impl PodControl for Svc {
                 let idx = meta.net_index;
                 Self::blocking(move || net::ensure_stack_net(&stack, idx)).await?;
             }
-            if let Err(e) = net::ensure_ip_forward() {
-                tracing::warn!("ip_forward: {e:#}");
-            }
             Some(net::netns_path(&meta.stack))
         };
+        // v4+v6 forwarding is a hard prerequisite: a networked pod that
+        // can't route is a failed start, not a degraded one — and it must
+        // fail BEFORE the listener spawns / engine starts.
+        if needs_network {
+            net::ensure_ip_forward().map_err(int)?;
+        }
         // Last fallible step before spawn: the agent listener. From here on
         // the only failure path is engine.start below, which stops it.
         agent::spawn_listener(
@@ -1238,6 +1432,7 @@ impl PodControl for Svc {
             run_dir,
             shm_dir: shm_host,
             ports: meta.ports.clone(),
+            network_veth: meta.stack.is_empty() && needs_network,
             binds,
             netns,
             log: log.clone(),
@@ -1268,41 +1463,24 @@ impl PodControl for Svc {
                 tracing::warn!("storage cap {name}: {e:#}");
             }
         }
-        // NAT: standalone port-pods wait for nspawn's veth to appear, then
-        // configure it; stack members are already wired (the shared netns
-        // exists pre-boot) and just need the table rebuilt — that also
-        // installs the egress masquerade stacks rely on.
-        if !meta.ports.is_empty() || !meta.stack.is_empty() {
-            if let Err(e) = net::ensure_ip_forward() {
-                tracing::warn!("ip_forward: {e:#}");
+        // Private networking must be usable BEFORE the pod reports
+        // started: for standalone pods the daemon configures both veth
+        // ends (dual-stack) now that the leader pid exists — bare OCI
+        // payloads have no in-pod networkd to do it. Stack members were
+        // wired at apply/first-member-start; everyone then gets the DNAT
+        // table rebuilt from live state. A veth failure unwinds the
+        // start rather than leaving a half-networked "running" pod.
+        if needs_network {
+            if meta.stack.is_empty() {
+                if let Err(e) =
+                    net::configure_veth(&name, meta.net_index, leader.unwrap_or(0)).await
+                {
+                    agent::stop_listener(&self.listeners, &self.metrics, &name).await;
+                    let _ = self.engine.stop(&name).await;
+                    return Err(int(e));
+                }
             }
-            let pod = name.clone();
-            let idx = meta.net_index;
-            let is_stack = !meta.stack.is_empty();
-            let st = self.st.clone();
-            let eng = self.engine.clone();
-            tokio::spawn(async move {
-                if !is_stack {
-                    if let Err(e) = net::configure_host_veth(&pod, idx).await {
-                        tracing::warn!("veth setup {pod}: {e:#}");
-                        return;
-                    }
-                }
-                let pods: Vec<PodMeta> = {
-                    let g = st.lock().await;
-                    g.pods.values().cloned().collect()
-                };
-                let mut running = std::collections::BTreeSet::new();
-                for m in &pods {
-                    if eng.running_pid(&m.name).await.is_some() {
-                        running.insert(m.name.clone());
-                    }
-                }
-                // `nft -f -` is a subprocess — off the executor.
-                let _ =
-                    tokio::task::spawn_blocking(move || net::rebuild_nat(pods.iter(), &running))
-                        .await;
-            });
+            self.sync_nat().await;
         }
         let mut st = self.st.lock().await;
         if let Some(m) = st.pods.get_mut(&name) {
@@ -1456,9 +1634,22 @@ impl PodControl for Svc {
                 proto::validate_argv(&cl.argv).map_err(bad)?;
             }
         }
+        // Ingress changes the pod's private-network identity — applying it
+        // to a live pod would split persisted state from runtime state, so
+        // it's only accepted on a stopped pod (takes effect next start).
+        if req.ingress.is_some() && self.engine.running_pid(&name).await.is_some() {
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is running — stop the pod before changing ingress"
+            )));
+        }
         let ports_changed = req.ports.is_some();
         let meta = {
             let mut st = self.st.lock().await;
+            // Race-safe ingress policy: global hostname check happens under
+            // THIS lock, immediately before the update below.
+            if let Some(il) = &req.ingress {
+                validate_ingress_conflicts(&st, &name, &il.rules)?;
+            }
             let Some(m) = st.pods.get_mut(&name) else {
                 return Err(Status::not_found(format!("pod {name} not found")));
             };
@@ -1475,6 +1666,10 @@ impl PodControl for Svc {
             // present-but-empty clears it.
             if let Some(cl) = req.cmd {
                 m.cmd = cl.argv;
+            }
+            // Ingress: present (even empty) replaces the whole set.
+            if let Some(il) = req.ingress {
+                m.ingress = ingress_from_proto(&il.rules);
             }
             // Snapshot retention: persisted only — the GC sweep applies it.
             // Absent = keep, 0 clears.
@@ -1523,15 +1718,30 @@ impl PodControl for Svc {
         for spec in &meta.ports {
             proto::validate_port(spec).map_err(bad)?;
         }
-        {
+        // Ingress changes on a live pod would drift persisted vs runtime
+        // state — same rule as `config` (pod_op is held, so the running
+        // check can't race a concurrent start).
+        let old_ingress = {
             let st = self.st.lock().await;
-            validate_host_ports(&st, &name, &meta.stack, &meta.ports)?;
+            st.pods
+                .get(&name)
+                .map(|m| m.ingress.clone())
+                .unwrap_or_default()
+        };
+        if !same_ingress(&old_ingress, &meta.ingress)
+            && self.engine.running_pid(&name).await.is_some()
+        {
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is running — stop the pod before changing ingress"
+            )));
         }
         {
             let mut st = self.st.lock().await;
             if !st.pods.contains_key(&name) {
                 return Err(Status::not_found(format!("pod {name} not found")));
             }
+            validate_host_ports(&st, &name, &meta.stack, &meta.ports)?;
+            validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress))?;
             st.pods.insert(name.clone(), meta.clone());
         }
         if self.engine.running_pid(&name).await.is_some() {
@@ -2249,7 +2459,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .context("storage detect task")?;
     engine.init().await?;
 
-    let st = Arc::new(Mutex::new(state::load(&cfg.data_dir)));
+    let st = Arc::new(Mutex::new(state::load(&cfg.data_dir)?));
     let metrics: MetricsMap = Default::default();
     let listeners: ListenerMap = Default::default();
     let svc = Svc {
@@ -2405,7 +2615,130 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::snapshot_expired;
+    use super::{
+        snapshot_expired, validate_ingress_conflicts, validate_ingress_conflicts_excluding,
+    };
+    use crate::state::{IngressSpec, LimitsSpec, PodMeta, State};
+    use rustypods_proto::rpc::IngressRule;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn meta_with_ingress(name: &str, hosts: &[&str]) -> PodMeta {
+        PodMeta {
+            name: name.into(),
+            image: "img".into(),
+            created_unix: 0,
+            limits: LimitsSpec::default(),
+            ephemeral: false,
+            private_users: true,
+            started: false,
+            storage_max_bytes: 0,
+            ports: vec![],
+            ingress: hosts
+                .iter()
+                .map(|h| IngressSpec {
+                    host: h.to_string(),
+                    pod_port: 8080,
+                })
+                .collect(),
+            net_index: 0,
+            stack: String::new(),
+            binds: vec![],
+            cmd: vec![],
+            snap_keep_last: 0,
+            snap_max_age_secs: 0,
+            autostart: false,
+        }
+    }
+
+    fn rule(host: &str) -> IngressRule {
+        IngressRule {
+            host: host.into(),
+            pod_port: 80,
+        }
+    }
+
+    #[test]
+    fn ingress_conflicts() {
+        let mut st = State {
+            images: BTreeMap::new(),
+            pods: BTreeMap::new(),
+        };
+        st.pods.insert(
+            "taken".into(),
+            meta_with_ingress("taken", &["web.rustypods.localhost"]),
+        );
+        // A fresh host for a new pod is fine.
+        assert!(
+            validate_ingress_conflicts(&st, "new", &[rule("api.rustypods.localhost")]).is_ok()
+        );
+        // Same host on another persisted pod — even stopped — conflicts.
+        let e = validate_ingress_conflicts(&st, "new", &[rule("web.rustypods.localhost")]);
+        assert!(e.is_err_and(|s| s.code() == tonic::Code::AlreadyExists));
+        // Keeping your own rules on update is not a conflict.
+        assert!(
+            validate_ingress_conflicts(&st, "taken", &[rule("web.rustypods.localhost")]).is_ok()
+        );
+        // Duplicate hosts inside one request.
+        let e = validate_ingress_conflicts(
+            &st,
+            "new",
+            &[
+                rule("api.rustypods.localhost"),
+                rule("api.rustypods.localhost"),
+            ],
+        );
+        assert!(e.is_err_and(|s| s.code() == tonic::Code::InvalidArgument));
+        // Bad grammar is rejected before any state comparison.
+        let e = validate_ingress_conflicts(&st, "new", &[rule("UPPER.rustypods.localhost")]);
+        assert!(e.is_err_and(|s| s.code() == tonic::Code::InvalidArgument));
+    }
+
+    #[test]
+    fn ingress_conflicts_excluding_desired_members() {
+        let mut st = State {
+            images: BTreeMap::new(),
+            pods: BTreeMap::new(),
+        };
+        // Persisted: stack member web owns a.host, api owns b.host.
+        st.pods.insert(
+            "s-web".into(),
+            meta_with_ingress("s-web", &["a.rustypods.localhost"]),
+        );
+        st.pods.insert(
+            "s-api".into(),
+            meta_with_ingress("s-api", &["b.rustypods.localhost"]),
+        );
+        st.pods.insert(
+            "outside".into(),
+            meta_with_ingress("outside", &["c.rustypods.localhost"]),
+        );
+        let desired: BTreeSet<String> =
+            ["s-web".to_string(), "s-api".to_string()].into_iter().collect();
+        // Desired swap (web↔api hosts) passes — sibling stale rules are
+        // ignored while the atomic desired set is applied.
+        assert!(validate_ingress_conflicts_excluding(
+            &st,
+            "s-web",
+            &[rule("b.rustypods.localhost")],
+            &desired
+        )
+        .is_ok());
+        assert!(validate_ingress_conflicts_excluding(
+            &st,
+            "s-api",
+            &[rule("a.rustypods.localhost")],
+            &desired
+        )
+        .is_ok());
+        // An outside pod's claim still conflicts.
+        let e = validate_ingress_conflicts_excluding(
+            &st,
+            "s-web",
+            &[rule("c.rustypods.localhost")],
+            &desired,
+        );
+        assert!(e.is_err_and(|s| s.code() == tonic::Code::AlreadyExists));
+    }
 
     #[test]
     fn gc_keep_last_counts_from_newest() {
