@@ -72,6 +72,9 @@ service PodControl {
   rpc GetMeshStatus(Empty) returns (MeshStatus);
   rpc MeshAddPeer(MeshPeer) returns (MeshStatus);
   rpc MeshRemovePeer(MeshPeer) returns (MeshStatus);
+  // Tear the mesh down: cancel the pump, delete rp-mesh0, strip pod
+  // mesh /128s and remove conf/mesh.conf. Returns enabled=false status.
+  rpc MeshDeinit(Empty) returns (MeshStatus);
 
   // Provision/start the managed ingress gateway pod (local PKI + the
   // rustypods-ingress proxy), and report its health/route table.
@@ -311,6 +314,11 @@ message MeshStatus {
   string listen = 3;     // "0.0.0.0:51820"
   string prefix = 4;     // this host's fd…::/48
   repeated MeshPeerInfo peers = 5;
+  // Pump liveness (in-memory counters — the diag that caught the
+  // AsyncFd guard deadlock): ticks should advance ~1/s.
+  uint64 pump_ticks = 6;
+  uint64 udp_pkts = 7;
+  uint64 tun_pkts = 8;
 }
 
 message ListPodsRequest {}

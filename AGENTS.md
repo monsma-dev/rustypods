@@ -290,11 +290,21 @@ from pods on other hosts. L3, end-to-end encrypted, no NAT.
 - Hard-won: never nest a second `AsyncFd::readable()` inside a select
   arm that already holds the readiness guard — the inner await parked
   forever (guard `r` alive until arm end) freezing the whole pump:
-  UDP Recv-Q grew, 0% CPU, `mesh status` still answered. Diagnose via
-  pump_ticks/udp_pkts/tun_pkts/pump_where (also mirrored to
-  $data_dir/mesh-pump.status each tick). Fix: `guard.try_io` directly
-  on the select arm's own guard. The pump also runs under a supervisor
-  task — a panic would otherwise die silently on a dropped JoinHandle.
+  UDP Recv-Q grew, 0% CPU, `mesh status` still answered. Fix:
+  `guard.try_io` directly on the select arm's own guard. The pump runs
+  under a supervisor task (a panic would otherwise die silently on a
+  dropped JoinHandle); liveness counters pump_ticks/udp_pkts/tun_pkts
+  are in-memory atomics surfaced via MeshStatus — no file dumps.
+- `mesh deinit` (`DELETE /v1/mesh`) is the full teardown: watch-channel
+  cancels the pump, the supervisor JoinHandle is awaited (3s bound),
+  `ip tuntap del` removes rp-mesh0 (its routes die with it), pod /128s
+  are stripped via remove_mesh_addr, and conf/mesh.conf is deleted so
+  a restart stays down. Svc.mesh is `Arc<std::sync::RwLock<…>>`, NOT a
+  OnceCell — set-once can't express deinit, and the lock must be std
+  (to_pod reads it synchronously).
+- REST mesh surface: `GET /v1/mesh`, `POST /v1/mesh/init?listen_port=`,
+  `DELETE /v1/mesh`, `POST /v1/mesh/peers`, `DELETE /v1/mesh/peers/
+  {*pubkey}` (wildcard — raw base64 can contain `/`).
 - Hard-won: dual-stack UDP sockets need v4-mapped-v6 endpoints —
   `send_to` to a plain `SocketAddrV4` on a `[::]`-bound socket fails
   silently. `canon_ep` maps both directions (config, roaming srcs) and

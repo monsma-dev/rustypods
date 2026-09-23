@@ -387,6 +387,9 @@ enum MeshCmd {
         /// Peer's base64 WG pubkey (`mesh status` lists them).
         pubkey: String,
     },
+    /// Tear the mesh down: stop the pump, delete rp-mesh0, strip pod
+    /// mesh addresses and forget the WG identity (conf/mesh.conf).
+    Deinit,
 }
 
 #[derive(Subcommand)]
@@ -1048,6 +1051,10 @@ fn print_mesh_status(st: &MeshStatus) {
     println!("pubkey:  {}", st.pubkey);
     println!("listen:  {}", st.listen);
     println!("prefix:  {}", st.prefix);
+    println!(
+        "pump:    ticks={} udp={} tun={}",
+        st.pump_ticks, st.udp_pkts, st.tun_pkts
+    );
     if st.peers.is_empty() {
         println!("peers:   none — `rustypods mesh add-peer <ip:port> <pubkey>`");
     }
@@ -1256,6 +1263,13 @@ async fn main() -> Result<()> {
                     .await?
                     .into_inner();
                 print_mesh_status(&st);
+            }
+            MeshCmd::Deinit => {
+                connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .mesh_deinit(Empty {})
+                    .await?;
+                println!("mesh down — rp-mesh0 removed, identity forgotten");
             }
         },
         Cmd::Ingress { sub } => match sub {

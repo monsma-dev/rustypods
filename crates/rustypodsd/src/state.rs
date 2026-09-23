@@ -399,6 +399,16 @@ pub fn save_mesh(data_dir: &Path, m: &MeshConf) -> Result<()> {
     Ok(())
 }
 
+/// `mesh deinit` — drop the persisted identity+peers so a daemon
+/// restart does not resurrect the mesh.
+pub fn remove_mesh(data_dir: &Path) -> Result<()> {
+    match std::fs::remove_file(mesh_conf_path(data_dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn save_image(data_dir: &Path, m: &ImageMeta) -> Result<()> {
     std::fs::create_dir_all(images_conf_dir(data_dir))?;
     write_conf(&image_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)

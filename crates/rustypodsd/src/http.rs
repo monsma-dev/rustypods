@@ -527,6 +527,76 @@ async fn remove_volume(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- Multi-host mesh (Wave I/J) ---
+
+/// `POST /v1/mesh/init?listen_port=N` — empty body, port optional.
+#[derive(Deserialize, Default)]
+struct MeshInitIn {
+    #[serde(default)]
+    listen_port: u32,
+}
+
+async fn mesh_status_http(State(s): State<Svc>) -> Result<Json<MeshStatus>, ApiErr> {
+    s.get_mesh_status(Request::new(Empty {}))
+        .await
+        .map(|r| Json(r.into_inner()))
+        .map_err(api_err)
+}
+
+async fn mesh_init_http(
+    State(s): State<Svc>,
+    Query(q): Query<MeshInitIn>,
+) -> Result<Json<MeshStatus>, ApiErr> {
+    s.mesh_init(Request::new(MeshInitRequest {
+        listen_port: q.listen_port,
+    }))
+    .await
+    .map(|r| Json(r.into_inner()))
+    .map_err(api_err)
+}
+
+async fn mesh_deinit_http(State(s): State<Svc>) -> Result<Json<MeshStatus>, ApiErr> {
+    s.mesh_deinit(Request::new(Empty {}))
+        .await
+        .map(|r| Json(r.into_inner()))
+        .map_err(api_err)
+}
+
+/// `POST /v1/mesh/peers` body — proto types don't derive Deserialize.
+#[derive(Deserialize)]
+struct MeshPeerIn {
+    endpoint: String,
+    pubkey: String,
+}
+
+async fn mesh_add_peer_http(
+    State(s): State<Svc>,
+    Json(b): Json<MeshPeerIn>,
+) -> Result<Json<MeshStatus>, ApiErr> {
+    s.mesh_add_peer(Request::new(MeshPeer {
+        endpoint: b.endpoint,
+        pubkey: b.pubkey,
+    }))
+    .await
+    .map(|r| Json(r.into_inner()))
+    .map_err(api_err)
+}
+
+/// `DELETE /v1/mesh/peers/*pubkey` — wildcard because raw base64 may
+/// contain `/`.
+async fn mesh_rm_peer_http(
+    State(s): State<Svc>,
+    Path(pubkey): Path<String>,
+) -> Result<Json<MeshStatus>, ApiErr> {
+    s.mesh_remove_peer(Request::new(MeshPeer {
+        endpoint: String::new(),
+        pubkey,
+    }))
+    .await
+    .map(|r| Json(r.into_inner()))
+    .map_err(api_err)
+}
+
 /// Bearer auth + browser-header rejection for /v1/*. Two gates:
 /// 1. Any `Origin` or `Sec-Fetch-Site` header → 403. Browsers attach those
 ///    to cross-origin requests; a local web page must never drive the API.
@@ -573,6 +643,10 @@ pub fn router(svc: Svc, token: Arc<str>) -> Router {
         .route("/v1/stacks/{name}", delete(destroy_stack))
         .route("/v1/volumes", get(list_volumes).post(create_volume))
         .route("/v1/volumes/{name}", delete(remove_volume))
+        .route("/v1/mesh", get(mesh_status_http).delete(mesh_deinit_http))
+        .route("/v1/mesh/init", post(mesh_init_http))
+        .route("/v1/mesh/peers", post(mesh_add_peer_http))
+        .route("/v1/mesh/peers/{*pubkey}", delete(mesh_rm_peer_http))
         .route_layer(axum::middleware::from_fn_with_state(
             token,
             require_token,

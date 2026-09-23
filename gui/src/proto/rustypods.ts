@@ -326,6 +326,13 @@ export interface MeshStatus {
   /** this host's fd…::/48 */
   prefix: string;
   peers: MeshPeerInfo[];
+  /**
+   * Pump liveness (in-memory counters — the diag that caught the
+   * AsyncFd guard deadlock): ticks should advance ~1/s.
+   */
+  pumpTicks: number;
+  udpPkts: number;
+  tunPkts: number;
 }
 
 export interface ListPodsRequest {
@@ -3632,7 +3639,7 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
 };
 
 function createBaseMeshStatus(): MeshStatus {
-  return { enabled: false, pubkey: "", listen: "", prefix: "", peers: [] };
+  return { enabled: false, pubkey: "", listen: "", prefix: "", peers: [], pumpTicks: 0, udpPkts: 0, tunPkts: 0 };
 }
 
 export const MeshStatus: MessageFns<MeshStatus> = {
@@ -3651,6 +3658,15 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     }
     for (const v of message.peers) {
       MeshPeerInfo.encode(v!, writer.uint32(42).fork()).join();
+    }
+    if (message.pumpTicks !== 0) {
+      writer.uint32(48).uint64(message.pumpTicks);
+    }
+    if (message.udpPkts !== 0) {
+      writer.uint32(56).uint64(message.udpPkts);
+    }
+    if (message.tunPkts !== 0) {
+      writer.uint32(64).uint64(message.tunPkts);
     }
     return writer;
   },
@@ -3708,6 +3724,30 @@ export const MeshStatus: MessageFns<MeshStatus> = {
             message.peers.push(MeshPeerInfo.decode(reader, reader.uint32()));
             continue;
           }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.pumpTicks = longToNumber(reader.uint64());
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.udpPkts = longToNumber(reader.uint64());
+            continue;
+          }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.tunPkts = longToNumber(reader.uint64());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3727,6 +3767,21 @@ export const MeshStatus: MessageFns<MeshStatus> = {
       listen: isSet(object.listen) ? globalThis.String(object.listen) : "",
       prefix: isSet(object.prefix) ? globalThis.String(object.prefix) : "",
       peers: globalThis.Array.isArray(object?.peers) ? object.peers.map((e: any) => MeshPeerInfo.fromJSON(e)) : [],
+      pumpTicks: isSet(object.pumpTicks)
+        ? globalThis.Number(object.pumpTicks)
+        : isSet(object.pump_ticks)
+        ? globalThis.Number(object.pump_ticks)
+        : 0,
+      udpPkts: isSet(object.udpPkts)
+        ? globalThis.Number(object.udpPkts)
+        : isSet(object.udp_pkts)
+        ? globalThis.Number(object.udp_pkts)
+        : 0,
+      tunPkts: isSet(object.tunPkts)
+        ? globalThis.Number(object.tunPkts)
+        : isSet(object.tun_pkts)
+        ? globalThis.Number(object.tun_pkts)
+        : 0,
     };
   },
 
@@ -3747,6 +3802,15 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     if (message.peers?.length) {
       obj.peers = message.peers.map((e) => MeshPeerInfo.toJSON(e));
     }
+    if (message.pumpTicks !== 0) {
+      obj.pumpTicks = Math.round(message.pumpTicks);
+    }
+    if (message.udpPkts !== 0) {
+      obj.udpPkts = Math.round(message.udpPkts);
+    }
+    if (message.tunPkts !== 0) {
+      obj.tunPkts = Math.round(message.tunPkts);
+    }
     return obj;
   },
 
@@ -3760,6 +3824,9 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     message.listen = object.listen ?? "";
     message.prefix = object.prefix ?? "";
     message.peers = object.peers?.map((e) => MeshPeerInfo.fromPartial(e)) || [];
+    message.pumpTicks = object.pumpTicks ?? 0;
+    message.udpPkts = object.udpPkts ?? 0;
+    message.tunPkts = object.tunPkts ?? 0;
     return message;
   },
 };
@@ -7858,6 +7925,18 @@ export const PodControlDefinition = {
     meshRemovePeer: {
       name: "MeshRemovePeer",
       requestType: MeshPeer as typeof MeshPeer,
+      requestStream: false,
+      responseType: MeshStatus as typeof MeshStatus,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Tear the mesh down: cancel the pump, delete rp-mesh0, strip pod
+     * mesh /128s and remove conf/mesh.conf. Returns enabled=false status.
+     */
+    meshDeinit: {
+      name: "MeshDeinit",
+      requestType: Empty as typeof Empty,
       requestStream: false,
       responseType: MeshStatus as typeof MeshStatus,
       responseStream: false,

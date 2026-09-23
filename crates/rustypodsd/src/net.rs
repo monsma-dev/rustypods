@@ -468,6 +468,28 @@ pub async fn configure_mesh_addr(
     Ok(())
 }
 
+/// `mesh deinit` counterpart — strip a pod's mesh /128 (in-pod addr +
+/// host-side route). Best-effort: the pod may be mid-stop, so failures
+/// are the caller's to log, not fatal.
+pub async fn remove_mesh_addr(idx: u32, leader: u32, prefix: std::net::Ipv6Addr) -> Result<()> {
+    let addr = crate::mesh::mesh_ip(prefix, idx);
+    if let Ok(veth) = wait_host_veth(leader).await {
+        let _ = run_async(
+            "ip",
+            &["-6", "route", "del", &format!("{addr}/128"), "dev", &veth],
+        )
+        .await;
+    }
+    if leader != 0 {
+        let _ = nsenter_net(
+            leader,
+            &["ip", "-6", "addr", "del", &format!("{addr}/128"), "dev", "host0"],
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// Kernel knobs required for DNAT into the veth — ip_forward (v4 and v6)
 /// for routed traffic, route_localnet so localhost→pod flows survive
 /// (Docker does the same on container hosts). Idempotent; a kernel

@@ -66,9 +66,10 @@ pub struct Svc {
     /// Entries exist only while a pod is under supervision (running
     /// with a restart policy or a configured probe).
     health: Arc<Mutex<HashMap<String, PodHealth>>>,
-    /// Wave I mesh: OnceCell — mesh_init sets it once per daemon
-    /// lifetime; `get()` is sync so to_pod stays non-async.
-    mesh: Arc<tokio::sync::OnceCell<Arc<mesh::Mesh>>>,
+    /// Wave I mesh: None until `mesh init`/startup-restore, Some while
+    /// up, back to None after `mesh deinit`. std RwLock — mesh_prefix
+    /// feeds the sync to_pod path, so a tokio lock won't do.
+    mesh: Arc<std::sync::RwLock<Option<Arc<mesh::Mesh>>>>,
     /// Pods stopped on purpose via stop_pod — the supervisor must not
     /// restart these. PodMeta.started means "was ever started" (display
     /// state), not "should be running", so intent lives here. In-memory:
@@ -435,10 +436,15 @@ fn same_ingress(a: &[IngressSpec], b: &[IngressSpec]) -> bool {
 }
 
 impl Svc {
+    /// The live mesh handle, if the Wave I mesh is up.
+    fn mesh(&self) -> Option<Arc<mesh::Mesh>> {
+        self.mesh.read().ok()?.clone()
+    }
+
     /// This host's mesh /48 when the Wave I mesh is up — to_pod derives
     /// each pod's mesh_ip from it (never persisted).
     fn mesh_prefix(&self) -> Option<std::net::Ipv6Addr> {
-        self.mesh.get().map(|m| m.prefix)
+        self.mesh().map(|m| m.prefix)
     }
 
     /// Give every running standalone pod its mesh /128 — used after
@@ -446,7 +452,7 @@ impl Svc {
     /// were started before the mesh existed). Idempotent: both the
     /// route and the addr use `replace`.
     async fn assign_mesh_addrs(&self) {
-        let Some(m) = self.mesh.get() else { return };
+        let Some(m) = self.mesh() else { return };
         let pods: Vec<PodMeta> = {
             let st = self.st.lock().await;
             st.pods
@@ -462,6 +468,78 @@ impl Svc {
                 }
             }
         }
+    }
+
+    /// `mesh deinit` counterpart: strip every pod's mesh /128. Best-
+    /// effort per pod — a pod mid-stop just logs and moves on.
+    async fn remove_mesh_addrs(&self, prefix: std::net::Ipv6Addr) {
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods
+                .values()
+                .filter(|p| p.net_index > 0 && p.stack.is_empty())
+                .cloned()
+                .collect()
+        };
+        for p in pods {
+            if let Some(leader) = self.engine.running_pid(&p.name).await {
+                if let Err(e) = net::remove_mesh_addr(p.net_index, leader, prefix).await {
+                    tracing::warn!("mesh addr removal for {}: {e:#}", p.name);
+                }
+            }
+        }
+    }
+
+    /// Shared mesh-init body for the gRPC handler and REST facade.
+    async fn mesh_up(&self, listen_port: u32) -> Result<MeshStatus, Status> {
+        if let Some(m) = self.mesh() {
+            return Ok(m.status().await);
+        }
+        let mut conf = state::load_mesh(&self.cfg.data_dir).unwrap_or_default();
+        if conf.private_key.is_empty() {
+            let (priv_, _pub) = mesh::keygen();
+            conf.private_key = priv_;
+        }
+        if listen_port != 0 {
+            conf.listen_port = listen_port as u16;
+        }
+        state::save_mesh(&self.cfg.data_dir, &conf).map_err(int)?;
+        let m = mesh::Mesh::start(&self.cfg.data_dir, conf)
+            .await
+            .map_err(int)?;
+        let status = m.status().await;
+        {
+            let mut g = self.mesh.write().map_err(|e| int(anyhow::anyhow!("{e}")))?;
+            if let Some(old) = g.replace(m) {
+                // init raced init — the loser's socket is already
+                // bound; shut it down async, the winner stays.
+                tokio::spawn(async move { old.shutdown().await });
+            }
+        }
+        // Pods already running get their /128 now — mesh init must not
+        // require a pod restart to take effect.
+        self.assign_mesh_addrs().await;
+        Ok(status)
+    }
+
+    /// Shared mesh-deinit body: cancel pump, delete rp-mesh0, strip pod
+    /// /128s, remove conf/mesh.conf. Idempotent.
+    async fn mesh_down(&self) -> Result<MeshStatus, Status> {
+        let m = self
+            .mesh
+            .write()
+            .map_err(|e| int(anyhow::anyhow!("{e}")))?
+            .take();
+        if let Some(m) = m {
+            self.remove_mesh_addrs(m.prefix).await;
+            m.shutdown().await;
+            state::remove_mesh(&self.cfg.data_dir).map_err(int)?;
+            tracing::info!("mesh down: rp-mesh0 removed, conf/mesh.conf deleted");
+        }
+        Ok(MeshStatus {
+            enabled: false,
+            ..Default::default()
+        })
     }
 
     fn save_pod(&self, m: &PodMeta) -> Result<()> {
@@ -1712,34 +1790,13 @@ impl PodControl for Svc {
         &self,
         req: Request<MeshInitRequest>,
     ) -> Result<Response<MeshStatus>, Status> {
-        if let Some(m) = self.mesh.get() {
-            return Ok(Response::new(m.status().await));
-        }
-        let req = req.into_inner();
-        let mut conf = state::load_mesh(&self.cfg.data_dir).unwrap_or_default();
-        if conf.private_key.is_empty() {
-            let (priv_, _pub) = mesh::keygen();
-            conf.private_key = priv_;
-        }
-        if req.listen_port != 0 {
-            conf.listen_port = req.listen_port as u16;
-        }
-        state::save_mesh(&self.cfg.data_dir, &conf).map_err(int)?;
-        let m = mesh::Mesh::start(&self.cfg.data_dir, conf)
-            .await
-            .map_err(int)?;
-        let status = m.status().await;
-        if self.mesh.set(m).is_err() {
-            return Err(Status::internal("mesh init raced — already running"));
-        }
-        // Pods already running get their /128 now — mesh init must not
-        // require a pod restart to take effect.
-        self.assign_mesh_addrs().await;
-        Ok(Response::new(status))
+        Ok(Response::new(
+            self.mesh_up(req.into_inner().listen_port).await?,
+        ))
     }
 
     async fn get_mesh_status(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
-        match self.mesh.get() {
+        match self.mesh() {
             Some(m) => Ok(Response::new(m.status().await)),
             None => Ok(Response::new(MeshStatus {
                 enabled: false,
@@ -1750,7 +1807,7 @@ impl PodControl for Svc {
 
     async fn mesh_add_peer(&self, req: Request<MeshPeer>) -> Result<Response<MeshStatus>, Status> {
         let p = req.into_inner();
-        let Some(m) = self.mesh.get() else {
+        let Some(m) = self.mesh() else {
             return Err(Status::failed_precondition(
                 "mesh not initialized — run `rustypods mesh init` first",
             ));
@@ -1764,7 +1821,7 @@ impl PodControl for Svc {
         req: Request<MeshPeer>,
     ) -> Result<Response<MeshStatus>, Status> {
         let p = req.into_inner();
-        let Some(m) = self.mesh.get() else {
+        let Some(m) = self.mesh() else {
             return Err(Status::failed_precondition(
                 "mesh not initialized — run `rustypods mesh init` first",
             ));
@@ -1773,6 +1830,10 @@ impl PodControl for Svc {
             return Err(Status::not_found("no such mesh peer"));
         }
         Ok(Response::new(m.status().await))
+    }
+
+    async fn mesh_deinit(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
+        Ok(Response::new(self.mesh_down().await?))
     }
 
     async fn import_image(
@@ -2948,7 +3009,7 @@ impl PodControl for Svc {
             // Mesh identity is part of "started" too — a pod that can't
             // take its mesh addr while the mesh is up would report
             // running yet be unreachable cluster-wide. Same unwind.
-            if let Some(m) = self.mesh.get() {
+            if let Some(m) = self.mesh() {
                 if let Err(e) =
                     net::configure_mesh_addr(meta.net_index, leader.unwrap_or(0), m.prefix).await
                 {
@@ -4641,7 +4702,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         match mesh::Mesh::start(&cfg.data_dir, conf).await {
             Ok(m) => {
                 tracing::info!("mesh up: {} on [::]:{}", m.prefix, m.port);
-                let _ = svc.mesh.set(m);
+                *svc.mesh.write().unwrap() = Some(m);
                 svc.assign_mesh_addrs().await;
             }
             Err(e) => tracing::error!("mesh start failed (mesh disabled): {e:#}"),

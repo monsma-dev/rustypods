@@ -33,7 +33,7 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::net;
 use crate::state::{MeshConf, MeshPeerConf};
@@ -159,6 +159,12 @@ pub struct Mesh {
     /// Where the pump is parked (diag): 0=in select, 1=tun read,
     /// 2=route_out, 3=udp recv, 4=handle_udp, 5=timers.
     pub pump_where: std::sync::atomic::AtomicU8,
+    /// Graceful pump stop — `mesh deinit` sends true; the pump's
+    /// select arm observes it and returns, ending the supervisor.
+    shutdown_tx: watch::Sender<bool>,
+    /// Supervisor task — awaited by shutdown() so `deinit` doesn't
+    /// report "down" while the pump still holds the socket/TUN.
+    supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[repr(C)]
@@ -206,11 +212,7 @@ impl Mesh {
     /// all setup syscalls are wrapped in spawn_blocking. `tun_name`
     /// exists for the meshpeer test harness (a second mesh endpoint on
     /// one host needs a distinct device).
-    pub async fn start_named(
-        data_dir: &Path,
-        conf: MeshConf,
-        tun_name: &str,
-    ) -> Result<Arc<Mesh>> {
+    pub async fn start_named(data_dir: &Path, conf: MeshConf, tun_name: &str) -> Result<Arc<Mesh>> {
         let privkey = conf.private_key.clone();
         let pubkey = pubkey_of(&privkey)?;
         let prefix = prefix_of(&pubkey)?;
@@ -252,6 +254,7 @@ impl Mesh {
             peers.insert(parse_pubkey(&pc.pubkey)?, p);
         }
 
+        let (shutdown_tx, _) = watch::channel(false);
         let mesh = Arc::new(Mesh {
             prefix,
             pubkey,
@@ -267,26 +270,28 @@ impl Mesh {
             udp_pkts: Default::default(),
             tun_pkts: Default::default(),
             pump_where: Default::default(),
+            shutdown_tx,
+            supervisor: Mutex::new(None),
         });
         // Supervised pump: a panic inside the spawned task would
         // otherwise die silently (dropped JoinHandle) leaving Recv-Q
         // to grow while `mesh status` still looks alive.
         let sup = mesh.clone();
-        tokio::spawn(async move {
+        *mesh.supervisor.lock().await = Some(tokio::spawn(async move {
             loop {
+                if *sup.shutdown_tx.borrow() {
+                    break;
+                }
                 let h = tokio::spawn(sup.clone().pump());
                 match h.await {
-                    Ok(()) => {
-                        tracing::error!("mesh pump exited; not restarting");
-                        break;
-                    }
+                    Ok(()) => break, // graceful shutdown
                     Err(e) => {
                         tracing::error!("mesh pump panicked: {e}; restarting");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
             }
-        });
+        }));
         Ok(mesh)
     }
 
@@ -321,7 +326,14 @@ impl Mesh {
         tokio::task::spawn_blocking(move || {
             let _ = net::run(
                 "ip",
-                &["-6", "route", "replace", &format!("{prefix}/48"), "dev", &tn],
+                &[
+                    "-6",
+                    "route",
+                    "replace",
+                    &format!("{prefix}/48"),
+                    "dev",
+                    &tn,
+                ],
             );
         })
         .await?;
@@ -389,7 +401,10 @@ impl Mesh {
                 // Unmap for display — [::ffff:10.0.0.1]:51820 reads as
                 // 10.0.0.1:51820, matching what the operator typed.
                 let ip = match p.endpoint.ip() {
-                    IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+                    IpAddr::V6(v6) => v6
+                        .to_ipv4_mapped()
+                        .map(IpAddr::V4)
+                        .unwrap_or(IpAddr::V6(v6)),
                     v4 => v4,
                 };
                 rustypods_proto::rpc::MeshPeerInfo {
@@ -408,6 +423,36 @@ impl Mesh {
             listen: format!("[::]:{}", self.port),
             prefix: format!("{}/48", self.prefix),
             peers: infos,
+            pump_ticks: self.pump_ticks.load(std::sync::atomic::Ordering::Relaxed),
+            udp_pkts: self.udp_pkts.load(std::sync::atomic::Ordering::Relaxed),
+            tun_pkts: self.tun_pkts.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Graceful teardown (`mesh deinit`): signal the pump, wait for the
+    /// supervisor to finish, then delete the persistent TUN. Routes
+    /// through rp-mesh0 die with the device; the caller strips pod
+    /// /128s and removes conf/mesh.conf.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(h) = self.supervisor.lock().await.take() {
+            if tokio::time::timeout(Duration::from_secs(3), h)
+                .await
+                .is_err()
+            {
+                tracing::warn!("mesh pump did not stop in 3s — abandoning");
+            }
+        }
+        // `ip link del` beats `tuntap del`: it removes the netdev even
+        // while a stale fd keeps it depersisted-only.
+        let tn = self.tun_name.clone();
+        let tn2 = tn.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || net::run("ip", &["link", "del", &tn]))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r)
+        {
+            tracing::warn!("mesh teardown: delete {tn2}: {e:#}");
         }
     }
 
@@ -418,24 +463,16 @@ impl Mesh {
         let mut udp_buf = vec![0u8; 2048];
         let mut out = vec![0u8; 2048];
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut shutdown = self.shutdown_tx.subscribe();
         use std::sync::atomic::Ordering::Relaxed;
         loop {
             self.pump_ticks.fetch_add(1, Relaxed);
             self.pump_where.store(0, Relaxed);
             tokio::select! {
+                _ = shutdown.changed() => break,
                 _ = tick.tick() => {
                     self.pump_where.store(5, Relaxed);
                     self.update_timers(&mut out).await;
-                    let _ = std::fs::write(
-                        self.data_dir.join("mesh-pump.status"),
-                        format!(
-                            "ticks={} where={} udp={} tun={}\n",
-                            self.pump_ticks.load(Relaxed),
-                            self.pump_where.load(Relaxed),
-                            self.udp_pkts.load(Relaxed),
-                            self.tun_pkts.load(Relaxed)
-                        ),
-                    );
                 }
                 r = self.tun.readable() => {
                     // try_io on THIS guard only — a nested readable()
@@ -493,8 +530,8 @@ impl Mesh {
             match p.tunn.encapsulate(pkt, out) {
                 TunnResult::WriteToNetwork(dgram) => {
                     if let Err(e) = self.udp.send_to(dgram, p.endpoint).await {
-                    tracing::debug!("mesh udp send {}: {e}", p.endpoint);
-                }
+                        tracing::debug!("mesh udp send {}: {e}", p.endpoint);
+                    }
                 }
                 TunnResult::Err(e) => {
                     tracing::debug!("mesh encapsulate: {e:?}");
