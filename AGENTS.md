@@ -194,6 +194,29 @@ rustypodsd does it itself:
   "on-failure" only on leader death (exit-code distinction is a machined
   blind spot for now).
 
+## Named volumes + pod env (Wave E)
+
+- `volumes/<name>` are btrfs subvols (fallback: plain dirs) under the
+  data dir; registry lives in `conf/volumes/<name>.conf`. Pods mount
+  them via `--volume name:/pod/path[:ro]` → daemon-side `--bind` at
+  start; `destroy pod` never deletes volumes, `volume rm` refuses
+  while any pod conf references one (running OR stopped).
+- Volume dirs are mode 0777 on purpose: pod roots under
+  --private-users=pick map to arbitrary host UIDs, so a 0755 dir is
+  read-only inside the pod. Without idmapped bind mounts there is no
+  narrower permission that works for every userns range.
+- Missing volumes are auto-created wherever specs resolve (create,
+  config, stack apply, start, `volume ls` fs-reconciliation) — hand-
+  edited confs can reference volumes that don't exist yet.
+- Pod env (`--env KEY=v`, `--env-file`, conf `env`, stack.toml `env`)
+  merges OVER the image's OCI env per key and goes to nspawn via
+  --setenv. It lands on PID 1's environ — exec'd processes do NOT
+  inherit it (nsenter doesn't carry env). Visible via
+  /proc/<pid>/environ: config, not a vault.
+- `--env-file` parsing: blank lines + `#` comments skipped, no shell
+  expansion, `A=$HOME` stays literal; `--env` flags override file
+  entries per key.
+
 ## Rootless podman caveat
 
 `podman` needs the user session bus (`/run/user/1000/bus`). If `podman

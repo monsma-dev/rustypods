@@ -57,6 +57,12 @@ pub struct StackPod {
     /// be unique across all members of the stack AND all other pods.
     #[serde(default)]
     pub ingress: Vec<String>,
+    /// Pod-level env "KEY=value" — merged over the image env at start.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Named-volume mounts "name:/pod/path[:ro]".
+    #[serde(default)]
+    pub volumes: Vec<String>,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.
@@ -108,6 +114,12 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
                     rule.host
                 );
             }
+        }
+        rustypods_proto::validate_env(&p.env)
+            .with_context(|| format!("pods.{member}: invalid env"))?;
+        for spec in &p.volumes {
+            rustypods_proto::parse_volume_spec(spec)
+                .with_context(|| format!("pods.{member}: invalid volume"))?;
         }
     }
     Ok(def)

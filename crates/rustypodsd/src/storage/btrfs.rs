@@ -145,8 +145,6 @@ impl StorageDriver for BtrfsDriver {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn create_clone_delete() {
         let base = std::env::temp_dir().join(format!("rustypods-storage-test-{}", std::process::id()));

@@ -1,6 +1,7 @@
 //! Shared API surface for RustyPods: generated gRPC code plus the few
 //! constants and validators both the daemon and the CLI need.
 
+use anyhow::Context as _;
 use std::path::PathBuf;
 
 pub mod rpc {
@@ -15,6 +16,10 @@ pub fn images_dir(data_dir: &std::path::Path) -> PathBuf {
 }
 pub fn pods_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("pods")
+}
+/// Named volumes — each a btrfs subvolume under volumes/<name>.
+pub fn volumes_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("volumes")
 }
 pub fn logs_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("logs")
@@ -359,6 +364,70 @@ pub fn validate_argv(argv: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A parsed "name:/pod/path[:ro]" volume mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeSpec {
+    pub name: String,
+    pub target: String,
+    pub ro: bool,
+}
+
+/// Parse+validate a named-volume mount spec. The volume name shares the
+/// pod-name grammar (it becomes a directory under volumes/); the target
+/// is an absolute in-pod path without '..'.
+pub fn parse_volume_spec(spec: &str) -> anyhow::Result<VolumeSpec> {
+    let (name, rest) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid volume '{spec}' — want name:/pod/path[:ro]"))?;
+    validate_name(name).with_context(|| format!("invalid volume name '{name}'"))?;
+    let (target, ro) = match rest.strip_suffix(":ro") {
+        Some(t) => (t, true),
+        None => (rest, false),
+    };
+    if !target.starts_with('/') || target.len() < 2 {
+        anyhow::bail!("invalid volume target '{target}' — must be an absolute path");
+    }
+    // ':' inside the target would make the ":ro" suffix ambiguous
+    // ("data:/a:b" vs "data:/a:b:ro"), so it's rejected outright.
+    if target.contains("..")
+        || target.contains('\0')
+        || target.contains(':')
+        || target.ends_with('/')
+    {
+        anyhow::bail!("invalid volume target '{target}' — no '..', ':', NUL or trailing '/'");
+    }
+    Ok(VolumeSpec {
+        name: name.into(),
+        target: target.into(),
+        ro,
+    })
+}
+
+/// Validate "KEY=value" env entries: POSIX-ish key, no NUL anywhere.
+/// Same rules exec.rs applies to client-supplied env — sharing them
+/// keeps conf-time validation honest with exec-time.
+pub fn validate_env(entries: &[String]) -> anyhow::Result<()> {
+    for kv in entries {
+        let Some((key, _)) = kv.split_once('=') else {
+            anyhow::bail!("invalid env entry '{kv}' — want KEY=value");
+        };
+        let key_ok = !key.is_empty()
+            && key
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !key_ok {
+            anyhow::bail!("invalid env key '{key}'");
+        }
+        if kv.contains('\0') {
+            anyhow::bail!("invalid env entry '{kv}' — NUL byte");
+        }
+    }
+    Ok(())
+}
+
 /// Restart policy names — "" normalizes to "no".
 pub const RESTART_POLICIES: [&str; 3] = ["no", "on-failure", "always"];
 
@@ -680,6 +749,40 @@ mod tests {
         assert!(parse_duration("inf").is_err());
         assert!(parse_duration("-inf").is_err());
         assert!(parse_duration("99999999999999d").is_err());
+    }
+
+    #[test]
+    fn volume_spec_parsing() {
+        let v = parse_volume_spec("data:/var/lib/pg").unwrap();
+        assert_eq!(v.name, "data");
+        assert_eq!(v.target, "/var/lib/pg");
+        assert!(!v.ro);
+        let v = parse_volume_spec("conf:/etc/app:ro").unwrap();
+        assert!(v.ro);
+        // RW must not carry the suffix; bad names/targets rejected.
+        assert!(parse_volume_spec("data:/x").is_ok());
+        assert!(parse_volume_spec("data").is_err());           // no target
+        assert!(parse_volume_spec("data:relative").is_err());  // not absolute
+        assert!(parse_volume_spec("data:/x:rw").is_err());     // unknown flag
+        assert!(parse_volume_spec("bad name:/x").is_err());
+        assert!(parse_volume_spec("../x:/x").is_err());
+        assert!(parse_volume_spec("data:/").is_err());         // can't mount over /
+        assert!(parse_volume_spec("data:/x:ro:extra").is_err());
+    }
+
+    #[test]
+    fn env_validation() {
+        assert!(validate_env(&["A=1".into(), "B_TWO=x=y".into()]).is_ok());
+        assert!(validate_env(&[]).is_ok());
+        assert!(validate_env(&["=x".into()]).is_err());        // empty key
+        assert!(validate_env(&["NOEQ".into()]).is_err());      // no '='
+        assert!(validate_env(&["A".into()]).is_err());
+        assert!(validate_env(&["1A=x".into()]).is_err());      // key starts digit
+        assert!(validate_env(&["A-B=x".into()]).is_err());     // bad key char
+        assert!(validate_env(&["_A=x".into()]).is_ok());       // '_' ok
+        assert!(validate_env(&["A=".into()]).is_ok());         // empty value ok
+        // Duplicate keys are legal — the pod-level merge keeps the last.
+        assert!(validate_env(&["A=1".into(), "A=2".into()]).is_ok());
     }
 
     #[test]

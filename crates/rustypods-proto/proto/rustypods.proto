@@ -48,6 +48,11 @@ service PodControl {
   rpc ListShm(PodRef) returns (ShmList);
   rpc RemoveShm(ShmRef) returns (Empty);
 
+  // Named btrfs volumes — outlive pods, mount into pods via --volume.
+  rpc ListVolumes(Empty) returns (VolumeInfoList);
+  rpc CreateVolume(VolumeRef) returns (VolumeInfo);
+  rpc RemoveVolume(VolumeRef) returns (Empty);
+
   // Provision/start the managed ingress gateway pod (local PKI + the
   // rustypods-ingress proxy), and report its health/route table.
   rpc InitIngress(InitIngressRequest) returns (IngressDeployment);
@@ -195,6 +200,11 @@ message Pod {
   string health = 20;
   // Persisted restart policy: "no" | "on-failure" | "always".
   string restart = 21;
+  // Named volumes bound into the pod at start (survive pod destroy).
+  repeated VolumeMount volumes = 22;
+  // Pod-level env "KEY=value", merged over the image's OCI env.
+  // Visible via /proc/<pid>/environ — treat as config, not a vault.
+  repeated string env = 23;
 }
 
 message PodList {
@@ -203,6 +213,31 @@ message PodList {
 
 message PodRef {
   string name = 1;
+}
+
+// A named volume mounted into a pod.
+message VolumeMount {
+  string name = 1;   // volume name (also its dir under volumes/)
+  string target = 2; // in-pod mount path
+  bool ro = 3;
+}
+
+message VolumeRef {
+  string name = 1;
+}
+
+// A named btrfs volume — survives pod destroy; cloneable via the
+// storage driver for dev-database copies.
+message VolumeInfo {
+  string name = 1;
+  string path = 2;           // host path
+  uint64 created_unix = 3;
+  repeated string pods = 4;  // pods that mount it
+  uint64 size_bytes = 5;
+}
+
+message VolumeInfoList {
+  repeated VolumeInfo volumes = 1;
 }
 
 message ListPodsRequest {}
@@ -244,6 +279,11 @@ message CreatePodRequest {
   // Restart policy: "no" (default), "on-failure", "always".
   string restart = 11;
   HealthCheck healthcheck = 12;
+  // Pod-level env "KEY=value", merged over the image's OCI env.
+  repeated string env = 13;
+  // Named volumes "name:/pod/path[:ro]" — auto-created on first use,
+  // survive pod destroy.
+  repeated string volumes = 14;
 }
 
 message ClonePodRequest {
@@ -305,6 +345,17 @@ message CmdList {
   repeated string argv = 1;
 }
 
+message EnvList {
+  // Full desired env set "KEY=value", replaces current. Empty = clear.
+  repeated string entries = 1;
+}
+
+message VolumeList {
+  // Full desired mount set "name:/pod/path[:ro]", replaces current.
+  // Empty = clear all volume mounts.
+  repeated string specs = 1;
+}
+
 // A hostname routed to one in-pod port. The host must be a lowercase DNS
 // name ending in .rustypods.localhost with at least one label in front.
 message IngressRule {
@@ -344,6 +395,11 @@ message UpdatePodConfigRequest {
   optional string restart = 11;
   // Absent = keep; present = replace the healthcheck (empty kind = off).
   optional HealthCheck healthcheck = 12;
+  // Absent = keep; present (even empty) = replace pod env. Next start.
+  optional EnvList env = 13;
+  // Absent = keep; present (even empty) = replace volume mounts.
+  // Takes effect on the next pod start.
+  optional VolumeList volumes = 14;
 }
 
 message StartPodRequest {

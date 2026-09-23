@@ -145,6 +145,8 @@ mod tests {
             autostart: false,
             restart: String::new(),
             healthcheck: Default::default(),
+            env: vec![],
+            volumes: vec![],
         }
     }
 

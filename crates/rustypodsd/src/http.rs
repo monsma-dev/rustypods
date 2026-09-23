@@ -73,6 +73,13 @@ struct CreatePodIn {
     /// Liveness probe spec (see rpc::HealthCheck).
     #[serde(default)]
     healthcheck: Option<HealthCheck>,
+    /// Pod-level env "KEY=value", merged over the image env at start.
+    #[serde(default)]
+    env: Vec<String>,
+    /// Named-volume mounts "name:/pod/path[:ro]"; auto-created on first
+    /// use, outlive the pod.
+    #[serde(default)]
+    volumes: Vec<String>,
 }
 
 /// `PATCH /v1/pods/:name` body — absent fields keep their current values.
@@ -99,6 +106,11 @@ struct UpdatePodIn {
     restart: Option<String>,
     /// Absent = keep; present replaces the probe (empty kind = off).
     healthcheck: Option<HealthCheck>,
+    /// Absent = keep; present (even []) replaces pod env. Next start.
+    env: Option<Vec<String>>,
+    /// Absent = keep; present (even []) replaces volume mounts.
+    /// Next start.
+    volumes: Option<Vec<String>>,
 }
 
 fn parse_ingress(specs: &[String]) -> Result<Vec<IngressRule>, ApiErr> {
@@ -160,6 +172,8 @@ async fn create_pod(
             ingress: parse_ingress(&b.ingress)?,
             restart: b.restart.unwrap_or_default(),
             healthcheck: b.healthcheck,
+            env: b.env,
+            volumes: b.volumes,
         }))
         .await
         .map_err(api_err)?
@@ -233,6 +247,8 @@ async fn update_pod(
                 .map(|rules| IngressList { rules }),
             restart: b.restart,
             healthcheck: b.healthcheck,
+            env: b.env.map(|entries| EnvList { entries }),
+            volumes: b.volumes.map(|specs| VolumeList { specs }),
         }))
         .await
         .map_err(api_err)?
@@ -274,6 +290,39 @@ async fn destroy_stack(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /v1/volumes` body.
+#[derive(Deserialize)]
+struct CreateVolumeIn {
+    name: String,
+}
+
+async fn create_volume(
+    State(s): State<Svc>,
+    Json(b): Json<CreateVolumeIn>,
+) -> Result<(StatusCode, Json<VolumeInfo>), ApiErr> {
+    s.create_volume(Request::new(VolumeRef { name: b.name }))
+        .await
+        .map(|r| (StatusCode::CREATED, Json(r.into_inner())))
+        .map_err(api_err)
+}
+
+async fn list_volumes(State(s): State<Svc>) -> Result<Json<VolumeInfoList>, ApiErr> {
+    s.list_volumes(Request::new(Empty {}))
+        .await
+        .map(|r| Json(r.into_inner()))
+        .map_err(api_err)
+}
+
+async fn remove_volume(
+    State(s): State<Svc>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiErr> {
+    s.remove_volume(Request::new(VolumeRef { name }))
+        .await
+        .map_err(api_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Bearer auth + browser-header rejection for /v1/*. Two gates:
 /// 1. Any `Origin` or `Sec-Fetch-Site` header → 403. Browsers attach those
 ///    to cross-origin requests; a local web page must never drive the API.
@@ -310,6 +359,8 @@ pub fn router(svc: Svc, token: Arc<str>) -> Router {
         .route("/v1/pods/{name}", patch(update_pod).delete(destroy_pod))
         .route("/v1/stacks", post(apply_stack))
         .route("/v1/stacks/{name}", delete(destroy_stack))
+        .route("/v1/volumes", get(list_volumes).post(create_volume))
+        .route("/v1/volumes/{name}", delete(remove_volume))
         .route_layer(axum::middleware::from_fn_with_state(
             token,
             require_token,

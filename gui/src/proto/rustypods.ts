@@ -204,6 +204,21 @@ export interface Pod {
    * itself). Managed pod — created only via InitIngress.
    */
   ingressGateway: boolean;
+  /**
+   * Supervisor view: "" (no probe/not started) | "starting" |
+   * "healthy" | "unhealthy" | "dead". Death-watch always runs for
+   * pods with a restart policy, even without a configured probe.
+   */
+  health: string;
+  /** Persisted restart policy: "no" | "on-failure" | "always". */
+  restart: string;
+  /** Named volumes bound into the pod at start (survive pod destroy). */
+  volumes: VolumeMount[];
+  /**
+   * Pod-level env "KEY=value", merged over the image's OCI env.
+   * Visible via /proc/<pid>/environ — treat as config, not a vault.
+   */
+  env: string[];
 }
 
 export interface PodList {
@@ -214,7 +229,62 @@ export interface PodRef {
   name: string;
 }
 
+/** A named volume mounted into a pod. */
+export interface VolumeMount {
+  /** volume name (also its dir under volumes/) */
+  name: string;
+  /** in-pod mount path */
+  target: string;
+  ro: boolean;
+}
+
+export interface VolumeRef {
+  name: string;
+}
+
+/**
+ * A named btrfs volume — survives pod destroy; cloneable via the
+ * storage driver for dev-database copies.
+ */
+export interface VolumeInfo {
+  name: string;
+  /** host path */
+  path: string;
+  createdUnix: number;
+  /** pods that mount it */
+  pods: string[];
+  sizeBytes: number;
+}
+
+export interface VolumeInfoList {
+  volumes: VolumeInfo[];
+}
+
 export interface ListPodsRequest {
+}
+
+/**
+ * Liveness probe + restart policy. A pod with no probe still gets
+ * death-watch restarts under a non-"no" restart policy — the supervisor
+ * treats leader-death as the ultimate failure.
+ */
+export interface HealthCheck {
+  /** "exec" | "tcp" | "http"; "" = disabled */
+  kind: string;
+  /**
+   * tcp: ":port" (resolved on the pod's own address) or "host:port".
+   * http: "/path" (on the pod's address :80) or a full "http://…" URL.
+   * exec: unused — argv carries the probe command.
+   */
+  target: string;
+  /** exec probe command */
+  argv: string[];
+  /** 0 = daemon default (10s) */
+  intervalSecs: number;
+  /** 0 = default (3s) */
+  timeoutSecs: number;
+  /** consecutive failures → unhealthy; 0 = 3 */
+  retries: number;
 }
 
 export interface CreatePodRequest {
@@ -242,6 +312,18 @@ export interface CreatePodRequest {
   cmd: string[];
   /** Ingress rules (see Pod.ingress); imply private networking. */
   ingress: IngressRule[];
+  /** Restart policy: "no" (default), "on-failure", "always". */
+  restart: string;
+  healthcheck?:
+    | HealthCheck
+    | undefined;
+  /** Pod-level env "KEY=value", merged over the image's OCI env. */
+  env: string[];
+  /**
+   * Named volumes "name:/pod/path[:ro]" — auto-created on first use,
+   * survive pod destroy.
+   */
+  volumes: string[];
 }
 
 export interface ClonePodRequest {
@@ -304,6 +386,19 @@ export interface CmdList {
   argv: string[];
 }
 
+export interface EnvList {
+  /** Full desired env set "KEY=value", replaces current. Empty = clear. */
+  entries: string[];
+}
+
+export interface VolumeList {
+  /**
+   * Full desired mount set "name:/pod/path[:ro]", replaces current.
+   * Empty = clear all volume mounts.
+   */
+  specs: string[];
+}
+
 /**
  * A hostname routed to one in-pod port. The host must be a lowercase DNS
  * name ending in .rustypods.localhost with at least one label in front.
@@ -362,7 +457,26 @@ export interface UpdatePodConfigRequest {
    * Absent = keep current ingress rules; present (even empty) = replace.
    * Ingress changes require a stopped pod.
    */
-  ingress?: IngressList | undefined;
+  ingress?:
+    | IngressList
+    | undefined;
+  /** Absent = keep; present = replace the restart policy. */
+  restart?:
+    | string
+    | undefined;
+  /** Absent = keep; present = replace the healthcheck (empty kind = off). */
+  healthcheck?:
+    | HealthCheck
+    | undefined;
+  /** Absent = keep; present (even empty) = replace pod env. Next start. */
+  env?:
+    | EnvList
+    | undefined;
+  /**
+   * Absent = keep; present (even empty) = replace volume mounts.
+   * Takes effect on the next pod start.
+   */
+  volumes?: VolumeList | undefined;
 }
 
 export interface StartPodRequest {
@@ -1914,6 +2028,10 @@ function createBasePod(): Pod {
     cmd: [],
     ingress: [],
     ingressGateway: false,
+    health: "",
+    restart: "",
+    volumes: [],
+    env: [],
   };
 }
 
@@ -1975,6 +2093,18 @@ export const Pod: MessageFns<Pod> = {
     }
     if (message.ingressGateway !== false) {
       writer.uint32(152).bool(message.ingressGateway);
+    }
+    if (message.health !== "") {
+      writer.uint32(162).string(message.health);
+    }
+    if (message.restart !== "") {
+      writer.uint32(170).string(message.restart);
+    }
+    for (const v of message.volumes) {
+      VolumeMount.encode(v!, writer.uint32(178).fork()).join();
+    }
+    for (const v of message.env) {
+      writer.uint32(186).string(v!);
     }
     return writer;
   },
@@ -2144,6 +2274,38 @@ export const Pod: MessageFns<Pod> = {
             message.ingressGateway = reader.bool();
             continue;
           }
+          case 20: {
+            if (tag !== 162) {
+              break;
+            }
+
+            message.health = reader.string();
+            continue;
+          }
+          case 21: {
+            if (tag !== 170) {
+              break;
+            }
+
+            message.restart = reader.string();
+            continue;
+          }
+          case 22: {
+            if (tag !== 178) {
+              break;
+            }
+
+            message.volumes.push(VolumeMount.decode(reader, reader.uint32()));
+            continue;
+          }
+          case 23: {
+            if (tag !== 186) {
+              break;
+            }
+
+            message.env.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2209,6 +2371,14 @@ export const Pod: MessageFns<Pod> = {
         : isSet(object.ingress_gateway)
         ? globalThis.Boolean(object.ingress_gateway)
         : false,
+      health: isSet(object.health) ? globalThis.String(object.health) : "",
+      restart: isSet(object.restart) ? globalThis.String(object.restart) : "",
+      volumes: globalThis.Array.isArray(object?.volumes)
+        ? object.volumes.map((e: any) => VolumeMount.fromJSON(e))
+        : [],
+      env: globalThis.Array.isArray(object?.env)
+        ? object.env.map((e: any) => globalThis.String(e))
+        : [],
     };
   },
 
@@ -2271,6 +2441,18 @@ export const Pod: MessageFns<Pod> = {
     if (message.ingressGateway !== false) {
       obj.ingressGateway = message.ingressGateway;
     }
+    if (message.health !== "") {
+      obj.health = message.health;
+    }
+    if (message.restart !== "") {
+      obj.restart = message.restart;
+    }
+    if (message.volumes?.length) {
+      obj.volumes = message.volumes.map((e) => VolumeMount.toJSON(e));
+    }
+    if (message.env?.length) {
+      obj.env = message.env;
+    }
     return obj;
   },
 
@@ -2300,6 +2482,10 @@ export const Pod: MessageFns<Pod> = {
     message.cmd = object.cmd?.map((e) => e) || [];
     message.ingress = object.ingress?.map((e) => IngressRule.fromPartial(e)) || [];
     message.ingressGateway = object.ingressGateway ?? false;
+    message.health = object.health ?? "";
+    message.restart = object.restart ?? "";
+    message.volumes = object.volumes?.map((e) => VolumeMount.fromPartial(e)) || [];
+    message.env = object.env?.map((e) => e) || [];
     return message;
   },
 };
@@ -2438,6 +2624,384 @@ export const PodRef: MessageFns<PodRef> = {
   },
 };
 
+function createBaseVolumeMount(): VolumeMount {
+  return { name: "", target: "", ro: false };
+}
+
+export const VolumeMount: MessageFns<VolumeMount> = {
+  encode(message: VolumeMount, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.target !== "") {
+      writer.uint32(18).string(message.target);
+    }
+    if (message.ro !== false) {
+      writer.uint32(24).bool(message.ro);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VolumeMount {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseVolumeMount();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.target = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.ro = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): VolumeMount {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      target: isSet(object.target) ? globalThis.String(object.target) : "",
+      ro: isSet(object.ro) ? globalThis.Boolean(object.ro) : false,
+    };
+  },
+
+  toJSON(message: VolumeMount): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.target !== "") {
+      obj.target = message.target;
+    }
+    if (message.ro !== false) {
+      obj.ro = message.ro;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<VolumeMount>, I>>(base?: I): VolumeMount {
+    return VolumeMount.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<VolumeMount>, I>>(object: I): VolumeMount {
+    const message = createBaseVolumeMount();
+    message.name = object.name ?? "";
+    message.target = object.target ?? "";
+    message.ro = object.ro ?? false;
+    return message;
+  },
+};
+
+function createBaseVolumeRef(): VolumeRef {
+  return { name: "" };
+}
+
+export const VolumeRef: MessageFns<VolumeRef> = {
+  encode(message: VolumeRef, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VolumeRef {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseVolumeRef();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): VolumeRef {
+    return { name: isSet(object.name) ? globalThis.String(object.name) : "" };
+  },
+
+  toJSON(message: VolumeRef): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<VolumeRef>, I>>(base?: I): VolumeRef {
+    return VolumeRef.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<VolumeRef>, I>>(object: I): VolumeRef {
+    const message = createBaseVolumeRef();
+    message.name = object.name ?? "";
+    return message;
+  },
+};
+
+function createBaseVolumeInfo(): VolumeInfo {
+  return { name: "", path: "", createdUnix: 0, pods: [], sizeBytes: 0 };
+}
+
+export const VolumeInfo: MessageFns<VolumeInfo> = {
+  encode(message: VolumeInfo, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.path !== "") {
+      writer.uint32(18).string(message.path);
+    }
+    if (message.createdUnix !== 0) {
+      writer.uint32(24).uint64(message.createdUnix);
+    }
+    for (const v of message.pods) {
+      writer.uint32(34).string(v!);
+    }
+    if (message.sizeBytes !== 0) {
+      writer.uint32(40).uint64(message.sizeBytes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VolumeInfo {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseVolumeInfo();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.path = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.createdUnix = longToNumber(reader.uint64());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.pods.push(reader.string());
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.sizeBytes = longToNumber(reader.uint64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): VolumeInfo {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+      createdUnix: isSet(object.createdUnix)
+        ? globalThis.Number(object.createdUnix)
+        : isSet(object.created_unix)
+        ? globalThis.Number(object.created_unix)
+        : 0,
+      pods: globalThis.Array.isArray(object?.pods) ? object.pods.map((e: any) => globalThis.String(e)) : [],
+      sizeBytes: isSet(object.sizeBytes)
+        ? globalThis.Number(object.sizeBytes)
+        : isSet(object.size_bytes)
+        ? globalThis.Number(object.size_bytes)
+        : 0,
+    };
+  },
+
+  toJSON(message: VolumeInfo): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    if (message.createdUnix !== 0) {
+      obj.createdUnix = Math.round(message.createdUnix);
+    }
+    if (message.pods?.length) {
+      obj.pods = message.pods;
+    }
+    if (message.sizeBytes !== 0) {
+      obj.sizeBytes = Math.round(message.sizeBytes);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<VolumeInfo>, I>>(base?: I): VolumeInfo {
+    return VolumeInfo.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<VolumeInfo>, I>>(object: I): VolumeInfo {
+    const message = createBaseVolumeInfo();
+    message.name = object.name ?? "";
+    message.path = object.path ?? "";
+    message.createdUnix = object.createdUnix ?? 0;
+    message.pods = object.pods?.map((e) => e) || [];
+    message.sizeBytes = object.sizeBytes ?? 0;
+    return message;
+  },
+};
+
+function createBaseVolumeInfoList(): VolumeInfoList {
+  return { volumes: [] };
+}
+
+export const VolumeInfoList: MessageFns<VolumeInfoList> = {
+  encode(message: VolumeInfoList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.volumes) {
+      VolumeInfo.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VolumeInfoList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseVolumeInfoList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.volumes.push(VolumeInfo.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): VolumeInfoList {
+    return {
+      volumes: globalThis.Array.isArray(object?.volumes) ? object.volumes.map((e: any) => VolumeInfo.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: VolumeInfoList): unknown {
+    const obj: any = {};
+    if (message.volumes?.length) {
+      obj.volumes = message.volumes.map((e) => VolumeInfo.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<VolumeInfoList>, I>>(base?: I): VolumeInfoList {
+    return VolumeInfoList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<VolumeInfoList>, I>>(object: I): VolumeInfoList {
+    const message = createBaseVolumeInfoList();
+    message.volumes = object.volumes?.map((e) => VolumeInfo.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBaseListPodsRequest(): ListPodsRequest {
   return {};
 }
@@ -2490,6 +3054,163 @@ export const ListPodsRequest: MessageFns<ListPodsRequest> = {
   },
 };
 
+function createBaseHealthCheck(): HealthCheck {
+  return { kind: "", target: "", argv: [], intervalSecs: 0, timeoutSecs: 0, retries: 0 };
+}
+
+export const HealthCheck: MessageFns<HealthCheck> = {
+  encode(message: HealthCheck, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.kind !== "") {
+      writer.uint32(10).string(message.kind);
+    }
+    if (message.target !== "") {
+      writer.uint32(18).string(message.target);
+    }
+    for (const v of message.argv) {
+      writer.uint32(26).string(v!);
+    }
+    if (message.intervalSecs !== 0) {
+      writer.uint32(32).uint32(message.intervalSecs);
+    }
+    if (message.timeoutSecs !== 0) {
+      writer.uint32(40).uint32(message.timeoutSecs);
+    }
+    if (message.retries !== 0) {
+      writer.uint32(48).uint32(message.retries);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): HealthCheck {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseHealthCheck();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.kind = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.target = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.argv.push(reader.string());
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.intervalSecs = reader.uint32();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.timeoutSecs = reader.uint32();
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.retries = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): HealthCheck {
+    return {
+      kind: isSet(object.kind) ? globalThis.String(object.kind) : "",
+      target: isSet(object.target) ? globalThis.String(object.target) : "",
+      argv: globalThis.Array.isArray(object?.argv) ? object.argv.map((e: any) => globalThis.String(e)) : [],
+      intervalSecs: isSet(object.intervalSecs)
+        ? globalThis.Number(object.intervalSecs)
+        : isSet(object.interval_secs)
+        ? globalThis.Number(object.interval_secs)
+        : 0,
+      timeoutSecs: isSet(object.timeoutSecs)
+        ? globalThis.Number(object.timeoutSecs)
+        : isSet(object.timeout_secs)
+        ? globalThis.Number(object.timeout_secs)
+        : 0,
+      retries: isSet(object.retries) ? globalThis.Number(object.retries) : 0,
+    };
+  },
+
+  toJSON(message: HealthCheck): unknown {
+    const obj: any = {};
+    if (message.kind !== "") {
+      obj.kind = message.kind;
+    }
+    if (message.target !== "") {
+      obj.target = message.target;
+    }
+    if (message.argv?.length) {
+      obj.argv = message.argv;
+    }
+    if (message.intervalSecs !== 0) {
+      obj.intervalSecs = Math.round(message.intervalSecs);
+    }
+    if (message.timeoutSecs !== 0) {
+      obj.timeoutSecs = Math.round(message.timeoutSecs);
+    }
+    if (message.retries !== 0) {
+      obj.retries = Math.round(message.retries);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<HealthCheck>, I>>(base?: I): HealthCheck {
+    return HealthCheck.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<HealthCheck>, I>>(object: I): HealthCheck {
+    const message = createBaseHealthCheck();
+    message.kind = object.kind ?? "";
+    message.target = object.target ?? "";
+    message.argv = object.argv?.map((e) => e) || [];
+    message.intervalSecs = object.intervalSecs ?? 0;
+    message.timeoutSecs = object.timeoutSecs ?? 0;
+    message.retries = object.retries ?? 0;
+    return message;
+  },
+};
+
 function createBaseCreatePodRequest(): CreatePodRequest {
   return {
     name: "",
@@ -2502,6 +3223,10 @@ function createBaseCreatePodRequest(): CreatePodRequest {
     autostart: false,
     cmd: [],
     ingress: [],
+    restart: "",
+    healthcheck: undefined,
+    env: [],
+    volumes: [],
   };
 }
 
@@ -2536,6 +3261,18 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     }
     for (const v of message.ingress) {
       IngressRule.encode(v!, writer.uint32(82).fork()).join();
+    }
+    if (message.restart !== "") {
+      writer.uint32(90).string(message.restart);
+    }
+    if (message.healthcheck !== undefined) {
+      HealthCheck.encode(message.healthcheck, writer.uint32(98).fork()).join();
+    }
+    for (const v of message.env) {
+      writer.uint32(106).string(v!);
+    }
+    for (const v of message.volumes) {
+      writer.uint32(114).string(v!);
     }
     return writer;
   },
@@ -2633,6 +3370,38 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
             message.ingress.push(IngressRule.decode(reader, reader.uint32()));
             continue;
           }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.restart = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.healthcheck = HealthCheck.decode(reader, reader.uint32());
+            continue;
+          }
+          case 13: {
+            if (tag !== 106) {
+              break;
+            }
+
+            message.env.push(reader.string());
+            continue;
+          }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.volumes.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2661,6 +3430,10 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : false,
       cmd: globalThis.Array.isArray(object?.cmd) ? object.cmd.map((e: any) => globalThis.String(e)) : [],
       ingress: globalThis.Array.isArray(object?.ingress) ? object.ingress.map((e: any) => IngressRule.fromJSON(e)) : [],
+      restart: isSet(object.restart) ? globalThis.String(object.restart) : "",
+      healthcheck: isSet(object.healthcheck) ? HealthCheck.fromJSON(object.healthcheck) : undefined,
+      env: globalThis.Array.isArray(object?.env) ? object.env.map((e: any) => globalThis.String(e)) : [],
+      volumes: globalThis.Array.isArray(object?.volumes) ? object.volumes.map((e: any) => globalThis.String(e)) : [],
     };
   },
 
@@ -2696,6 +3469,18 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     if (message.ingress?.length) {
       obj.ingress = message.ingress.map((e) => IngressRule.toJSON(e));
     }
+    if (message.restart !== "") {
+      obj.restart = message.restart;
+    }
+    if (message.healthcheck !== undefined) {
+      obj.healthcheck = HealthCheck.toJSON(message.healthcheck);
+    }
+    if (message.env?.length) {
+      obj.env = message.env;
+    }
+    if (message.volumes?.length) {
+      obj.volumes = message.volumes;
+    }
     return obj;
   },
 
@@ -2716,6 +3501,12 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     message.autostart = object.autostart ?? false;
     message.cmd = object.cmd?.map((e) => e) || [];
     message.ingress = object.ingress?.map((e) => IngressRule.fromPartial(e)) || [];
+    message.restart = object.restart ?? "";
+    message.healthcheck = (object.healthcheck !== undefined && object.healthcheck !== null)
+      ? HealthCheck.fromPartial(object.healthcheck)
+      : undefined;
+    message.env = object.env?.map((e) => e) || [];
+    message.volumes = object.volumes?.map((e) => e) || [];
     return message;
   },
 };
@@ -3621,6 +4412,142 @@ export const CmdList: MessageFns<CmdList> = {
   },
 };
 
+function createBaseEnvList(): EnvList {
+  return { entries: [] };
+}
+
+export const EnvList: MessageFns<EnvList> = {
+  encode(message: EnvList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.entries) {
+      writer.uint32(10).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): EnvList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseEnvList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.entries.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): EnvList {
+    return {
+      entries: globalThis.Array.isArray(object?.entries) ? object.entries.map((e: any) => globalThis.String(e)) : [],
+    };
+  },
+
+  toJSON(message: EnvList): unknown {
+    const obj: any = {};
+    if (message.entries?.length) {
+      obj.entries = message.entries;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<EnvList>, I>>(base?: I): EnvList {
+    return EnvList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<EnvList>, I>>(object: I): EnvList {
+    const message = createBaseEnvList();
+    message.entries = object.entries?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseVolumeList(): VolumeList {
+  return { specs: [] };
+}
+
+export const VolumeList: MessageFns<VolumeList> = {
+  encode(message: VolumeList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.specs) {
+      writer.uint32(10).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VolumeList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseVolumeList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.specs.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): VolumeList {
+    return { specs: globalThis.Array.isArray(object?.specs) ? object.specs.map((e: any) => globalThis.String(e)) : [] };
+  },
+
+  toJSON(message: VolumeList): unknown {
+    const obj: any = {};
+    if (message.specs?.length) {
+      obj.specs = message.specs;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<VolumeList>, I>>(base?: I): VolumeList {
+    return VolumeList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<VolumeList>, I>>(object: I): VolumeList {
+    const message = createBaseVolumeList();
+    message.specs = object.specs?.map((e) => e) || [];
+    return message;
+  },
+};
+
 function createBaseIngressRule(): IngressRule {
   return { host: "", podPort: 0 };
 }
@@ -3791,6 +4718,10 @@ function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
     autostart: undefined,
     cmd: undefined,
     ingress: undefined,
+    restart: undefined,
+    healthcheck: undefined,
+    env: undefined,
+    volumes: undefined,
   };
 }
 
@@ -3825,6 +4756,18 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     }
     if (message.ingress !== undefined) {
       IngressList.encode(message.ingress, writer.uint32(82).fork()).join();
+    }
+    if (message.restart !== undefined) {
+      writer.uint32(90).string(message.restart);
+    }
+    if (message.healthcheck !== undefined) {
+      HealthCheck.encode(message.healthcheck, writer.uint32(98).fork()).join();
+    }
+    if (message.env !== undefined) {
+      EnvList.encode(message.env, writer.uint32(106).fork()).join();
+    }
+    if (message.volumes !== undefined) {
+      VolumeList.encode(message.volumes, writer.uint32(114).fork()).join();
     }
     return writer;
   },
@@ -3922,6 +4865,38 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
             message.ingress = IngressList.decode(reader, reader.uint32());
             continue;
           }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.restart = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.healthcheck = HealthCheck.decode(reader, reader.uint32());
+            continue;
+          }
+          case 13: {
+            if (tag !== 106) {
+              break;
+            }
+
+            message.env = EnvList.decode(reader, reader.uint32());
+            continue;
+          }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.volumes = VolumeList.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3958,6 +4933,10 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
       autostart: isSet(object.autostart) ? globalThis.Boolean(object.autostart) : undefined,
       cmd: isSet(object.cmd) ? CmdList.fromJSON(object.cmd) : undefined,
       ingress: isSet(object.ingress) ? IngressList.fromJSON(object.ingress) : undefined,
+      restart: isSet(object.restart) ? globalThis.String(object.restart) : undefined,
+      healthcheck: isSet(object.healthcheck) ? HealthCheck.fromJSON(object.healthcheck) : undefined,
+      env: isSet(object.env) ? EnvList.fromJSON(object.env) : undefined,
+      volumes: isSet(object.volumes) ? VolumeList.fromJSON(object.volumes) : undefined,
     };
   },
 
@@ -3993,6 +4972,18 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     if (message.ingress !== undefined) {
       obj.ingress = IngressList.toJSON(message.ingress);
     }
+    if (message.restart !== undefined) {
+      obj.restart = message.restart;
+    }
+    if (message.healthcheck !== undefined) {
+      obj.healthcheck = HealthCheck.toJSON(message.healthcheck);
+    }
+    if (message.env !== undefined) {
+      obj.env = EnvList.toJSON(message.env);
+    }
+    if (message.volumes !== undefined) {
+      obj.volumes = VolumeList.toJSON(message.volumes);
+    }
     return obj;
   },
 
@@ -4018,6 +5009,14 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     message.cmd = (object.cmd !== undefined && object.cmd !== null) ? CmdList.fromPartial(object.cmd) : undefined;
     message.ingress = (object.ingress !== undefined && object.ingress !== null)
       ? IngressList.fromPartial(object.ingress)
+      : undefined;
+    message.restart = object.restart ?? undefined;
+    message.healthcheck = (object.healthcheck !== undefined && object.healthcheck !== null)
+      ? HealthCheck.fromPartial(object.healthcheck)
+      : undefined;
+    message.env = (object.env !== undefined && object.env !== null) ? EnvList.fromPartial(object.env) : undefined;
+    message.volumes = (object.volumes !== undefined && object.volumes !== null)
+      ? VolumeList.fromPartial(object.volumes)
       : undefined;
     return message;
   },
@@ -6006,6 +7005,31 @@ export const PodControlDefinition = {
     removeShm: {
       name: "RemoveShm",
       requestType: ShmRef as typeof ShmRef,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Named btrfs volumes — outlive pods, mount into pods via --volume. */
+    listVolumes: {
+      name: "ListVolumes",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: VolumeInfoList as typeof VolumeInfoList,
+      responseStream: false,
+      options: {},
+    },
+    createVolume: {
+      name: "CreateVolume",
+      requestType: VolumeRef as typeof VolumeRef,
+      requestStream: false,
+      responseType: VolumeInfo as typeof VolumeInfo,
+      responseStream: false,
+      options: {},
+    },
+    removeVolume: {
+      name: "RemoveVolume",
+      requestType: VolumeRef as typeof VolumeRef,
       requestStream: false,
       responseType: Empty as typeof Empty,
       responseStream: false,

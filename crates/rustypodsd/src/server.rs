@@ -22,7 +22,7 @@ use rustypods_proto::{self as proto};
 use crate::agent::{self, ListenerMap, MetricsMap};
 use crate::oci;
 use crate::runtime::{RuntimeEngine, StartSpec};
-use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State};
+use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State, VolumeMeta};
 use crate::storage::StorageDriver;
 use crate::{exec, ingress, net, pki, runtime, stack, storage, Config};
 
@@ -143,7 +143,24 @@ fn to_pod(m: &PodMeta, rootfs: &Path, leader: Option<u32>, health: &str) -> Pod 
         ingress_gateway: m.ingress_gateway,
         health: health.into(),
         restart: m.restart.clone(),
+        volumes: volumes_to_proto(&m.volumes),
+        env: m.env.clone(),
     }
+}
+
+/// Persisted "name:/path[:ro]" specs → proto mounts. Specs reaching here
+/// were validated at write/reload time; unparseable hand edits drop out
+/// rather than fail the whole pod view.
+fn volumes_to_proto(specs: &[String]) -> Vec<VolumeMount> {
+    specs
+        .iter()
+        .filter_map(|s| proto::parse_volume_spec(s).ok())
+        .map(|v| VolumeMount {
+            name: v.name,
+            target: v.target,
+            ro: v.ro,
+        })
+        .collect()
 }
 
 fn ingress_to_proto(specs: &[IngressSpec]) -> Vec<IngressRule> {
@@ -452,6 +469,91 @@ impl Svc {
     async fn st_delete(&self, path: &Path) -> Result<(), Status> {
         let (s, p) = (self.storage.clone(), path.to_path_buf());
         Self::blocking(move || s.delete_rootfs(&p)).await
+    }
+
+    /// Make a named volume exist on disk + in the registry. Idempotent;
+    /// called wherever a pod's volume specs resolve (create/update/start)
+    /// so even hand-edited confs auto-materialise their volumes. A dir
+    /// that exists without a conf entry (conf deleted by hand) is
+    /// adopted rather than rejected.
+    async fn ensure_volume(&self, name: &str) -> Result<VolumeMeta, Status> {
+        let name = proto::validate_name(name).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if let Some(v) = st.volumes.get(&name) {
+                return Ok(v.clone());
+            }
+        }
+        let dir = proto::volumes_dir(&self.cfg.data_dir).join(&name);
+        // Single statx — cheap enough for the executor; the create/delete
+        // below stay on the blocking pool.
+        let existed = match std::fs::symlink_metadata(&dir) {
+            Ok(md) => {
+                if !md.is_dir() {
+                    return Err(Status::failed_precondition(format!(
+                        "volume path {} exists but is not a directory",
+                        dir.display()
+                    )));
+                }
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(int(e)),
+        };
+        if !existed {
+            self.st_create(&dir).await?;
+        }
+        // Pod roots under --private-users map to an arbitrary host UID —
+        // a plain root-owned 0755 dir would be read-only inside the pod.
+        // Volumes are shared writable space: 0777 keeps every userns
+        // mapping (and non-userns pods) able to write, like /tmp.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
+                .map_err(int)?;
+        }
+        let v = VolumeMeta {
+            name,
+            created_unix: state::now_unix(),
+        };
+        state::save_volume(&self.cfg.data_dir, &v).map_err(int)?;
+        let mut st = self.st.lock().await;
+        st.volumes.insert(v.name.clone(), v.clone());
+        Ok(v)
+    }
+
+    /// Pod names whose conf references this volume (for `volume ls`/`rm`).
+    async fn volume_attachers(&self, name: &str) -> Vec<String> {
+        let st = self.st.lock().await;
+        st.pods
+            .values()
+            .filter(|m| {
+                m.volumes.iter().any(|s| {
+                    proto::parse_volume_spec(s)
+                        .map(|v| v.name == name)
+                        .unwrap_or(false)
+                })
+            })
+            .map(|m| m.name.clone())
+            .collect()
+    }
+
+    /// VolumeMeta → wire view: path, byte usage, attaching pods.
+    async fn volume_info(&self, v: &VolumeMeta) -> VolumeInfo {
+        let dir = proto::volumes_dir(&self.cfg.data_dir).join(&v.name);
+        let size_bytes = Self::blocking({
+            let d = dir.clone();
+            move || dir_size(&d)
+        })
+        .await
+        .unwrap_or(0);
+        VolumeInfo {
+            name: v.name.clone(),
+            path: dir.display().to_string(),
+            created_unix: v.created_unix,
+            size_bytes,
+            pods: self.volume_attachers(&v.name).await,
+        }
     }
 
     /// <data>/snapshots/<pod>/ — one subvolume per commit.
@@ -1161,6 +1263,10 @@ impl PodControl for Svc {
             .transpose()
             .map_err(bad)?
             .unwrap_or_default();
+        proto::validate_env(&req.env).map_err(bad)?;
+        for spec in &req.volumes {
+            proto::parse_volume_spec(spec).map_err(bad)?;
+        }
         if let Err(e) = self.st_clone(&img_dir, &dest).await {
             // A partial dest (fallback cp died mid-copy) would wedge the
             // name on "already exists" forever — clean it like pull/import.
@@ -1190,6 +1296,8 @@ impl PodControl for Svc {
             ingress_gateway: false,
             restart: req.restart.clone(),
             healthcheck: hc,
+            env: req.env.clone(),
+            volumes: req.volumes.clone(),
         };
         let mut st = self.st.lock().await;
         if let Err(e) = validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress)) {
@@ -1201,6 +1309,10 @@ impl PodControl for Svc {
         }
         st.pods.insert(name.clone(), meta.clone());
         drop(st);
+        for spec in &meta.volumes {
+            let v = proto::parse_volume_spec(spec).map_err(bad)?;
+            self.ensure_volume(&v.name).await.map_err(int)?;
+        }
         self.save_pod(&meta).map_err(int)?;
         Ok(Response::new(to_pod(&meta, &dest, None, "")))
     }
@@ -1680,6 +1792,8 @@ impl PodControl for Svc {
                         ingress_gateway: false,
                         restart: String::new(),
                         healthcheck: Default::default(),
+                        env: sp.env.clone(),
+                        volumes: sp.volumes.clone(),
                     };
                     let mut st = self.st.lock().await;
                     if st.pods.contains_key(&pname) {
@@ -1707,6 +1821,10 @@ impl PodControl for Svc {
                     m
                 }
             };
+            for spec in &meta.volumes {
+                let v = proto::parse_volume_spec(spec).map_err(bad)?;
+                self.ensure_volume(&v.name).await.map_err(int)?;
+            }
             self.save_pod(&meta).map_err(int)?;
             out.push(meta);
         }
@@ -1876,7 +1994,7 @@ impl PodControl for Svc {
         let rootfs = self.pod_rootfs(&name);
         // Resolve binds up front: nspawn's failure for a missing source is
         // cryptic, so check existence (and re-validate hand-edited confs).
-        let mut binds = Vec::with_capacity(meta.binds.len());
+        let mut binds = Vec::with_capacity(meta.binds.len() + meta.volumes.len());
         for spec in &meta.binds {
             let b = proto::validate_bind(spec).map_err(bad)?;
             if !Path::new(&b.host).exists() {
@@ -1886,6 +2004,21 @@ impl PodControl for Svc {
                 )));
             }
             binds.push(b);
+        }
+        // Named volumes: auto-create missing ones (hand-edited confs can
+        // reference volumes that don't exist yet), then bind-mount like
+        // any other host dir.
+        for spec in &meta.volumes {
+            let v = proto::parse_volume_spec(spec).map_err(bad)?;
+            self.ensure_volume(&v.name).await.map_err(int)?;
+            binds.push(proto::BindSpec {
+                host: proto::volumes_dir(&self.cfg.data_dir)
+                    .join(&v.name)
+                    .display()
+                    .to_string(),
+                pod: v.target,
+                ro: v.ro,
+            });
         }
         // Boot vs payload: OCI-pulled images record their entrypoint/cmd and
         // have no systemd → nspawn execs the payload directly (non-boot).
@@ -1913,6 +2046,14 @@ impl PodControl for Svc {
                 (None, Vec::new(), String::new())
             }
         };
+        // Pod env merges over the image env: same KEY wins. Boot pods
+        // get --setenv on PID 1 (image env is empty for them anyway).
+        let mut env = env;
+        for kv in &meta.env {
+            let key = kv.split('=').next().unwrap_or(kv);
+            env.retain(|e| e.split('=').next() != Some(key));
+            env.push(kv.clone());
+        }
         if let Some(p) = &mut payload {
             // OCI entrypoints are often bare names ("sh",
             // "docker-entrypoint.sh") — resolve inside the rootfs so the
@@ -2356,10 +2497,12 @@ impl PodControl for Svc {
                     || req.cmd.is_some()
                     || req.ingress.is_some()
                     || req.restart.is_some()
-                    || req.healthcheck.is_some())
+                    || req.healthcheck.is_some()
+                    || req.env.is_some()
+                    || req.volumes.is_some())
             {
                 return Err(Status::failed_precondition(
-                    "the ingress gateway is managed — cmd/ports/binds/ingress/restart are not configurable; re-run `rustypods ingress init`",
+                    "the ingress gateway is managed — cmd/ports/binds/ingress/restart/env/volumes are not configurable; re-run `rustypods ingress init`",
                 ));
             }
         }
@@ -2373,6 +2516,14 @@ impl PodControl for Svc {
             .map(health_from_proto)
             .transpose()
             .map_err(bad)?;
+        if let Some(el) = &req.env {
+            proto::validate_env(&el.entries).map_err(bad)?;
+        }
+        if let Some(vl) = &req.volumes {
+            for spec in &vl.specs {
+                proto::parse_volume_spec(spec).map_err(bad)?;
+            }
+        }
         if let Some(pm) = &req.ports {
             for spec in &pm.ports {
                 proto::validate_port(spec).map_err(bad)?;
@@ -2452,10 +2603,22 @@ impl PodControl for Svc {
             if let Some(h) = new_hc {
                 m.healthcheck = h;
             }
+            if let Some(el) = req.env {
+                m.env = el.entries;
+            }
+            if let Some(vl) = req.volumes {
+                m.volumes = vl.specs;
+            }
             let m = m.clone();
             self.save_pod(&m).map_err(int)?;
             m
         };
+        // Volume mounts reference named subvols — create missing ones so
+        // `volume ls` reflects the pod's config immediately.
+        for spec in &meta.volumes {
+            let v = proto::parse_volume_spec(spec).map_err(bad)?;
+            self.ensure_volume(&v.name).await.map_err(int)?;
+        }
         // Hot-apply while the pod runs — no restart needed.
         if self.engine.running_pid(&name).await.is_some() {
             self.engine.apply_limits(&name, &meta.limits).await.map_err(int)?;
@@ -2638,6 +2801,8 @@ impl PodControl for Svc {
             autostart: true,
             restart: "always".into(),
             healthcheck: Default::default(),
+            env: vec![],
+            volumes: vec![],
         };
         // Copy the dataplane binary + LEAF pair into the rootfs via
         // symlink-safe helpers. The CA key NEVER leaves the host.
@@ -3107,6 +3272,88 @@ impl PodControl for Svc {
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    async fn create_volume(&self, req: Request<VolumeRef>) -> Result<Response<VolumeInfo>, Status> {
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        {
+            let st = self.st.lock().await;
+            if st.volumes.contains_key(&name) {
+                return Err(Status::already_exists(format!(
+                    "volume {name} already exists"
+                )));
+            }
+        }
+        let v = self.ensure_volume(&name).await?;
+        Ok(Response::new(self.volume_info(&v).await))
+    }
+
+    async fn list_volumes(&self, _req: Request<Empty>) -> Result<Response<VolumeInfoList>, Status> {
+        // Reconcile the registry with the fs first: a volume dir created
+        // while the daemon was down (or whose conf vanished) still
+        // mounts — adopt it so `ls` is complete.
+        let vdir = proto::volumes_dir(&self.cfg.data_dir);
+        let orphans: Vec<String> = Self::blocking({
+            let vdir = vdir.clone();
+            move || {
+                let mut out = Vec::new();
+                let Ok(rd) = std::fs::read_dir(&vdir) else {
+                    return Ok(out);
+                };
+                for e in rd.flatten() {
+                    let Ok(md) = e.metadata() else { continue };
+                    if md.is_dir() {
+                        if let Some(n) = e.file_name().to_str() {
+                            out.push(n.to_string());
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        })
+        .await?;
+        for n in orphans {
+            self.ensure_volume(&n).await?;
+        }
+        let metas: Vec<VolumeMeta> = {
+            let st = self.st.lock().await;
+            st.volumes.values().cloned().collect()
+        };
+        let mut volumes = Vec::with_capacity(metas.len());
+        for v in &metas {
+            volumes.push(self.volume_info(v).await);
+        }
+        Ok(Response::new(VolumeInfoList { volumes }))
+    }
+
+    async fn remove_volume(&self, req: Request<VolumeRef>) -> Result<Response<Empty>, Status> {
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        let attachers = self.volume_attachers(&name).await;
+        if !attachers.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "volume {name} is still referenced by pod(s) {} — remove the mount first",
+                attachers.join(", ")
+            )));
+        }
+        let dir = proto::volumes_dir(&self.cfg.data_dir).join(&name);
+        let on_disk = dir.exists();
+        let registered = {
+            let st = self.st.lock().await;
+            st.volumes.contains_key(&name)
+        };
+        if !on_disk && !registered {
+            return Err(Status::not_found(format!("volume {name} not found")));
+        }
+        if on_disk {
+            self.st_delete(&dir).await?;
+        }
+        state::remove_volume(&self.cfg.data_dir, &name);
+        self.st.lock().await.volumes.remove(&name);
+        Ok(Response::new(Empty {}))
+    }
 }
 
 /// Per-line cap for stream_logs: BufReader::lines() buffers a whole line
@@ -3323,6 +3570,31 @@ fn resolve_in_rootfs(rootfs: &Path, prog: &str) -> Option<String> {
     None
 }
 
+/// Recursive byte size of a dir — plain metadata walk, works on btrfs
+/// and fallback alike (du would double-count reflinked extents anyway).
+fn dir_size(path: &std::path::Path) -> Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let rd = match std::fs::read_dir(&d) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            // DirEntry::metadata does NOT traverse symlinks (unlike
+            // Path::metadata) — a planted symlink is counted as itself,
+            // never followed outside the volume.
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// "Pre-upgrade v2!" → "pre-upgrade-v2" — snapshot labels become dir names.
 fn slugify(s: &str) -> String {
     let mut out = String::new();
@@ -3441,6 +3713,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         cfg.shm_dir(),
         state::pods_conf_dir(&cfg.data_dir),
         state::images_conf_dir(&cfg.data_dir),
+        proto::volumes_dir(&cfg.data_dir),
     ] {
         std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
     }
@@ -3768,6 +4041,8 @@ mod tests {
             ingress_gateway: false,
             restart: String::new(),
             healthcheck: Default::default(),
+            env: vec![],
+            volumes: vec![],
         }
     }
 
@@ -3838,6 +4113,7 @@ mod tests {
         let mut st = State {
             images: BTreeMap::new(),
             pods: BTreeMap::new(),
+            volumes: BTreeMap::new(),
         };
         st.pods.insert(
             "taken".into(),
@@ -3874,6 +4150,7 @@ mod tests {
         let mut st = State {
             images: BTreeMap::new(),
             pods: BTreeMap::new(),
+            volumes: BTreeMap::new(),
         };
         // Persisted: stack member web owns a.host, api owns b.host.
         st.pods.insert(

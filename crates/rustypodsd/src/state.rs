@@ -264,12 +264,30 @@ pub struct PodMeta {
     /// Liveness probe spec; kind "" = disabled.
     #[serde(default)]
     pub healthcheck: HealthSpec,
+    /// Pod-level env "KEY=value", merged over the image's OCI env at
+    /// start (pod wins per key). Visible via /proc/<pid>/environ.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Named-volume mounts "name:/pod/path[:ro]"; volumes are btrfs
+    /// subvols under volumes/ that outlive the pod.
+    #[serde(default)]
+    pub volumes: Vec<String>,
+}
+
+/// A named volume: a btrfs subvolume under volumes/<name> that pods
+/// bind-mount by name. Persisted as conf/volumes/<name>.conf so the
+/// registry survives daemon restarts even when the fs doesn't.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeMeta {
+    pub name: String,
+    pub created_unix: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct State {
     pub images: BTreeMap<String, ImageMeta>,
     pub pods: BTreeMap<String, PodMeta>,
+    pub volumes: BTreeMap<String, VolumeMeta>,
 }
 
 pub fn pods_conf_dir(data_dir: &Path) -> PathBuf {
@@ -307,6 +325,21 @@ fn write_conf(path: &Path, body: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn volumes_conf_dir(data_dir: &Path) -> std::path::PathBuf {
+    rustypods_proto::conf_dir(data_dir).join("volumes")
+}
+fn volume_conf(data_dir: &Path, name: &str) -> std::path::PathBuf {
+    volumes_conf_dir(data_dir).join(format!("{name}.conf"))
+}
+
+pub fn save_volume(data_dir: &Path, m: &VolumeMeta) -> Result<()> {
+    std::fs::create_dir_all(volumes_conf_dir(data_dir))?;
+    write_conf(&volume_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
+}
+pub fn remove_volume(data_dir: &Path, name: &str) {
+    let _ = std::fs::remove_file(volume_conf(data_dir, name));
 }
 
 pub fn save_pod(data_dir: &Path, m: &PodMeta) -> Result<()> {
@@ -378,6 +411,11 @@ fn check_pod_meta(m: &PodMeta, stem: &str, check_binds: bool) -> Result<()> {
     if !m.cmd.is_empty() {
         rustypods_proto::validate_argv(&m.cmd).context("invalid cmd")?;
     }
+    rustypods_proto::validate_env(&m.env).context("invalid env")?;
+    for spec in &m.volumes {
+        rustypods_proto::parse_volume_spec(spec)
+            .with_context(|| format!("invalid volume '{spec}'"))?;
+    }
     Ok(())
 }
 
@@ -425,6 +463,14 @@ fn scan<T: for<'de> Deserialize<'de>>(
     }
 }
 
+fn check_volume_meta(m: &VolumeMeta, stem: &str) -> Result<()> {
+    rustypods_proto::validate_name(&m.name)?;
+    if m.name != stem {
+        anyhow::bail!("conf name '{}' does not match filename '{}.conf'", m.name, stem);
+    }
+    Ok(())
+}
+
 fn check_image_meta(m: &ImageMeta, stem: &str) -> Result<()> {
     rustypods_proto::validate_name(&m.name)?;
     if m.name != stem {
@@ -447,6 +493,12 @@ pub fn load(data_dir: &Path) -> Result<State> {
         &mut st.images,
         |m: &ImageMeta| m.name.as_str(),
         check_image_meta,
+    );
+    scan(
+        &volumes_conf_dir(data_dir),
+        &mut st.volumes,
+        |m: &VolumeMeta| m.name.as_str(),
+        check_volume_meta,
     );
     // Ingress hostnames are globally unique — a hand-edited conf pair
     // claiming the same host would silently split traffic between pods,
@@ -595,6 +647,8 @@ fn migrate_json(data_dir: &Path) {
             ingress_gateway: false,
             restart: String::new(),
             healthcheck: Default::default(),
+            env: vec![],
+            volumes: vec![],
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");
@@ -613,6 +667,81 @@ pub fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn volume_meta_roundtrip_and_adoption() {
+        let dir = std::env::temp_dir().join(format!("rustypods-vol-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let v = VolumeMeta {
+            name: "pgdata".into(),
+            created_unix: 42,
+        };
+        save_volume(&dir, &v).unwrap();
+        let st = load(&dir).unwrap();
+        assert_eq!(st.volumes["pgdata"].created_unix, 42);
+        remove_volume(&dir, "pgdata");
+        let st = load(&dir).unwrap();
+        assert!(st.volumes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pod_env_volumes_roundtrip_and_legacy() {
+        let dir = std::env::temp_dir().join(format!("rustypods-env-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A minimal legacy conf (pre-Wave-E) must load with env/volumes
+        // defaulting to empty.
+        let pod = PodMeta {
+            name: "legacy".into(),
+            image: "img".into(),
+            created_unix: 0,
+            limits: Default::default(),
+            ephemeral: false,
+            storage_max_bytes: 0,
+            ports: vec![],
+            stack: String::new(),
+            net_index: 0,
+            binds: vec![],
+            private_users: false,
+            snap_keep_last: 0,
+            snap_max_age_secs: 0,
+            autostart: false,
+            cmd: vec![],
+            started: false,
+            ingress: vec![],
+            ingress_gateway: false,
+            restart: String::new(),
+            healthcheck: Default::default(),
+            env: vec!["A=1".into(), "B=two=parts".into()],
+            volumes: vec!["data:/data".into(), "cfg:/etc/app:ro".into()],
+        };
+        save_pod(&dir, &pod).unwrap();
+        let st = load(&dir).unwrap();
+        let m = &st.pods["legacy"];
+        assert_eq!(m.env, pod.env);
+        assert_eq!(m.volumes, pod.volumes);
+        // Bad env / bad volume specs in a hand-edited conf are rejected
+        // by the boot-time scan too.
+        let bad = PodMeta {
+            env: vec!["NOEQ".into()],
+            ..pod.clone()
+        };
+        save_pod(&dir, &bad).unwrap();
+        let st = load(&dir).unwrap();
+        assert!(st.pods.is_empty(), "invalid env must be skipped");
+        // A true pre-Wave-E conf — no env=/volumes= keys at all — loads
+        // with both defaulting empty (serde defaults).
+        save_pod(&dir, &pod).unwrap();
+        std::fs::write(
+            pod_conf(&dir, "old"),
+            "name = \"old\"\nimage = \"img\"\ncreated_unix = 1\n",
+        )
+        .unwrap();
+        let st = load(&dir).unwrap();
+        assert!(st.pods["old"].env.is_empty());
+        assert!(st.pods["old"].volumes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn meta(name: &str, host: &str) -> PodMeta {
@@ -640,6 +769,8 @@ mod tests {
             ingress_gateway: false,
             restart: String::new(),
             healthcheck: Default::default(),
+            env: vec![],
+            volumes: vec![],
         }
     }
 

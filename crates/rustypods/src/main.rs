@@ -112,6 +112,20 @@ enum Cmd {
         /// Consecutive probe failures before unhealthy (default 3).
         #[arg(long)]
         health_retries: Option<u32>,
+        /// Env var KEY=value; repeatable. Wins over --env-file entries on
+        /// duplicate keys. Visible via /proc/<pid>/environ — treat as
+        /// config, not a secret vault.
+        #[arg(long)]
+        env: Vec<String>,
+        /// Read KEY=value lines from a file (blank lines and # comments
+        /// ignored; no shell expansion).
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+        /// Named volume mount <name>:/pod/path[:ro]; repeatable. Volumes
+        /// are btrfs subvols that survive pod destroy; missing volumes
+        /// are auto-created on first use.
+        #[arg(long)]
+        volume: Vec<String>,
     },
     /// Start a pod (nspawn --boot, machined registration).
     Start {
@@ -244,6 +258,24 @@ enum Cmd {
         /// Remove the liveness probe.
         #[arg(long)]
         clear_health: bool,
+        /// Env var KEY=value; repeatable. Replaces the whole env set —
+        /// applied at the next start.
+        #[arg(long, conflicts_with_all = ["env_file", "clear_env"])]
+        env: Vec<String>,
+        /// Replace the env set with KEY=value lines from a file.
+        #[arg(long, conflicts_with = "clear_env")]
+        env_file: Option<PathBuf>,
+        /// Remove all pod env vars (applied at the next start).
+        #[arg(long)]
+        clear_env: bool,
+        /// Named volume mount <name>:/pod/path[:ro]; repeatable. Replaces
+        /// the whole mount set — applied at the next start.
+        #[arg(long, conflicts_with = "clear_volumes")]
+        volume: Vec<String>,
+        /// Remove all volume mounts (next start). The volumes themselves
+        /// are kept — `rustypods volume rm` deletes data.
+        #[arg(long)]
+        clear_volumes: bool,
     },
     /// Reread a hand-edited <pod>.conf and apply it.
     Reload { name: String },
@@ -299,6 +331,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: IngressCmd,
     },
+    /// Named data volumes: btrfs subvols that outlive pods and mount via
+    /// --volume <name>:/path.
+    Volume {
+        #[command(subcommand)]
+        sub: VolumeCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -323,6 +361,20 @@ enum IngressCmd {
     /// Show gateway state: configured/running, dataplane liveness,
     /// applied snapshot generation and route count, CA path.
     Status,
+}
+
+#[derive(Subcommand)]
+enum VolumeCmd {
+    /// Create a volume (volumes are also auto-created on first mount).
+    Create { name: String },
+    /// List volumes with usage and attaching pods.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Show one volume's details.
+    Inspect { name: String },
+    /// Delete a volume's data (refused while any pod still mounts it).
+    #[command(visible_alias = "remove")]
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -921,6 +973,14 @@ fn print_pod(p: &Pod) {
     if !p.restart.is_empty() && p.restart != "no" {
         extra.push_str(&format!(" restart={}", p.restart));
     }
+    if !p.volumes.is_empty() {
+        let vs: Vec<String> = p
+            .volumes
+            .iter()
+            .map(|v| format!("{}:{}{}", v.name, v.target, if v.ro { ":ro" } else { "" }))
+            .collect();
+        extra.push_str(&format!(" vols=[{}]", vs.join(",")));
+    }
     println!(
         "{:<20} {:<8} {:<8} pid={:<7} {}",
         p.name,
@@ -975,6 +1035,39 @@ fn healthcheck_proto(
     Ok(Some(hc))
 }
 
+/// Merge --env-file lines with --env entries into the pod env list:
+/// file first, then explicit flags win per key (the same rule the
+/// daemon applies merging pod env over image env). No shell expansion —
+/// `A=$HOME` stores the literal.
+fn collect_env(env_file: Option<&PathBuf>, env: Vec<String>) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(p) = env_file {
+        let text =
+            std::fs::read_to_string(p).with_context(|| format!("read env file {}", p.display()))?;
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            anyhow::ensure!(
+                line.contains('='),
+                "{}:{}: expected KEY=value, got {:?}",
+                p.display(),
+                i + 1,
+                line
+            );
+            out.push(line.to_string());
+        }
+    }
+    for kv in env {
+        let key = kv.split('=').next().unwrap_or(&kv);
+        out.retain(|e| e.split('=').next() != Some(key));
+        out.push(kv);
+    }
+    rustypods_proto::validate_env(&out)?;
+    Ok(out)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -998,6 +1091,54 @@ async fn main() -> Result<()> {
         }
         Cmd::Cp { src, dst, user } => {
             cp_cmd(cli.socket, cli.remote, src, dst, user).await?;
+        }
+        Cmd::Volume { sub } => {
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            match sub {
+                VolumeCmd::Create { name } => {
+                    let v = c.create_volume(VolumeRef { name }).await?.into_inner();
+                    println!("volume {} → {}", v.name, v.path);
+                }
+                VolumeCmd::Ls => {
+                    let l = c.list_volumes(Empty {}).await?.into_inner();
+                    for v in &l.volumes {
+                        println!(
+                            "{:<24} {:>9}  pods=[{}]  {}",
+                            v.name,
+                            fmt_bytes(v.size_bytes),
+                            v.pods.join(","),
+                            v.path
+                        );
+                    }
+                    if l.volumes.is_empty() {
+                        println!("no volumes — `rustypods volume create <name>` or mount one with --volume");
+                    }
+                }
+                VolumeCmd::Inspect { name } => {
+                    let l = c.list_volumes(Empty {}).await?.into_inner();
+                    let v = l
+                        .volumes
+                        .into_iter()
+                        .find(|v| v.name == name)
+                        .context(format!("volume {name} not found"))?;
+                    println!("name:    {}", v.name);
+                    println!("path:    {}", v.path);
+                    println!("size:    {}", fmt_bytes(v.size_bytes));
+                    println!("created: {}", v.created_unix);
+                    println!(
+                        "pods:    {}",
+                        if v.pods.is_empty() {
+                            "-".into()
+                        } else {
+                            v.pods.join(", ")
+                        }
+                    );
+                }
+                VolumeCmd::Rm { name } => {
+                    c.remove_volume(VolumeRef { name: name.clone() }).await?;
+                    println!("volume {name} removed");
+                }
+            }
         }
         Cmd::Ingress { sub } => match sub {
             IngressCmd::Init { image, install_ca } => {
@@ -1123,7 +1264,7 @@ async fn main() -> Result<()> {
             connect(cli.socket.clone(), cli.remote.clone()).await?.remove_image(ImageRef { name: name.clone() }).await?;
             println!("image {name} removed");
         }
-        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, ingress, cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries } => {
+        Cmd::Create { name, image, storage_max, port, desktop, bind, autostart, ingress, cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries, env, env_file, volume } => {
             let storage_max_bytes = storage_max.as_deref().map(parse_bytes).transpose()?.unwrap_or(0);
             if !port.is_empty() || !ingress.is_empty() {
                 eprintln!("note: --port/--ingress imply a private netns (--network-veth); the pod no longer shares host networking");
@@ -1140,9 +1281,13 @@ async fn main() -> Result<()> {
                 health_timeout.as_ref(),
                 health_retries,
             )?;
+            let env = collect_env(env_file.as_ref(), env)?;
+            for spec in &volume {
+                rustypods_proto::parse_volume_spec(spec)?;
+            }
             let p = connect(cli.socket.clone(), cli.remote.clone())
                 .await?
-                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, ingress: ingress_rules, desktop, binds: bind, limits: None, autostart, cmd, restart: restart.unwrap_or_default(), healthcheck })
+                .create_pod(CreatePodRequest { name, image, storage_max_bytes, ports: port, ingress: ingress_rules, desktop, binds: bind, limits: None, autostart, cmd, restart: restart.unwrap_or_default(), healthcheck, env, volumes: volume })
                 .await?
                 .into_inner();
             print_pod(&p);
@@ -1309,7 +1454,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, ingress, clear_ingress, cmd, clear_cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries, clear_health } => {
+        Cmd::Config { name, memory_high, memory_max, cpu, storage_max, bind, clear_binds, snap_keep, snap_max_age, autostart, ingress, clear_ingress, cmd, clear_cmd, restart, health_cmd, health_tcp, health_http, health_interval, health_timeout, health_retries, clear_health, env, env_file, clear_env, volume, clear_volumes } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let cur = c
@@ -1377,6 +1522,25 @@ async fn main() -> Result<()> {
                     health_retries,
                 )?
             };
+            let env = if clear_env {
+                Some(EnvList { entries: vec![] })
+            } else if env_file.is_some() || !env.is_empty() {
+                Some(EnvList {
+                    entries: collect_env(env_file.as_ref(), env)?,
+                })
+            } else {
+                None
+            };
+            let volumes = if clear_volumes {
+                Some(VolumeList { specs: vec![] })
+            } else if !volume.is_empty() {
+                for spec in &volume {
+                    rustypods_proto::parse_volume_spec(spec)?;
+                }
+                Some(VolumeList { specs: volume })
+            } else {
+                None
+            };
             let p = c
                 .update_pod_config(UpdatePodConfigRequest {
                     name,
@@ -1394,6 +1558,8 @@ async fn main() -> Result<()> {
                     autostart,
                     restart,
                     healthcheck,
+                    env,
+                    volumes,
                 })
                 .await?
                 .into_inner();
@@ -1560,6 +1726,32 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_env_merges_file_and_flags() {
+        let dir = std::env::temp_dir();
+        let f = dir.join(format!("rustypods-env-test-{}.env", std::process::id()));
+        std::fs::write(
+            &f,
+            "# comment\n\nA=1\nB=two=parts\n  TRIM= spaced \n",
+        )
+        .unwrap();
+        // --env overrides a same-key file entry; new keys append.
+        let env = collect_env(
+            Some(&f),
+            vec!["A=flag".into(), "C=3".into()],
+        )
+        .unwrap();
+        assert_eq!(env, vec!["B=two=parts", "TRIM= spaced", "A=flag", "C=3"]);
+        // Malformed file line → error naming file:line.
+        std::fs::write(&f, "NOEQ\n").unwrap();
+        let e = collect_env(Some(&f), vec![]).unwrap_err();
+        assert!(e.to_string().contains(":1"));
+        // Invalid KEY rejected by the validator.
+        std::fs::write(&f, "1BAD=x\n").unwrap();
+        assert!(collect_env(Some(&f), vec![]).is_err());
+        let _ = std::fs::remove_file(&f);
+    }
 
     // --cmd takes hyphen-leading argv (regression: `--cmd sh -c '...'` used
     // to be rejected, breaking payload scripts like busybox httpd setups).

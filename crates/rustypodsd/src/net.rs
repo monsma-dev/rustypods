@@ -693,6 +693,8 @@ mod tests {
             ingress_gateway: true,
             restart: String::new(),
             healthcheck: Default::default(),
+            env: vec![],
+            volumes: vec![],
         }
     }
 
