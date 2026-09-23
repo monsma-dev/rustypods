@@ -137,6 +137,24 @@ rustypodsd does it itself:
   in init_user_ns) → stack members run with `private_users: false`;
   standalone `create` pods get userns by default.
 - Privileged pod ports (<1024) need `--user root` inside the pod.
+- Hard-won: nspawn's host veth name for a >12-char machine name is NOT a
+  plain truncation — systemd v257 rewrites it with a hash suffix
+  (`ve-rustypod0iFF`). Resolve the host veth by peer ifindex
+  (`host0@ifN` in the pod netns ↔ `ifindex` on the host), never by name.
+  And `nsenter --net` does NOT enter the mount ns — `/sys/class/net`
+  still shows the HOST's interfaces; use `ip link` (netlink) for
+  pod-netns reads.
+- Hard-won: foreign firewalls (ufw, libvirt's iptables-compat, firewalld)
+  install FORWARD base chains with drop policy — pod↔pod and pod egress
+  die there, and a RustyPods-owned accept chain can't override a foreign
+  drop (each base chain gets its own verdict). `ensure_forward_accepts`
+  inserts marker-commented accepts at the TOP of the foreign chain —
+  same pattern as Docker's DOCKER-USER. Idempotent, absent tables skipped.
+- Hard-won: `::1`→pod dnat can NEVER work — the kernel hard-drops
+  loopback tuples on non-loopback devices (tcp_v6_rcv; no v6
+  `route_localnet` exists — same wall Docker hits). Leaving `::1:80/443`
+  unmapped gives instant RST and happy-eyeballs falls back to
+  127.0.0.1. Don't re-add an ip6 output dnat for ::1.
 
 ## Storage quotas (btrfs qgroups)
 

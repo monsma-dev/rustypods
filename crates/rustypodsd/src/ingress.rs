@@ -49,6 +49,9 @@ pub fn build_snapshot(
             });
         }
     }
+    // Deterministic order — pod-map iteration is unordered, and the
+    // daemon dedups pushes by comparing route sets for equality.
+    routes.sort_by(|a, b| a.host.cmp(&b.host));
     Ok(RouteSnapshot {
         generation,
         routes,

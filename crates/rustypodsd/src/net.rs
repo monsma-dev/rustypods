@@ -111,6 +111,19 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
     }
 }
 
+/// Blocking subprocess returning stdout — same contract as `run`.
+fn run_out(cmd: &str, args: &[&str]) -> Result<String> {
+    let out = Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {cmd}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        bail!("{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim())
+    }
+}
+
 /// `run` on the blocking pool — for the one async caller
 /// (configure_veth) that can't itself be wrapped in spawn_blocking
 /// because it interleaves `ip` calls with async sleeps.
@@ -141,6 +154,69 @@ async fn nsenter_net(leader: u32, args: &[&str]) -> Result<()> {
     })
     .await
     .context("blocking task")?
+}
+
+/// `nsenter_net` variant that returns stdout (e.g. sysfs reads).
+async fn nsenter_net_out(leader: u32, args: &[&str]) -> Result<String> {
+    let mut argv: Vec<String> = vec![
+        "--target".into(),
+        leader.to_string(),
+        "--net".into(),
+        "--".into(),
+    ];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_out("nsenter", &refs)
+    })
+    .await
+    .context("blocking task")?
+}
+
+/// The host interface whose ifindex is `idx` — the peer index is unique
+/// in the host's ifindex space, so this can never match the wrong veth.
+fn host_iface_by_ifindex(idx: u32) -> Option<String> {
+    for e in std::fs::read_dir("/sys/class/net").ok()?.flatten() {
+        let Ok(s) = std::fs::read_to_string(e.path().join("ifindex")) else {
+            continue;
+        };
+        if s.trim().parse::<u32>().ok() == Some(idx) {
+            return Some(e.file_name().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Wait for nspawn to create the pod's veth pair and return the HOST
+/// interface's real name. Resolved by peer ifindex — never by name:
+/// nspawn's host ifname for a long machine name is not a plain
+/// truncation (systemd's naming scheme rewrites it with a hash suffix,
+/// e.g. 've-rustypod0iFF'), so guessing `ve-<name>` breaks on pod names
+/// longer than ~12 chars.
+///
+/// `host0@ifN` inside the pod netns carries the host end's ifindex —
+/// unique in the host's ifindex space. Read via `ip` (netlink → the
+/// pod's CURRENT netns), not /sys: `nsenter --net` does not enter the
+/// mount ns, so /sys/class/net keeps showing the HOST's interfaces.
+async fn wait_host_veth(leader: u32) -> Result<String> {
+    for _ in 0..150 {
+        let out = nsenter_net_out(leader, &["ip", "-o", "link", "show"]).await;
+        // Any interface with an '@if' peer suffix is the veth end — don't
+        // assume the container side is literally called host0 either.
+        let peer = out.ok().and_then(|s| {
+            s.lines().find_map(|l| {
+                l.split("@if").nth(1)?.split(':').next()?.parse::<u32>().ok()
+            })
+        });
+        if let Some(idx) = peer {
+            if let Some(name) = host_iface_by_ifindex(idx) {
+                return Ok(name);
+            }
+        }
+        // No veth end yet (still moving into the netns).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("veth peer of pod leader {leader} never appeared (host0@ifN unresolved)");
 }
 
 // --- stacks: one shared netns per stack (the K8s pod model) -----------------
@@ -244,21 +320,11 @@ pub fn teardown_stack_net(stack: &str) {
 /// same state networkd would reach — every step is idempotent.
 /// `leader` is the pod init pid; 0 means "registered but no pid yet" and
 /// is refused — start must not report success before the link is usable.
-pub async fn configure_veth(pod: &str, idx: u32, leader: u32) -> Result<()> {
+pub async fn configure_veth(_pod: &str, idx: u32, leader: u32) -> Result<()> {
     if leader == 0 {
         bail!("pod has no usable leader pid yet — cannot enter its netns");
     }
-    let veth = veth_name(pod);
-    let sys = format!("/sys/class/net/{veth}");
-    for _ in 0..150 {
-        if Path::new(&sys).exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !Path::new(&sys).exists() {
-        bail!("veth {veth} never appeared");
-    }
+    let veth = wait_host_veth(leader).await?;
     run_async("ip", &["link", "set", &veth, "up"]).await?;
     run_async(
         "ip",
@@ -407,20 +473,21 @@ pub fn nat_script<'a>(
             ));
         }
     }
-    // Loopback-only ingress redirects — OUTPUT hook, 127/8 + ::1
-    // destinations, so a packet that arrived on any interface can never
-    // match (no prerouting chain carries these at all).
-    let (mut gw_v4, mut gw_v6_out) = (String::new(), String::new());
+    // Loopback-only ingress redirects — OUTPUT hook, 127/8 destinations,
+    // so a packet that arrived on any interface can never match (no
+    // prerouting chain carries these at all).
+    //
+    // IPv6 is deliberately NOT redirected: ::1→pod dnat produces replies
+    // whose un-nat'd ::1 tuple arrives on a veth — the kernel hard-drops
+    // loopback tuples on non-loopback devices (tcp_v6_rcv; no
+    // route_localnet equivalent exists for v6). Leaving ::1 alone gives
+    // an instant RST and happy-eyeballs clients fall back to 127.0.0.1.
+    let mut gw_v4 = String::new();
     if let Some(idx) = gw {
         let v4 = pod_ip(idx);
-        let v6 = pod_ip6(idx);
         gw_v4.push_str(&format!(
             "    ip daddr 127.0.0.0/8 tcp dport 80 dnat ip to {v4}:8080\n\
              \x20   ip daddr 127.0.0.0/8 tcp dport 443 dnat ip to {v4}:8443\n"
-        ));
-        gw_v6_out.push_str(&format!(
-            "    ip6 daddr ::1 tcp dport 80 dnat ip6 to [{v6}]:8080\n\
-             \x20   ip6 daddr ::1 tcp dport 443 dnat ip6 to [{v6}]:8443\n"
         ));
     }
     let rules = format!(
@@ -444,14 +511,8 @@ pub fn nat_script<'a>(
          \x20 }}\n\
          }}\n\
          table ip6 rustypods6 {{\n\
-         \x20 chain output {{\n\
-         \x20   type nat hook output priority -100; policy accept;\n\
-         {gw_v6_out}\
-         \x20 }}\n\
          \x20 chain postrouting {{\n\
          \x20   type nat hook postrouting priority srcnat; policy accept;\n\
-         \x20   # ::1-originated traffic dnat'd to a pod ULA needs SNAT\n\
-         \x20   ip6 saddr ::1 ip6 daddr fd22:220::/32 masquerade\n\
          \x20   # ULA pod egress onto the real network\n\
          \x20   ip6 saddr fd22:220::/32 oifname != \"ve-*\" masquerade\n\
          \x20 }}\n\
@@ -485,7 +546,68 @@ pub fn rebuild_nat<'a>(
     if !st.success() {
         bail!("nft -f exited {st}");
     }
+    ensure_forward_accepts();
     Ok(())
+}
+
+/// Foreign firewalls (ufw, libvirt's iptables compat, firewalld) install
+/// FORWARD base chains with a drop/reject policy — every pod↔pod and
+/// pod↔wan packet dies there, and a RustyPods-owned accept chain cannot
+/// override a foreign drop (each base chain at a hook gets its own
+/// verdict). The only fix is accepts INSIDE the foreign chain, ahead of
+/// its drop path — the same thing Docker does with DOCKER-USER.
+///
+/// Idempotent via a comment marker; absent tables/chains are skipped;
+/// failures only warn (a strict host firewall shouldn't sink a start —
+/// doctor reports the gap instead).
+pub fn ensure_forward_accepts() {
+    const MARK: &str = "rustypods-forward";
+    const V4: [&str; 2] = [
+        "ip saddr 10.220.0.0/16 accept",
+        "ip daddr 10.220.0.0/16 accept",
+    ];
+    const V6: [&str; 2] = [
+        "ip6 saddr fd22:220::/32 accept",
+        "ip6 daddr fd22:220::/32 accept",
+    ];
+    const BOTH: [&str; 4] = [
+        "ip saddr 10.220.0.0/16 accept",
+        "ip daddr 10.220.0.0/16 accept",
+        "ip6 saddr fd22:220::/32 accept",
+        "ip6 daddr fd22:220::/32 accept",
+    ];
+    // (family, table, chain, rules to insert) — cover ufw's iptables-compat
+    // tables, a plain inet filter table, and firewalld's forward hook.
+    for (fam, table, chain, rules) in [
+        ("ip", "filter", "FORWARD", V4.as_slice()),
+        ("ip6", "filter", "FORWARD", V6.as_slice()),
+        ("inet", "filter", "FORWARD", BOTH.as_slice()),
+        ("inet", "firewalld", "filter_FORWARD", BOTH.as_slice()),
+    ] {
+        let out = Command::new("nft")
+            .args(["list", "chain", fam, table, chain])
+            .output();
+        let Ok(out) = out else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let txt = String::from_utf8_lossy(&out.stdout);
+        let strict = txt.contains("policy drop") || txt.contains("policy reject");
+        if !strict || txt.contains(MARK) {
+            continue;
+        }
+        for r in rules {
+            let mut argv: Vec<&str> = vec!["insert", "rule", fam, table, chain];
+            argv.extend(r.split_whitespace());
+            argv.extend(["comment", MARK]);
+            match Command::new("nft").args(&argv).status() {
+                Ok(s) if s.success() => {}
+                Ok(s) => tracing::warn!("nft insert into {fam} {table} {chain}: exit {s}"),
+                Err(e) => tracing::warn!("nft insert into {fam} {table} {chain}: {e}"),
+            }
+        }
+        tracing::info!("installed pod-traffic accepts in {fam} {table} {chain} (drop/reject policy)");
+    }
 }
 
 /// TCP 80+443 on BOTH loopback stacks must be free before the gateway
@@ -548,7 +670,10 @@ mod tests {
         let s = nat_script([&gw].into_iter(), &running(&["rustypods-ingress"]));
         assert!(s.contains("ip daddr 127.0.0.0/8 tcp dport 80 dnat ip to 10.220.7.2:8080"));
         assert!(s.contains("ip daddr 127.0.0.0/8 tcp dport 443 dnat ip to 10.220.7.2:8443"));
-        assert!(s.contains("ip6 daddr ::1 tcp dport 80 dnat ip6 to [fd22:220:7::2]:8080"));
+        // No ::1 redirect: the kernel drops loopback tuples arriving on
+        // non-loopback devices, so v6 dnat could never complete a
+        // handshake — ::1 must RST and let clients fall back to 127.0.0.1.
+        assert!(!s.contains("ip6 daddr ::1"));
         // The gateway rules sit ONLY in the output chain: the prerouting
         // block must not contain dport 80/443 redirects at all.
         let prerouting = &s[s.find("chain prerouting").unwrap()..s.find("chain output").unwrap()];

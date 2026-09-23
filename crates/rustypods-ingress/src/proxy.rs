@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -78,11 +78,21 @@ async fn health() -> &'static str {
 /// `Host` → canonical route key: UTF-8, valid authority (strips any
 /// :port), lowercase, and matching the ingress grammar — a name the
 /// daemon could never have pushed is malformed, not "unknown".
-fn canonical_host(headers: &HeaderMap) -> Result<String, Response> {
-    let v = headers
+///
+/// HTTP/2 carries the authority in `:authority`, not a Host header —
+/// hyper exposes it via `uri().authority()`, so check the header first
+/// (h1 semantics) then the URI (h2 / absolute-form), same precedence as
+/// axum's `Host` extractor.
+fn canonical_host(req: &Request) -> Result<String, Response> {
+    let raw = req
+        .headers()
         .get(header::HOST)
-        .ok_or_else(|| bad_request("missing Host"))?;
-    let s = v.to_str().map_err(|_| bad_request("malformed Host"))?;
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()));
+    let Some(s) = raw else {
+        return Err(bad_request("missing Host"));
+    };
     let authority: http::uri::Authority =
         s.parse().map_err(|_| bad_request("malformed Host"))?;
     let host = authority.host().to_ascii_lowercase();
@@ -171,7 +181,7 @@ fn is_websocket_upgrade(h: &HeaderMap) -> bool {
 }
 
 async fn http_redirect(req: Request) -> Response {
-    let host = match canonical_host(req.headers()) {
+    let host = match canonical_host(&req) {
         Ok(h) => h,
         Err(e) => return e,
     };
@@ -195,7 +205,7 @@ async fn proxy_request(st: &ProxyState, mut req: Request) -> Response {
     if req.method() == Method::CONNECT {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    let host = match canonical_host(req.headers()) {
+    let host = match canonical_host(&req) {
         Ok(h) => h,
         Err(e) => return e,
     };
@@ -219,6 +229,9 @@ async fn proxy_request(st: &ProxyState, mut req: Request) -> Response {
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     *req.uri_mut() = target;
+    // Upstream is always HTTP/1.1 — the pooled client is h1-only and an
+    // h2 (TLS/ALPN) downstream version would be rejected outright.
+    *req.version_mut() = Version::HTTP_11;
     if let Ok(v) = HeaderValue::from_str(&host) {
         req.headers_mut().insert(header::HOST, v);
     }
@@ -282,21 +295,42 @@ mod tests {
         h
     }
 
+    fn req_with_host(host: Option<&str>) -> Request {
+        let mut b = Request::builder().uri("/");
+        if let Some(h) = host {
+            b = b.header("host", h);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
     #[test]
     fn host_normalization() {
         // Missing → malformed/missing error (400 path).
-        assert!(canonical_host(&HeaderMap::new()).is_err());
+        assert!(canonical_host(&req_with_host(None)).is_err());
         // Not an ingress name → malformed.
-        assert!(canonical_host(&headers(&[("host", "www.example.com")])).is_err());
+        assert!(canonical_host(&req_with_host(Some("www.example.com"))).is_err());
         // Garbage that isn't an authority.
-        assert!(canonical_host(&headers(&[("host", "no spaces allowed")])).is_err());
+        assert!(canonical_host(&req_with_host(Some("no spaces allowed"))).is_err());
         // Port stripped, case folded.
         assert_eq!(
-            canonical_host(&headers(&[("host", "Web.Rustypods.Localhost:8443")])).unwrap(),
+            canonical_host(&req_with_host(Some("Web.Rustypods.Localhost:8443"))).unwrap(),
             "web.rustypods.localhost"
         );
         // Nested names are malformed — one label only (wildcard SAN).
-        assert!(canonical_host(&headers(&[("host", "api.dev.rustypods.localhost")])).is_err());
+        assert!(canonical_host(&req_with_host(Some("api.dev.rustypods.localhost"))).is_err());
+    }
+
+    #[test]
+    fn host_via_uri_authority() {
+        // h2/absolute-form: no Host header, authority on the URI.
+        let req = Request::builder()
+            .uri("https://Demo.Rustypods.Localhost:8443/x")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            canonical_host(&req).unwrap(),
+            "demo.rustypods.localhost"
+        );
     }
 
     #[tokio::test]

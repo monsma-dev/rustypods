@@ -55,6 +55,12 @@ pub struct Svc {
     /// Last periodic-reconcile error string — identical failures are logged
     /// once, recovery once, instead of every 2s tick.
     ingress_last_err: Arc<Mutex<Option<String>>>,
+    /// Last successfully-pushed (generation, routes): lets steady-state
+    /// syncs verify the gateway still holds our table via a cheap
+    /// GetStatus instead of committing an identical snapshot every 2s
+    /// (each commit logs on the dataplane). `None` after daemon restart
+    /// always forces a push — clearing whatever the gateway kept.
+    ingress_last_push: Arc<Mutex<Option<(u64, Vec<ActiveIngressRoute>)>>>,
 }
 
 /// Hard cap on a single SHM segment — the file lives on /dev/shm (tmpfs),
@@ -514,7 +520,27 @@ impl Svc {
                 Status::unavailable(msg)
             });
         }
-        ingress::push_snapshot(&self.cfg.data_dir, snap)
+        // Steady state: if the gateway verifiably still holds the exact
+        // table we last pushed, skip the commit entirely — otherwise a
+        // 2s reconciler tick burns a UDS round-trip + dataplane commit +
+        // log line forever. A restarted gateway reports a different
+        // generation and gets the full push.
+        let last_gen = {
+            let last = self.ingress_last_push.lock().await;
+            match &*last {
+                Some((g, pushed)) if *pushed == snap.routes => Some(*g),
+                _ => None,
+            }
+        };
+        if let Some(g) = last_gen {
+            if matches!(
+                ingress::gateway_status(&self.cfg.data_dir).await,
+                Ok(s) if s.generation == g
+            ) {
+                return Ok(());
+            }
+        }
+        ingress::push_snapshot(&self.cfg.data_dir, snap.clone())
             .await
             .map_err(|e| {
                 if required {
@@ -523,6 +549,7 @@ impl Svc {
                     Status::unavailable(format!("{e:#}"))
                 }
             })?;
+        *self.ingress_last_push.lock().await = Some((generation, snap.routes));
         Ok(())
     }
 
@@ -1733,7 +1760,7 @@ impl PodControl for Svc {
             // lingers while the gateway is down. Best-effort: the stop
             // itself must still proceed.
             let gen = self.ingress_generation.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Err(e) = ingress::push_snapshot(
+            match ingress::push_snapshot(
                 &self.cfg.data_dir,
                 RouteSnapshot {
                     generation: gen,
@@ -1742,7 +1769,12 @@ impl PodControl for Svc {
             )
             .await
             {
-                tracing::warn!("empty ingress snapshot before gateway stop: {e:#}");
+                Ok(_) => {
+                    *self.ingress_last_push.lock().await = Some((gen, vec![]));
+                }
+                Err(e) => {
+                    tracing::warn!("empty ingress snapshot before gateway stop: {e:#}");
+                }
             }
         } else if has_ingress {
             // Drain this pod's routes BEFORE it stops so clients never hit
@@ -3054,6 +3086,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         ingress_generation: Arc::new(AtomicU64::new(0)),
         ingress_mu: Arc::new(Mutex::new(())),
         ingress_last_err: Arc::new(Mutex::new(None)),
+        ingress_last_push: Arc::new(Mutex::new(None)),
     };
 
     // Daemon restarted while pods kept running → rebind their agent channels.
