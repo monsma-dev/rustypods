@@ -40,6 +40,17 @@ use crate::state::{MeshConf, MeshPeerConf};
 
 pub const TUN_NAME: &str = "rp-mesh0";
 pub const DEFAULT_PORT: u16 = 51820;
+/// The host's own mesh address: `fd<host>::1/128` on rp-mesh0. Hosts
+/// speak host-to-host control protocols (gossip, DNS) at this addr;
+/// pods live at `:<idx>::2`.
+pub const HOST_SUFFIX: u128 = 1;
+/// Registry gossip between daemons — JSON over the tunnel.
+const GOSSIP_PORT: u16 = 5305;
+/// Pod-facing DNS on the host mesh addr.
+const DNS_PORT: u16 = 53;
+/// Announce cadence; remote registries expire after 3 intervals.
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
+const NAME_TTL: Duration = Duration::from_secs(95);
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const IFF_TUN: i16 = 0x0001;
 const IFF_NO_PI: i16 = 0x1000;
@@ -118,6 +129,11 @@ pub fn mesh_ip(prefix: Ipv6Addr, idx: u32) -> Ipv6Addr {
     Ipv6Addr::from(seg)
 }
 
+/// `fd<host>::1` — the daemon's own address on the mesh (gossip + DNS).
+pub fn host_addr(prefix: Ipv6Addr) -> Ipv6Addr {
+    Ipv6Addr::from((u128::from(prefix) & !0xffff_ffff) | HOST_SUFFIX)
+}
+
 /// Whether `addr` sits under `prefix` (/48 = first 6 bytes).
 pub fn in_prefix(prefix: Ipv6Addr, addr: Ipv6Addr) -> bool {
     addr.segments()[..3] == prefix.segments()[..3]
@@ -165,6 +181,37 @@ pub struct Mesh {
     /// Supervisor task — awaited by shutdown() so `deinit` doesn't
     /// report "down" while the pump still holds the socket/TUN.
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// --- Mesh-DNS (Wave K) ---
+    /// This daemon's addr on the mesh: `fd<host>::1` on the TUN.
+    pub host_addr: Ipv6Addr,
+    /// Pod-facing DNS responder bound to [fd<host>::1]:53.
+    dns: UdpSocket,
+    /// Registry gossip bound to [fd<host>::1]:5305 — packets only
+    /// arrive here after WireGuard decapsulation, and senders are
+    /// validated to be exactly a peer's fd<peer>::1.
+    gossip: UdpSocket,
+    /// name → mesh addr for THIS host's running pods (fed by Svc).
+    local_names: Mutex<std::collections::BTreeMap<String, Ipv6Addr>>,
+    /// peer /48 → (last refresh, its registry). Entries expire after
+    /// NAME_TTL without an announce — a dead peer's names decay.
+    remote_names: Mutex<
+        HashMap<
+            Ipv6Addr,
+            (
+                std::time::Instant,
+                std::collections::BTreeMap<String, Ipv6Addr>,
+            ),
+        >,
+    >,
+    /// Set by set_local_names/add_peer/remove_peer — wakes the
+    /// announcer for an immediate push instead of waiting out the
+    /// interval.
+    announce: tokio::sync::Notify,
+    /// Host's upstream resolver for non-mesh DNS queries (pods point
+    /// all of resolv.conf at us, so we relay what we don't own).
+    upstream: Option<SocketAddr>,
+    /// Gossip/DNS task handles — awaited by shutdown().
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[repr(C)]
@@ -232,10 +279,50 @@ impl Mesh {
         net::ensure_ip_forward()?;
         net::firewalld_bind_sync(tun_name);
         net::ensure_mesh_forward();
+        // INPUT side: pod→host DNS + decap'd gossip + inbound WG
+        // handshakes (a passive peer's first packet is NEW conntrack
+        // — default-drop INPUT kills it before boringtun sees it).
+        net::ensure_mesh_input(port);
+
+        // The host itself lives at fd<host>::1 — host-to-host control
+        // protocols (gossip, pod-facing DNS) bind to it. `nodad`: the
+        // addr is a /128 on a point-to-point TUN, DAD is meaningless.
+        let host = host_addr(prefix);
+        {
+            let tn = tun_name.to_string();
+            let ha = host.to_string();
+            tokio::task::spawn_blocking(move || {
+                net::run(
+                    "ip",
+                    &[
+                        "-6",
+                        "addr",
+                        "replace",
+                        &format!("{ha}/128"),
+                        "dev",
+                        &tn,
+                        "nodad",
+                        "noprefixroute",
+                    ],
+                )
+            })
+            .await?
+            .context("host mesh addr on TUN")?;
+        }
 
         let udp = UdpSocket::bind(("::", port))
             .await
             .with_context(|| format!("bind mesh udp :{port}"))?;
+        // Two control sockets on the host addr: pod-facing DNS (53) and
+        // daemon-to-daemon registry gossip (5305). Both only reachable
+        // after WireGuard decapsulation or from local pods.
+        let dns = UdpSocket::bind((host, DNS_PORT))
+            .await
+            .with_context(|| format!("bind mesh dns [{host}]:{DNS_PORT}"))?;
+        let gossip = UdpSocket::bind((host, GOSSIP_PORT))
+            .await
+            .with_context(|| format!("bind mesh gossip [{host}]:{GOSSIP_PORT}"))?;
+        let upstream = net::upstream_resolver();
 
         let mut peers = HashMap::new();
         let mut endpoints = HashMap::new();
@@ -272,6 +359,14 @@ impl Mesh {
             pump_where: Default::default(),
             shutdown_tx,
             supervisor: Mutex::new(None),
+            host_addr: host,
+            dns,
+            gossip,
+            local_names: Mutex::new(Default::default()),
+            remote_names: Mutex::new(Default::default()),
+            announce: tokio::sync::Notify::new(),
+            upstream,
+            tasks: Mutex::new(Vec::new()),
         });
         // Supervised pump: a panic inside the spawned task would
         // otherwise die silently (dropped JoinHandle) leaving Recv-Q
@@ -292,6 +387,14 @@ impl Mesh {
                 }
             }
         }));
+        // Mesh-DNS tasks: registry gossip + pod-facing DNS responder.
+        // All subscribe to shutdown_tx and land in `tasks` so
+        // shutdown() can wait for a real teardown.
+        let mut tasks = mesh.tasks.lock().await;
+        tasks.push(tokio::spawn(mesh.clone().gossip_rx()));
+        tasks.push(tokio::spawn(mesh.clone().announcer()));
+        tasks.push(tokio::spawn(mesh.clone().dns_server()));
+        drop(tasks);
         Ok(mesh)
     }
 
@@ -346,6 +449,9 @@ impl Mesh {
         // Kick the handshake proactively so `mesh status` shows liveness
         // before the first payload byte.
         self.kick(pk).await;
+        // Push our registry immediately — a fresh peer shouldn't wait
+        // a full interval to learn our pod names.
+        self.announce.notify_one();
         Ok(())
     }
 
@@ -374,6 +480,8 @@ impl Mesh {
             c.peers.retain(|p| p.pubkey != pubkey_b64);
             crate::state::save_mesh(&self.data_dir, &c)?;
         }
+        // A removed peer's names must not linger for the full TTL.
+        self.remote_names.lock().await.remove(&prefix);
         Ok(true)
     }
 
@@ -426,6 +534,7 @@ impl Mesh {
             pump_ticks: self.pump_ticks.load(std::sync::atomic::Ordering::Relaxed),
             udp_pkts: self.udp_pkts.load(std::sync::atomic::Ordering::Relaxed),
             tun_pkts: self.tun_pkts.load(std::sync::atomic::Ordering::Relaxed),
+            names: self.names().await.into_iter().collect(),
         }
     }
 
@@ -442,6 +551,9 @@ impl Mesh {
             {
                 tracing::warn!("mesh pump did not stop in 3s — abandoning");
             }
+        }
+        for h in self.tasks.lock().await.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
         }
         // `ip link del` beats `tuntap del`: it removes the netdev even
         // while a stale fd keeps it depersisted-only.
@@ -635,6 +747,257 @@ impl Mesh {
             }
         }
     }
+
+    // --- Mesh-DNS (Wave K) ---
+
+    /// Feed the local pod registry (Svc pushes on every pod lifecycle
+    /// change). Triggers an immediate announce so peers learn fast.
+    pub async fn set_local_names(&self, names: std::collections::BTreeMap<String, Ipv6Addr>) {
+        let mut l = self.local_names.lock().await;
+        if *l != names {
+            *l = names;
+            drop(l);
+            self.announce.notify_one();
+        }
+    }
+
+    /// Resolve a pod name across local + remote registries.
+    async fn resolve(&self, name: &str) -> Option<Ipv6Addr> {
+        if let Some(a) = self.local_names.lock().await.get(name) {
+            return Some(*a);
+        }
+        let r = self.remote_names.lock().await;
+        r.values()
+            .filter(|(t, _)| t.elapsed() < NAME_TTL)
+            .find_map(|(_, reg)| reg.get(name).copied())
+    }
+
+    /// Merged name→addr snapshot for `mesh status` / REST.
+    async fn names(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for (n, a) in self.local_names.lock().await.iter() {
+            out.insert(n.clone(), a.to_string());
+        }
+        for (t, reg) in self.remote_names.lock().await.values() {
+            if t.elapsed() < NAME_TTL {
+                for (n, a) in reg {
+                    out.entry(n.clone()).or_insert_with(|| a.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Push the local registry to every peer: JSON over the tunnel to
+    /// fd<peer>::1:5305. Full-state (not delta) — replace semantics
+    /// heal missed updates and pod removals.
+    async fn send_announces(&self) {
+        let names = self.local_names.lock().await.clone();
+        let body = serde_json::json!({ "names": names }).to_string();
+        let peers = self.peers.lock().await;
+        for p in peers.values() {
+            let dst = SocketAddr::new(IpAddr::V6(host_addr(p.prefix)), GOSSIP_PORT);
+            if let Err(e) = self.gossip.send_to(body.as_bytes(), dst).await {
+                tracing::debug!("mesh gossip → {dst}: {e}");
+            }
+        }
+    }
+
+    /// Receive peers' registries. Trust boundary: the datagram arrived
+    /// decapsulated from the tunnel AND src must be exactly that peer's
+    /// fd<peer>::1 — a pod can't forge it (pods use :<idx>::2, and a
+    /// spoofed src still has to be inside a *configured* peer /48).
+    async fn gossip_rx(self: Arc<Self>) {
+        let mut buf = vec![0u8; 8192];
+        let mut shutdown = self.shutdown_tx.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                r = self.gossip.recv_from(&mut buf) => {
+                    let Ok((n, src)) = r else { continue };
+                    let IpAddr::V6(src6) = src.ip() else { continue };
+                    let from_peer = {
+                        let peers = self.peers.lock().await;
+                        peers.values().any(|p| host_addr(p.prefix) == src6)
+                    };
+                    if !from_peer {
+                        tracing::debug!("mesh gossip: dropped non-peer src {src}");
+                        continue;
+                    }
+                    let peer_prefix = {
+                        let segs = src6.segments();
+                        Ipv6Addr::new(segs[0], segs[1], segs[2], 0, 0, 0, 0, 0)
+                    };
+                    #[derive(serde::Deserialize)]
+                    struct Ann {
+                        names: std::collections::BTreeMap<String, Ipv6Addr>,
+                    }
+                    match serde_json::from_slice::<Ann>(&buf[..n]) {
+                        Ok(a) => {
+                            let names = sanitize_registry(peer_prefix, a.names);
+                            self.remote_names
+                                .lock()
+                                .await
+                                .insert(peer_prefix, (std::time::Instant::now(), names));
+                        }
+                        Err(e) => tracing::debug!("mesh gossip parse: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Periodic announce + TTL sweep; Notify gives on-change pushes.
+    async fn announcer(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(ANNOUNCE_EVERY);
+        let mut shutdown = self.shutdown_tx.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = self.announce.notified() => self.send_announces().await,
+                _ = tick.tick() => {
+                    self.remote_names
+                        .lock()
+                        .await
+                        .retain(|_, (t, _)| t.elapsed() < NAME_TTL);
+                    self.send_announces().await;
+                }
+            }
+        }
+    }
+
+    /// Pod-facing DNS on [fd<host>::1]:53. Mesh names answer locally
+    /// (AAAA → addr, A → NODATA); everything else relays upstream so a
+    /// pod's resolv.conf can point only at us without losing real DNS.
+    async fn dns_server(self: Arc<Self>) {
+        let mut buf = vec![0u8; 4096];
+        let mut shutdown = self.shutdown_tx.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                r = self.dns.recv_from(&mut buf) => {
+                    let Ok((n, src)) = r else { continue };
+                    let reply = match dns_query_name(&buf[..n]) {
+                        Some((qname, qtype)) => {
+                            match self.resolve(&qname).await {
+                                Some(addr) if qtype == 28 => {
+                                    Some(dns_answer_aaaa(&buf[..n], addr))
+                                }
+                                Some(_) => Some(dns_nodata(&buf[..n])),
+                                None => self.dns_forward(&buf[..n]).await,
+                            }
+                        }
+                        None => None,
+                    };
+                    if let Some(rep) = reply {
+                        let _ = self.dns.send_to(&rep, src).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Relay one query verbatim to the host resolver; None on timeout.
+    async fn dns_forward(&self, pkt: &[u8]) -> Option<Vec<u8>> {
+        let up = canon_ep(self.upstream?); // v4 stub (127.0.0.53) → mapped-v6
+        let s = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await.ok()?;
+        s.send_to(pkt, up).await.ok()?;
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_secs(3), s.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+            _ => None,
+        }
+    }
+}
+
+/// Extract (single-label name, qtype) from a DNS query. Recognizes a
+/// bare `db`, `db.rp`, `db.pods` or `db.local` — the zone suffixes a
+/// pod's `search` line or a typed FQDN produces.
+fn dns_query_name(pkt: &[u8]) -> Option<(String, u16)> {
+    if pkt.len() < 12 || pkt[2] & 0x80 != 0 {
+        return None; // not a query
+    }
+    let mut qname = String::new();
+    let mut i = 12;
+    loop {
+        let len = *pkt.get(i)? as usize;
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 != 0 {
+            return None; // compression in a question — refuse
+        }
+        i += 1;
+        let label = std::str::from_utf8(pkt.get(i..i + len)?).ok()?;
+        if !qname.is_empty() {
+            qname.push('.');
+        }
+        qname.push_str(&label.to_lowercase());
+        i += len;
+    }
+    let qtype = u16::from_be_bytes([*pkt.get(i + 1)?, *pkt.get(i + 2)?]);
+    for zone in [".rp", ".pods", ".local", ".rustypods"] {
+        if let Some(stripped) = qname.strip_suffix(zone) {
+            qname = stripped.to_string();
+            break;
+        }
+    }
+    if qname.contains('.') || qname.is_empty() {
+        return Some((String::new(), qtype)); // multi-label: never ours
+    }
+    Some((qname, qtype))
+}
+
+/// Flip the query header into a response (QR|RA, rcode NOERROR), keep
+/// the question section, and truncate any prior answers.
+fn dns_response_base(pkt: &[u8]) -> Option<Vec<u8>> {
+    let qd = u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]) as usize;
+    let mut i = 12;
+    for _ in 0..qd {
+        while *pkt.get(i)? != 0 {
+            i += 1 + *pkt.get(i)? as usize;
+        }
+        i += 5; // root label + qtype + qclass
+    }
+    let mut out = pkt[..i].to_vec();
+    out[2] |= 0x84; // QR + AA
+    out[3] = 0x80; // RA
+    out[6..8].copy_from_slice(&[0, 0]); // ancount
+    out[8..10].copy_from_slice(&[0, 0]); // nscount
+    out[10..12].copy_from_slice(&[0, 0]); // arcount
+    Some(out)
+}
+
+/// NOERROR with zero answers — correct for `A podname` on a v6 mesh.
+fn dns_nodata(pkt: &[u8]) -> Vec<u8> {
+    dns_response_base(pkt).unwrap_or_else(|| pkt.to_vec())
+}
+
+/// AAAA answer for a resolved mesh name: name compressed to 0xC00C.
+fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Vec<u8> {
+    let Some(mut out) = dns_response_base(pkt) else {
+        return pkt.to_vec();
+    };
+    out[6..8].copy_from_slice(&[0, 1]); // ancount = 1
+    out.extend_from_slice(&[0xc0, 0x0c]); // name → question
+    out.extend_from_slice(&28u16.to_be_bytes()); // AAAA
+    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+    out.extend_from_slice(&5u32.to_be_bytes()); // TTL 5s
+    out.extend_from_slice(&16u16.to_be_bytes()); // rdlength
+    out.extend_from_slice(&addr.octets());
+    out
+}
+
+/// Registry values must stay inside the announcer's own /48 — never
+/// trust a peer to name OUR space or a third host's.
+fn sanitize_registry(
+    peer_prefix: Ipv6Addr,
+    names: std::collections::BTreeMap<String, Ipv6Addr>,
+) -> std::collections::BTreeMap<String, Ipv6Addr> {
+    names
+        .into_iter()
+        .filter(|(_, a)| in_prefix(peer_prefix, *a))
+        .collect()
 }
 
 /// Build one boringtun session for a peer conf.
@@ -718,5 +1081,119 @@ mod tests {
         let (priv_, pub_) = keygen();
         assert_eq!(pubkey_of(&priv_).unwrap(), pub_);
         assert!(pubkey_of("not-b64!!!").is_err());
+    }
+
+    /// Minimal DNS query packet: id, flags, qdcount=1, one qname.
+    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut p = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            p.push(label.len() as u8);
+            p.extend_from_slice(label.as_bytes());
+        }
+        p.push(0);
+        p.extend_from_slice(&qtype.to_be_bytes());
+        p.extend_from_slice(&1u16.to_be_bytes()); // IN
+        p
+    }
+
+    #[test]
+    fn dns_query_name_parses_zones() {
+        assert_eq!(
+            dns_query_name(&dns_query("db", 28)),
+            Some(("db".into(), 28))
+        );
+        assert_eq!(
+            dns_query_name(&dns_query("db.rp", 1)),
+            Some(("db".into(), 1))
+        );
+        assert_eq!(
+            dns_query_name(&dns_query("db.pods", 28)),
+            Some(("db".into(), 28))
+        );
+        assert_eq!(
+            dns_query_name(&dns_query("DB.LOCAL", 28)),
+            Some(("db".into(), 28))
+        );
+        // Multi-label names are never ours — empty name sentinel.
+        assert_eq!(
+            dns_query_name(&dns_query("a.b.example.com", 28)),
+            Some((String::new(), 28))
+        );
+        // Responses (QR bit) and truncated packets are rejected.
+        let mut resp = dns_query("db", 28);
+        resp[2] |= 0x80;
+        assert_eq!(dns_query_name(&resp), None);
+        assert_eq!(dns_query_name(&dns_query("db", 28)[..10]), None);
+    }
+
+    #[test]
+    fn dns_aaaa_answer_roundtrips() {
+        let q = dns_query("db", 28);
+        let addr = Ipv6Addr::new(0xfd41, 0x85b6, 0xa9dd, 4, 0, 0, 0, 2);
+        let ans = dns_answer_aaaa(&q, addr);
+        // Header: QR set, ancount=1.
+        assert_eq!(ans[2] & 0x80, 0x80);
+        assert_eq!(&ans[6..8], &[0, 1]);
+        // Question preserved verbatim, answer tail carries the addr.
+        assert!(ans.windows(2).any(|w| w == [0xc0, 0x0c]));
+        assert_eq!(&ans[ans.len() - 16..], &addr.octets());
+        // [name:2][type:2][class:2][ttl:4][rdlen:2][rdata:16] — the
+        // AAAA type field sits 26 bytes from the tail.
+        assert_eq!(&ans[ans.len() - 26..ans.len() - 24], &28u16.to_be_bytes());
+    }
+
+    #[test]
+    fn dns_nodata_has_zero_answers() {
+        let ans = dns_nodata(&dns_query("db", 1));
+        assert_eq!(ans[2] & 0x80, 0x80); // still a valid response
+        assert_eq!(&ans[6..8], &[0, 0]); // ancount = 0 → NODATA
+        assert_eq!(ans[3] & 0x0f, 0); // rcode NOERROR, not NXDOMAIN
+    }
+
+    #[test]
+    fn registry_json_roundtrip_and_sanitize() {
+        let ours = Ipv6Addr::new(0xfd41, 0x85b6, 0xa9dd, 0, 0, 0, 0, 0);
+        let theirs = Ipv6Addr::new(0xfd51, 0x0b83, 0x5157, 0, 0, 0, 0, 0);
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("db".to_string(), mesh_ip(theirs, 1));
+        names.insert("web".to_string(), mesh_ip(theirs, 7));
+        let body = serde_json::json!({ "names": names }).to_string();
+        #[derive(serde::Deserialize)]
+        struct Ann {
+            names: std::collections::BTreeMap<String, Ipv6Addr>,
+        }
+        let parsed: Ann = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.names.len(), 2);
+
+        // Sanitize: addrs inside the announcer's /48 survive, foreign
+        // addrs (ours, or a third host's) are stripped.
+        let mut dirty = parsed.names.clone();
+        dirty.insert("evil".to_string(), mesh_ip(ours, 9));
+        dirty.insert("star".to_string(), Ipv6Addr::LOCALHOST);
+        let clean = sanitize_registry(theirs, dirty);
+        assert_eq!(clean.len(), 2);
+        assert!(clean.contains_key("db"));
+        assert!(!clean.contains_key("evil"));
+        assert!(!clean.contains_key("star"));
+        // Every surviving addr is in the announcer's prefix.
+        assert!(clean.values().all(|a| in_prefix(theirs, *a)));
+    }
+
+    /// A socket bound to a specific ULA addr — the DNS/gossip bind
+    /// pattern — must actually receive datagrams sent to that addr.
+    #[tokio::test]
+    async fn bound_host_addr_receives() {
+        // Binding a real ULA needs the addr on an interface, which the
+        // test env may not grant — emulate with ::1 semantics on lo.
+        let rx = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+        let port = rx.local_addr().unwrap().port();
+        let tx = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+        tx.send_to(b"x", (Ipv6Addr::LOCALHOST, port)).await.unwrap();
+        let mut buf = [0u8; 4];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"x");
     }
 }

@@ -333,6 +333,13 @@ export interface MeshStatus {
   pumpTicks: number;
   udpPkts: number;
   tunPkts: number;
+  /** Mesh-DNS registry (Wave K): pod name → mesh addr, local + remote. */
+  names: { [key: string]: string };
+}
+
+export interface MeshStatus_NamesEntry {
+  key: string;
+  value: string;
 }
 
 export interface ListPodsRequest {
@@ -3639,7 +3646,17 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
 };
 
 function createBaseMeshStatus(): MeshStatus {
-  return { enabled: false, pubkey: "", listen: "", prefix: "", peers: [], pumpTicks: 0, udpPkts: 0, tunPkts: 0 };
+  return {
+    enabled: false,
+    pubkey: "",
+    listen: "",
+    prefix: "",
+    peers: [],
+    pumpTicks: 0,
+    udpPkts: 0,
+    tunPkts: 0,
+    names: {},
+  };
 }
 
 export const MeshStatus: MessageFns<MeshStatus> = {
@@ -3668,6 +3685,9 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     if (message.tunPkts !== 0) {
       writer.uint32(64).uint64(message.tunPkts);
     }
+    globalThis.Object.entries(message.names).forEach(([key, value]: [string, string]) => {
+      MeshStatus_NamesEntry.encode({ key: key as any, value }, writer.uint32(74).fork()).join();
+    });
     return writer;
   },
 
@@ -3748,6 +3768,17 @@ export const MeshStatus: MessageFns<MeshStatus> = {
             message.tunPkts = longToNumber(reader.uint64());
             continue;
           }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            const entry9 = MeshStatus_NamesEntry.decode(reader, reader.uint32());
+            if (entry9.value !== undefined) {
+              message.names[entry9.key] = entry9.value;
+            }
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3782,6 +3813,20 @@ export const MeshStatus: MessageFns<MeshStatus> = {
         : isSet(object.tun_pkts)
         ? globalThis.Number(object.tun_pkts)
         : 0,
+      names: isObject(object.names)
+        ? (globalThis.Object.entries(object.names) as [string, any][]).reduce(
+          (acc: { [key: string]: string }, [key, value]: [string, any]) => {
+            globalThis.Object.defineProperty(acc, key, {
+              value: globalThis.String(value),
+              enumerable: true,
+              configurable: true,
+              writable: true,
+            });
+            return acc;
+          },
+          {},
+        )
+        : {},
     };
   },
 
@@ -3811,6 +3856,15 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     if (message.tunPkts !== 0) {
       obj.tunPkts = Math.round(message.tunPkts);
     }
+    if (message.names) {
+      const entries = globalThis.Object.entries(message.names) as [string, string][];
+      if (entries.length > 0) {
+        obj.names = {};
+        entries.forEach(([k, v]) => {
+          obj.names[k] = v;
+        });
+      }
+    }
     return obj;
   },
 
@@ -3827,6 +3881,100 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     message.pumpTicks = object.pumpTicks ?? 0;
     message.udpPkts = object.udpPkts ?? 0;
     message.tunPkts = object.tunPkts ?? 0;
+    message.names = (globalThis.Object.entries(object.names ?? {}) as [string, string][]).reduce(
+      (acc: { [key: string]: string }, [key, value]: [string, string]) => {
+        if (value !== undefined) {
+          acc[key] = globalThis.String(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    return message;
+  },
+};
+
+function createBaseMeshStatus_NamesEntry(): MeshStatus_NamesEntry {
+  return { key: "", value: "" };
+}
+
+export const MeshStatus_NamesEntry: MessageFns<MeshStatus_NamesEntry> = {
+  encode(message: MeshStatus_NamesEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "") {
+      writer.uint32(18).string(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshStatus_NamesEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshStatus_NamesEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.value = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshStatus_NamesEntry {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      value: isSet(object.value) ? globalThis.String(object.value) : "",
+    };
+  },
+
+  toJSON(message: MeshStatus_NamesEntry): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.value !== "") {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshStatus_NamesEntry>, I>>(base?: I): MeshStatus_NamesEntry {
+    return MeshStatus_NamesEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshStatus_NamesEntry>, I>>(object: I): MeshStatus_NamesEntry {
+    const message = createBaseMeshStatus_NamesEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? "";
     return message;
   },
 };
@@ -8058,6 +8206,10 @@ function longToNumber(int64: { toString(): string }): number {
     throw new globalThis.Error("Value is smaller than Number.MIN_SAFE_INTEGER");
   }
   return num;
+}
+
+function isObject(value: any): boolean {
+  return typeof value === "object" && value !== null;
 }
 
 function isSet(value: any): boolean {

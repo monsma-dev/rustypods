@@ -468,6 +468,7 @@ impl Svc {
                 }
             }
         }
+        self.sync_mesh_names().await;
     }
 
     /// `mesh deinit` counterpart: strip every pod's mesh /128. Best-
@@ -539,6 +540,64 @@ impl Svc {
         Ok(MeshStatus {
             enabled: false,
             ..Default::default()
+        })
+    }
+
+    /// Push the running standalone pods into the mesh registry (name →
+    /// mesh addr). Called on every lifecycle edge; a no-op diff inside
+    /// set_local_names keeps the announce quiet when nothing changed.
+    async fn sync_mesh_names(&self) {
+        let Some(m) = self.mesh() else { return };
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods
+                .values()
+                .filter(|p| p.net_index > 0 && p.stack.is_empty())
+                .cloned()
+                .collect()
+        };
+        let mut names = std::collections::BTreeMap::new();
+        for p in pods {
+            if self.engine.running_pid(&p.name).await.is_some() {
+                names.insert(p.name.clone(), mesh::mesh_ip(m.prefix, p.net_index));
+            }
+        }
+        m.set_local_names(names).await;
+    }
+
+    /// Mesh-DNS (Wave K): write run/resolv.conf pointing the pod at the
+    /// host's mesh addr (fd<host>::1:53) with the real upstream as
+    /// fallback, and return the ro bind over /etc/resolv.conf. Missing
+    /// targets get created so --bind never fails on a bare OCI rootfs.
+    fn mesh_resolv_bind(
+        &self,
+        rootfs: &Path,
+        run_dir: &Path,
+        host_addr: std::net::Ipv6Addr,
+    ) -> Result<proto::BindSpec, Status> {
+        let mut content = format!("nameserver {host_addr}\n");
+        if let Some(up) = net::upstream_resolver() {
+            // Loopback stubs (127.0.0.53) are unreachable from the pod's
+            // netns — only offer a fallback the pod can actually dial;
+            // our responder already relays upstream itself.
+            if !up.ip().is_loopback() {
+                content += &format!("nameserver {}\n", up.ip());
+            }
+        }
+        content += "search rp pods\n";
+        let file = run_dir.join("resolv.conf");
+        std::fs::write(&file, content).map_err(int)?;
+        let target = rootfs.join("etc/resolv.conf");
+        if !target.exists() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(int)?;
+            }
+            std::fs::write(&target, "").map_err(int)?;
+        }
+        Ok(proto::BindSpec {
+            host: file.display().to_string(),
+            pod: "/etc/resolv.conf".into(),
+            ro: true,
         })
     }
 
@@ -2936,6 +2995,18 @@ impl PodControl for Svc {
         if meta.ingress_gateway {
             Self::blocking(net::check_ingress_ports_free).await?;
         }
+        // Mesh-DNS: networked standalone pods get a resolv.conf bound
+        // onto /etc/resolv.conf pointing at fd<host>::1. Failure is a
+        // warning, not fatal — worst case the pod keeps upstream DNS
+        // only and can't resolve pod names.
+        if needs_network && meta.stack.is_empty() {
+            if let Some(m) = self.mesh() {
+                match self.mesh_resolv_bind(&rootfs, &run_dir, m.host_addr) {
+                    Ok(b) => binds.push(b),
+                    Err(e) => tracing::warn!("mesh resolv.conf for {name}: {e:#}"),
+                }
+            }
+        }
         // Last fallible step before spawn: the agent listener. From here on
         // the only failure path is engine.start below, which stops it.
         agent::spawn_listener(
@@ -3066,13 +3137,16 @@ impl PodControl for Svc {
             self.save_pod(&m).map_err(int)?;
         }
         let m = st.pods.get(&name).cloned().unwrap_or(meta);
-        Ok(Response::new(to_pod(
+        let pod = to_pod(
             &m,
             &rootfs,
             leader,
             &self.health_view(&name).await,
             self.mesh_prefix(),
-        )))
+        );
+        drop(st);
+        self.sync_mesh_names().await;
+        Ok(Response::new(pod))
     }
 
     async fn stop_pod(&self, req: Request<PodRef>) -> Result<Response<Pod>, Status> {
@@ -3161,6 +3235,7 @@ impl PodControl for Svc {
                 tracing::warn!("ingress resync after {name} stop: {e}");
             }
         }
+        self.sync_mesh_names().await;
         Ok(Response::new(p))
     }
 
@@ -3281,6 +3356,7 @@ impl PodControl for Svc {
         self.ops.lock().await.remove(&name);
         self.stop_intent.lock().await.remove(&name);
         self.health.lock().await.remove(&name);
+        self.sync_mesh_names().await;
         Ok(Response::new(Empty {}))
     }
 

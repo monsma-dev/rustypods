@@ -319,6 +319,8 @@ message MeshStatus {
   uint64 pump_ticks = 6;
   uint64 udp_pkts = 7;
   uint64 tun_pkts = 8;
+  // Mesh-DNS registry (Wave K): pod name → mesh addr, local + remote.
+  map<string, string> names = 9;
 }
 
 message ListPodsRequest {}

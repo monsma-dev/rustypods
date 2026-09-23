@@ -1073,6 +1073,12 @@ fn print_mesh_status(st: &MeshStatus) {
             fmt_bytes(p.rx_bytes)
         );
     }
+    if !st.names.is_empty() {
+        println!("names:");
+        for (n, a) in &st.names {
+            println!("  {n:<20} {a}");
+        }
+    }
 }
 
 /// Build the proto HealthCheck from the CLI's --health-* flags.

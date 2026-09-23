@@ -63,6 +63,11 @@ async fn main() -> anyhow::Result<()> {
             .status()?;
         anyhow::ensure!(st.success(), "ip addr add {addr} dev lo");
         println!("fake pod: {addr} on lo");
+        // Announce it in the gossip registry so the real daemon's pods
+        // can resolve `fakepod` via Mesh-DNS.
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("fakepod".to_string(), addr);
+        m.set_local_names(names).await;
     }
     // Heartbeat: status snapshot every 2s where the unprivileged test
     // driver can read it — the unit's stdout goes to the root journal.
@@ -86,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
                     "peer {} {} handshake={}s tx={} rx={}\n",
                     p.endpoint, p.prefix, p.handshake_secs_ago, p.tx_bytes, p.rx_bytes
                 ));
+            }
+            for (n, a) in &st.names {
+                s.push_str(&format!("name {n} {a}\n"));
             }
             let _ = std::fs::write(&hb, s);
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;

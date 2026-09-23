@@ -543,6 +543,81 @@ pub(crate) fn ensure_mesh_forward() {
     }
 }
 
+/// Mesh INPUT accepts (Wave K): pod→host DNS and decapsulated gossip
+/// hit the INPUT chain, not FORWARD — and an inbound WireGuard
+/// handshake on a passive host is a NEW conntrack entry, dropped by
+/// ufw/firewalld default-drop INPUT before boringtun ever sees it.
+/// Scoped tight: ULA srcs only on our own interfaces (ve-* pod veths,
+/// rp-mesh* TUNs), plus the WG UDP port on any interface.
+pub(crate) fn ensure_mesh_input(wg_port: u16) {
+    const MARK: &str = "rustypods-mesh-in";
+    let wg = wg_port.to_string();
+    // Rule tails as argv slices — iifname wildcards need real quotes,
+    // so no whitespace-split string rules here.
+    for (fam, rules) in [
+        (
+            "ip6",
+            vec![
+                vec![
+                    "iifname",
+                    "{",
+                    "\"ve-*\"",
+                    ",",
+                    "\"rp-mesh*\"",
+                    "}",
+                    "ip6",
+                    "saddr",
+                    "fd00::/8",
+                    "accept",
+                ],
+                vec!["udp", "dport", wg.as_str(), "accept"],
+            ],
+        ),
+        (
+            "inet",
+            vec![
+                vec![
+                    "iifname",
+                    "{",
+                    "\"ve-*\"",
+                    ",",
+                    "\"rp-mesh*\"",
+                    "}",
+                    "ip6",
+                    "saddr",
+                    "fd00::/8",
+                    "accept",
+                ],
+                vec!["udp", "dport", wg.as_str(), "accept"],
+            ],
+        ),
+        ("ip", vec![vec!["udp", "dport", wg.as_str(), "accept"]]),
+    ] {
+        let out = Command::new("nft")
+            .args(["list", "chain", fam, "filter", "INPUT"])
+            .output();
+        let Ok(out) = out else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let txt = String::from_utf8_lossy(&out.stdout);
+        if txt.contains(MARK) {
+            continue;
+        }
+        for r in &rules {
+            let mut argv: Vec<&str> = vec!["insert", "rule", fam, "filter", "INPUT"];
+            argv.extend(r.iter());
+            argv.extend(["comment", MARK]);
+            match Command::new("nft").args(&argv).status() {
+                Ok(s) if s.success() => {}
+                Ok(s) => tracing::warn!("nft insert into {fam} filter INPUT: exit {s}"),
+                Err(e) => tracing::warn!("nft insert into {fam} filter INPUT: {e}"),
+            }
+        }
+        tracing::info!("installed mesh accepts in {fam} filter INPUT");
+    }
+}
+
 fn port_rule_ports(spec: &str) -> Option<(u16, u16, &'static str)> {
     let (ports, proto) = match spec.split_once('/') {
         Some((p, pr)) => (p, pr),
@@ -863,4 +938,25 @@ mod tests {
         assert!(text.contains("Gateway=fd22:220:7::1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// First usable upstream resolver for DNS forwarding. Prefers
+/// systemd-resolved's real upstream file over the 127.0.0.53 stub —
+/// either is reachable for the host daemon, but only the real one is
+/// usable as a pod's fallback nameserver.
+pub(crate) fn upstream_resolver() -> Option<std::net::SocketAddr> {
+    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(ns) = line.trim().strip_prefix("nameserver") else {
+                continue;
+            };
+            if let Ok(ip) = ns.trim().parse::<std::net::IpAddr>() {
+                return Some(std::net::SocketAddr::new(ip, 53));
+            }
+        }
+    }
+    None
 }
