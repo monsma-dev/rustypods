@@ -30,8 +30,12 @@ NOTE: always `set -o pipefail` when piping cargo output — a bare
 
 ## Runtime requirements
 
-- `sudo apt install systemd-container` (nspawn, machinectl, machined)
-- `sudo bash scripts/install-daemon.sh` installs the root daemon + polkit rule.
+- `sudo bash scripts/install-daemon.sh --user "$USER"` installs packages
+  (apt/dnf/pacman families), the unit, `/etc/rustypods/daemon.env`
+  (RUSTYPODS_ALLOWED_UID) and the binaries. `--skip-packages`,
+  `--install-polkit` (opt-in; only for raw machinectl), `--dry-run`.
+- `rustypods doctor` verifies the host: systemd PID1, cgroup v2, userns,
+  nspawn/nsenter option surface, machined, /dev/shm, net sysctls, btrfs.
 - Daemon must run as **root** (nspawn, btrfs subvols under /var/lib, machined).
 - Btrfs host assumed; off-btrfs falls back to `cp --reflink=auto` (slower, works).
 - Port forwarding needs `nft` + `ip` on the host PATH (daemon spawns them).

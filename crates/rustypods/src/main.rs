@@ -1,3 +1,5 @@
+mod doctor;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -28,6 +30,9 @@ struct Cli {
 enum Cmd {
     /// Daemon status (version, machined, btrfs).
     Ping,
+    /// Check that the local host can run rustypodsd — works before the
+    /// daemon is installed (daemon probe is a warning, not a failure).
+    Doctor,
     /// List images.
     Images,
     /// Import a rootless podman/distrobox container as an image.
@@ -719,6 +724,20 @@ async fn cp_cmd(
     }
 }
 
+/// Username for commands that need a host user (import). $USER wins when it
+/// is set and not root; otherwise /etc/passwd is consulted for the euid.
+fn current_username() -> Result<String> {
+    if let Ok(u) = std::env::var("USER") {
+        if !u.is_empty() && u != "root" {
+            return Ok(u);
+        }
+    }
+    let euid = unsafe { libc::geteuid() };
+    let text = std::fs::read_to_string("/etc/passwd").context("reading /etc/passwd")?;
+    rustypods_proto::username_for_uid(&text, euid)
+        .with_context(|| format!("no /etc/passwd entry for uid {euid} — pass --user"))
+}
+
 fn term_size() -> (u32, u32) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -810,6 +829,14 @@ fn print_pod(p: &Pod) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Doctor => {
+            if cli.remote.is_some() {
+                anyhow::bail!(
+                    "doctor inspects the local host; run 'rustypods doctor' on the remote host"
+                );
+            }
+            doctor::run(cli.socket.clone()).await?;
+        }
         Cmd::Shell {
             name,
             user,
@@ -871,7 +898,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Import { from_distrobox, name, user } => {
             let name = name.unwrap_or_else(|| format!("{from_distrobox}-base"));
-            let user = user.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "nick".into()));
+            let user = match user {
+                Some(u) => u,
+                None => current_username()?,
+            };
             println!("exporting: {from_distrobox} → {name} (this can take a while)...");
             let img = rustypods_client::connect_timeout(
                 cli.socket.clone(),

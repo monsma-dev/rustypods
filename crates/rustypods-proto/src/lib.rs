@@ -106,6 +106,18 @@ pub fn validate_container_ref(s: &str) -> anyhow::Result<&str> {
     }
 }
 
+/// Look up the login name for `uid` in passwd(5)-format text. Shared by the
+/// daemon (`--import-user` default) and the CLI (`import`/`shell` fallback).
+pub fn username_for_uid(text: &str, uid: u32) -> Option<String> {
+    text.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        f.next()?; // password field
+        let u: u32 = f.next()?.parse().ok()?;
+        (u == uid && !name.is_empty()).then(|| name.to_string())
+    })
+}
+
 /// A Unix login name: ^[a-z_][a-z0-9_-]{0,31}$.
 pub fn validate_unix_user(u: &str) -> anyhow::Result<&str> {
     let ok = !u.is_empty()
@@ -345,6 +357,19 @@ mod tests {
         assert!(validate_unix_user("nick").is_ok());
         assert!(validate_unix_user("root").is_ok());
         assert!(validate_unix_user("-u").is_err());
+    }
+
+    #[test]
+    fn username_for_uid_parses_passwd() {
+        let text = "root:x:0:0:root:/root:/bin/bash\n\
+                    daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+                    nick:x:1000:1000:Nick:/home/nick:/bin/bash\n";
+        assert_eq!(username_for_uid(text, 1000).as_deref(), Some("nick"));
+        assert_eq!(username_for_uid(text, 0).as_deref(), Some("root"));
+        assert_eq!(username_for_uid(text, 1234), None);
+        // Malformed lines are skipped, not fatal.
+        assert_eq!(username_for_uid("badline\nnick:x:1000:g:::", 1000).as_deref(), Some("nick"));
+        assert_eq!(username_for_uid("", 1000), None);
     }
 
     #[test]

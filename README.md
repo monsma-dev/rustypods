@@ -30,7 +30,10 @@ remote:    rustypods --remote user@host … — gRPC over `ssh … socat - UNIX-
 
 ## Build
 
-The host has no Rust toolchain — builds happen inside the `arch` distrobox:
+Needs cargo + protoc (vendored via `protoc-bin-vendored` — no system
+protobuf needed). `scripts/build.sh` picks a working environment: local
+cargo if present, else the `dev` rustypods pod, else the legacy `arch`
+distrobox:
 
 ```bash
 bash scripts/build.sh
@@ -39,8 +42,47 @@ bash scripts/build.sh
 ## Install (sudo)
 
 ```bash
-sudo bash scripts/install-daemon.sh   # systemd-container + unit + polkit rule
+sudo bash scripts/install-daemon.sh --user "$USER"
+rustypods doctor   # verify the host satisfies all requirements
 ```
+
+Requires a systemd host (PID 1 + machined) on a cgroup-v2 unified
+hierarchy — `rustypods doctor` checks this and more before you install.
+
+Supported distro families — the installer maps each to its package set
+(`systemd-container`/`systemd`, `nftables`, `iproute2`/`iproute`,
+`util-linux`, `btrfs-progs`, `socat`):
+
+| Family | Distros | Status |
+| --- | --- | --- |
+| Debian/Ubuntu | Debian, Ubuntu, Mint, Pop!_OS, Neon, Raspbian, Kali | runtime + deployment live-tested on Debian 13 |
+| Fedora/RHEL | Fedora, RHEL, CentOS, Alma, Rocky, Oracle | distro detection + installer dry-run validated; runtime unverified — SELinux enforcing explicitly requires validation (`doctor` warns) |
+| Arch | Arch, Manjaro, EndeavourOS, CachyOS | distro detection + installer dry-run validated; runtime unverified |
+
+Release artifacts are currently built from source and should be compiled
+on a target-compatible distro/libc — RustyPods does not yet publish
+portable static binaries. Package names above have been checked against
+the official Fedora/Alma/Arch package sources (name checking, not runtime
+testing).
+
+On Arch-family systems the package database and installed packages must
+be current before installing (`pacman -Syu`) — the installer deliberately
+uses `pacman -S`, never `-Sy`, to avoid partial upgrades.
+
+Unsupported distro: install the packages manually and re-run with
+`--skip-packages`. `--dry-run` prints the detected family, target
+user/uid, package commands and every path it would touch, without
+changing anything.
+
+The daemon's allowed non-root uid goes in `/etc/rustypods/daemon.env`
+(written by the installer); the unit's `Environment=` default is 1000.
+Off-btrfs hosts work via the `cp --reflink=auto` fallback — slower, no
+quotas; `doctor` reports which storage driver applies.
+
+The polkit rule (`deploy/49-rustypods.rules`) is **not** installed by
+default — the rustypods CLI talks to the daemon over its own socket, so
+polkit is only needed if you want raw `machinectl shell` on pods. Opt in
+with `--install-polkit`.
 
 ## Usage
 
@@ -78,8 +120,8 @@ Pods get no host paths by default. Add explicit binds at create or later —
 they're stored in the pod conf and applied at the next start:
 
 ```bash
-rustypods create dev --image arch-base --bind /home/nick --bind /data:/mnt/data:ro
-rustypods config dev --bind /home/nick --bind /run/user/1000:ro   # replaces the list
+rustypods create dev --image arch-base --bind "$HOME" --bind /data:/mnt/data:ro
+rustypods config dev --bind "$HOME" --bind "/run/user/$(id -u):ro"   # replaces the list
 rustypods config dev --clear-binds                              # removes them all
 ```
 

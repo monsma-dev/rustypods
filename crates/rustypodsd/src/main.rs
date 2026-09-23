@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -23,9 +23,10 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     allowed_uid: u32,
 
-    /// Host user owning the rootless podman store (for `import --from-distrobox`).
-    #[arg(long, default_value = "nick")]
-    import_user: String,
+    /// Host user owning the rootless podman store (for `import
+    /// --from-distrobox`). Default: the login name behind --allowed-uid.
+    #[arg(long)]
+    import_user: Option<String>,
 
     /// REST/JSON API bind address — bearer-token gated, loopback only by
     /// default. Empty string disables the HTTP listener. A non-loopback
@@ -63,11 +64,26 @@ async fn main() -> Result<()> {
     if euid() != 0 {
         tracing::warn!("rustypodsd is not running as root — nspawn/btrfs/machined will fail");
     }
+    // Default import user: whoever --allowed-uid maps to. A uid without a
+    // passwd entry needs an explicit --import-user.
+    let import_user = match args.import_user {
+        Some(u) => u,
+        None => {
+            let passwd = std::fs::read_to_string("/etc/passwd").context("reading /etc/passwd")?;
+            rustypods_proto::username_for_uid(&passwd, args.allowed_uid).with_context(|| {
+                format!(
+                    "--import-user is required because uid {} has no passwd entry",
+                    args.allowed_uid
+                )
+            })?
+        }
+    };
+    rustypods_proto::validate_unix_user(&import_user)?;
     server::serve(Config {
         data_dir: args.data_dir,
         socket: args.socket,
         allowed_uid: args.allowed_uid,
-        import_user: args.import_user,
+        import_user,
         http_addr: args.http_addr,
         gc_interval_secs: args.gc_interval_secs,
     })

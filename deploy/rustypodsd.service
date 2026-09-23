@@ -1,11 +1,14 @@
 [Unit]
 Description=RustyPods daemon — nspawn pod orchestrator
-Documentation=file:/home/nick/Projects/rustypods/README.md
 After=systemd-machined.service
 Wants=systemd-machined.service
 
 [Service]
-ExecStart=/usr/local/bin/rustypodsd
+# The uid allowed to drive the daemon besides root; override via
+# /etc/rustypods/daemon.env (written by scripts/install-daemon.sh).
+Environment=RUSTYPODS_ALLOWED_UID=1000
+EnvironmentFile=-/etc/rustypods/daemon.env
+ExecStart=/usr/local/bin/rustypodsd --allowed-uid=${RUSTYPODS_ALLOWED_UID}
 # Only the daemon's main pid belongs to systemd — on restart, leave the
 # nspawn pods (which live in this cgroup via machined scopes) alone.
 KillMode=process

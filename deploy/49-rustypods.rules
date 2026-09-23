@@ -1,8 +1,15 @@
-// RustyPods: user nick may manage machined pods without a password prompt
-// (machinectl shell/poweroff/terminate/list). Single-user dev box.
+// RustyPods OPTIONAL polkit rule — NOT installed by default.
+//
+// This rule is only for direct `machinectl shell/poweroff/terminate`
+// usage on RustyPods machines without a password prompt. Normal
+// RustyPods operation (the rustypods CLI → rustypodsd RPC) does not
+// need it; install only if you want raw machinectl access:
+//   scripts/install-daemon.sh --install-polkit
+//
+// @RUSTYPODS_USER@ is a placeholder replaced by the installer.
 polkit.addRule(function(action, subject) {
     if (action.id.indexOf("org.freedesktop.machine1.") === 0 &&
-        subject.user === "nick") {
+        subject.user === "@RUSTYPODS_USER@") {
         return polkit.Result.YES;
     }
 });

@@ -23,7 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "io-std", "sync", "time", "signal"] }
+# fs: rustypods (CLI) uses tokio::fs directly — without it the crate only
+# compiles when feature-unified with rustypodsd in a workspace build.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "io-std", "fs", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
