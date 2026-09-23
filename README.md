@@ -212,9 +212,9 @@ OCI images without an init exit immediately — use `--cmd sleep infinity`
 to keep a dev pod alive:
 
 ```bash
-rustypods pull debian:forky
-rustypods create kde-dev --image debian-forky --desktop --cmd sleep infinity
-rustypods start kde-dev                 # payload pod; logs via console log
+rustypods pull debian:trixie
+rustypods create deb-dev --image debian-trixie --desktop --cmd sleep infinity
+rustypods start deb-dev                 # payload pod; logs via console log
 ```
 
 The override replaces the image's entrypoint+cmd and forces non-boot mode;

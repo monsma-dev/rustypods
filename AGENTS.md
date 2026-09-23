@@ -99,8 +99,8 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
   ("Bad fd number" — broke `shell` on every Debian-family image).
 - Hard-won: `shell` forwards the host's `LANG` into the pod, but a fresh
   OCI rootfs hasn't generated it → locale-aware tools die
-  (`locale.Error: unsupported locale setting`, hit by sphinx-build during
-  a Plasma build on debian:forky). exec.rs downgrades LANG/LC_ALL to
+  (`locale.Error: unsupported locale setting`, hit by sphinx-build on a
+  fresh debian OCI pod). exec.rs downgrades LANG/LC_ALL to
   `C.UTF-8` when the locale isn't generated in the rootfs; run
   `locale-gen` in the pod for the real locale.
 
