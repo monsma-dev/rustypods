@@ -14,8 +14,8 @@ use std::time::Duration;
 use rustypods_proto::rpc::{exec_chunk::Kind, ExecChunk, ExecExit, ExecStart};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+use tokio_stream::Stream;
 use tokio_stream::StreamExt;
-use tonic::Streaming;
 
 type Tx = mpsc::Sender<Result<ExecChunk, tonic::Status>>;
 
@@ -416,14 +416,17 @@ fn openpty(rows: u16, cols: u16) -> Result<(std::os::fd::OwnedFd, std::os::fd::O
 /// Wire up an exec session. `inbound` is the client stream positioned *after*
 /// the ExecStart frame. All output (stdout/stderr + a terminal Exit chunk)
 /// flows through `tx`.
-pub async fn run(
+pub async fn run<S>(
     start: ExecStart,
     rootfs: &Path,
     leader: u32,
     private_users: bool,
-    inbound: Streaming<ExecChunk>,
+    inbound: S,
     tx: Tx,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
+{
     let argv = exec_argv(leader, rootfs, &start, private_users)?;
     if start.tty {
         run_tty(&argv, &start, inbound, tx).await
@@ -432,12 +435,15 @@ pub async fn run(
     }
 }
 
-async fn run_tty(
+async fn run_tty<S>(
     argv: &[OsString],
     start: &ExecStart,
-    mut inbound: Streaming<ExecChunk>,
+    mut inbound: S,
     tx: Tx,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
+{
     let (master, slave) = openpty(start.rows as u16, start.cols as u16)?;
     let slave_in = slave.try_clone().context("slave clone")?;
     let slave_err = slave.try_clone().context("slave clone")?;
@@ -534,12 +540,15 @@ async fn run_tty(
     Ok(())
 }
 
-async fn run_pipe(
+async fn run_pipe<S>(
     argv: &[OsString],
     _pod: String,
-    mut inbound: Streaming<ExecChunk>,
+    mut inbound: S,
     tx: Tx,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
+{
     let mut scmd = std::process::Command::new(&argv[0]);
     scmd
         .args(&argv[1..])

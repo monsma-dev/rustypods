@@ -160,6 +160,10 @@ impl RuntimeEngine for SystemdNspawn {
         dbus::apply_limits(&self.dbus, pod, limits).await
     }
 
+    async fn scope_name(&self, pod: &str) -> Option<String> {
+        dbus::unit_name(&self.dbus, pod).await.ok().flatten()
+    }
+
     async fn healthy(&self) -> bool {
         dbus::machined_up(&self.dbus).await
     }

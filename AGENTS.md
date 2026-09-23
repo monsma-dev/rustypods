@@ -217,6 +217,24 @@ rustypodsd does it itself:
   expansion, `A=$HOME` stays literal; `--env` flags override file
   entries per key.
 
+## REST API surface (Wave G)
+
+`/v1/pods/{name}` GET · `/v1/pods/{name}/stats` GET (live cgroup-v2:
+memory.current, cpu.stat usage_usec, pids.current, memory.peak — read
+from /sys/fs/cgroup/machine.slice/<machined-unit>/, no agent needed) ·
+`/v1/pods/{name}/logs?lines=N` GET (journal for boot pods, console log
+otherwise — same probe as stream_logs) · `/v1/pods/{name}/exec` POST
+(non-tty, {cmd,user,workdir,env,timeout_secs} → {stdout,stderr,
+exit_code,timed_out,truncated}, 4MiB/stream cap, timeout ≤900s).
+
+- exec.rs's `run`/`run_pipe`/`run_tty` are generic over the inbound
+  Stream — gRPC passes `tonic::Streaming`, REST `tokio_stream::empty()`.
+- Timeout kill is best-effort: dropping the receiver fires tx.closed()
+  → the waiter SIGKILLs the host-side nsenter — but `nsenter -p` forks,
+  so the in-pod payload is reparented to pod init and can linger until
+  it exits or the pod stops. Agents that must not leak should exec a
+  `pkill` cleanup or keep payloads self-terminating.
+
 ## Rootless podman caveat
 
 `podman` needs the user session bus (`/run/user/1000/bus`). If `podman

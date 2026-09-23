@@ -70,6 +70,12 @@ pub trait RuntimeEngine: Send + Sync {
     async fn registered(&self, pod: &str) -> Result<bool>;
     /// Hot-apply resource limits to the live pod scope.
     async fn apply_limits(&self, pod: &str, limits: &LimitsSpec) -> Result<()>;
+    /// The pod's live cgroup scope name (nspawn: the machined .unit
+    /// property, e.g. "machine-dev.scope"). None when not running; used
+    /// to read cgroup-v2 stats from /sys/fs/cgroup/machine.slice/.
+    async fn scope_name(&self, _pod: &str) -> Option<String> {
+        None
+    }
     /// Control-plane health (nspawn: machined answers ListMachines).
     async fn healthy(&self) -> bool;
 }

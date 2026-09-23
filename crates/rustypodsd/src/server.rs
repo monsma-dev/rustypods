@@ -163,6 +163,37 @@ fn volumes_to_proto(specs: &[String]) -> Vec<VolumeMount> {
         .collect()
 }
 
+/// Captured output of a finished non-tty exec (REST exec endpoint).
+/// Output is lossy UTF-8; each stream caps at max_bytes — further
+/// bytes are dropped and `truncated` flips.
+#[derive(Debug, Default)]
+pub(crate) struct ExecOutcome {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub truncated: bool,
+}
+
+impl ExecOutcome {
+    fn push_stdout(&mut self, b: Vec<u8>, max: usize) {
+        push_capped(&mut self.stdout, b, max, &mut self.truncated);
+    }
+    fn push_stderr(&mut self, b: Vec<u8>, max: usize) {
+        push_capped(&mut self.stderr, b, max, &mut self.truncated);
+    }
+}
+
+fn push_capped(buf: &mut Vec<u8>, b: Vec<u8>, max: usize, truncated: &mut bool) {
+    let room = max.saturating_sub(buf.len());
+    if room >= b.len() {
+        buf.extend_from_slice(&b);
+    } else {
+        buf.extend_from_slice(&b[..room]);
+        *truncated = true;
+    }
+}
+
 fn ingress_to_proto(specs: &[IngressSpec]) -> Vec<IngressRule> {
     specs
         .iter()
@@ -583,6 +614,149 @@ impl Svc {
         }
         out.sort_by(|a, b| b.created_unix.cmp(&a.created_unix));
         out
+    }
+
+    /// Whether the pod exists in persisted state (REST guards).
+    pub(crate) async fn pod_exists(&self, name: &str) -> bool {
+        self.st.lock().await.pods.contains_key(name)
+    }
+
+    /// The pod's live cgroup scope name, if registered and running.
+    /// http.rs reads /sys/fs/cgroup/machine.slice/<unit>/ for stats.
+    pub(crate) async fn pod_scope(&self, name: &str) -> Option<String> {
+        self.engine.scope_name(name).await
+    }
+
+    /// Last `lines` log lines — journal for boot pods (same
+    /// `journalctl -M` probe as stream_logs), the nspawn console log
+    /// otherwise. Returned newest-last, one String per line.
+    pub(crate) async fn pod_log_tail(&self, name: &str, lines: u32) -> Result<Vec<String>, Status> {
+        if !self.pod_exists(name).await {
+            return Err(Status::not_found(format!("pod {name} not found")));
+        }
+        let boot_pod = {
+            let st = self.st.lock().await;
+            st.pods.get(name).map(|m| is_payload_pod(&st, m)) == Some(false)
+        };
+        let n = lines.to_string();
+        let spawned = if boot_pod {
+            let has_journal = tokio::process::Command::new("journalctl")
+                .args(["-M", name, "-n", "1", "--no-pager"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            has_journal.then(|| {
+                tokio::process::Command::new("journalctl")
+                    .args(["-M", name, "-n", &n, "-o", "cat", "--no-pager"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output()
+            })
+        } else {
+            None
+        };
+        let out = match spawned {
+            Some(f) => f.await.map_err(int)?,
+            None => {
+                let log_path = self.cfg.logs_dir().join(format!("{name}.log"));
+                match tokio::process::Command::new("tail")
+                    .arg("-n")
+                    .arg(&n)
+                    .arg(&log_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => o,
+                    // A pod that never started has no console log — an
+                    // empty tail is more useful than a 500.
+                    Ok(_) => return Ok(Vec::new()),
+                    Err(e) => return Err(int(e)),
+                }
+            }
+        };
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect())
+    }
+
+    /// Run a non-tty exec session to completion and capture its output —
+    /// the REST exec endpoint's engine. `dur` bounds wall time: on
+    /// timeout we drop the receiver, exec::run's waiter sees
+    /// tx.closed() and kills the nsenter'd child.
+    pub(crate) async fn exec_collect(
+        &self,
+        start: ExecStart,
+        max_bytes: usize,
+        dur: std::time::Duration,
+    ) -> Result<ExecOutcome, Status> {
+        let name = proto::validate_name(&start.pod).map_err(bad)?.to_string();
+        let private_users = {
+            let st = self.st.lock().await;
+            let Some(m) = st.pods.get(&name) else {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            };
+            m.private_users
+        };
+        let Some(leader) = self.engine.running_pid(&name).await else {
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is not running"
+            )));
+        };
+        if leader == 0 {
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is still booting — no leader pid yet"
+            )));
+        }
+        proto::validate_argv(&start.argv).map_err(bad)?;
+        proto::validate_env(&start.env).map_err(bad)?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        crate::exec::run(
+            start,
+            &self.pod_rootfs(&name),
+            leader,
+            private_users,
+            tokio_stream::empty(),
+            tx,
+        )
+        .await
+        .map_err(int)?;
+        let deadline = tokio::time::Instant::now() + dur;
+        let mut out = ExecOutcome::default();
+        loop {
+            let chunk = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Err(_) => {
+                    out.timed_out = true;
+                    drop(rx); // tx.closed() → the waiter kills the child
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(c)) => c,
+            };
+            match chunk.map(|c| c.kind) {
+                Ok(Some(rustypods_proto::rpc::exec_chunk::Kind::Stdout(b))) => {
+                    out.push_stdout(b, max_bytes)
+                }
+                Ok(Some(rustypods_proto::rpc::exec_chunk::Kind::Stderr(b))) => {
+                    out.push_stderr(b, max_bytes)
+                }
+                Ok(Some(rustypods_proto::rpc::exec_chunk::Kind::Exit(e))) => {
+                    out.exit_code = Some(e.code);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Latest agent-pushed metric for a pod (REST /metrics). None when the

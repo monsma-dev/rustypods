@@ -131,6 +131,15 @@ pub async fn running_pid(conn: &Connection, name: &str) -> Result<Option<u32>> {
     Ok(Some(m.leader().await.unwrap_or(0)))
 }
 
+/// The machined scope name ("machine-<name>.scope") — authoritative;
+/// never format it yourself. None when the pod isn't registered.
+pub async fn unit_name(conn: &Connection, name: &str) -> Result<Option<String>> {
+    let Some(m) = machine(conn, name).await? else {
+        return Ok(None);
+    };
+    Ok(Some(m.unit().await?))
+}
+
 /// Poll machined until the pod has a live leader (nspawn registers first,
 /// the leader appears once init is up).
 pub async fn wait_registered(conn: &Connection, name: &str, dur: Duration) -> Result<u32> {

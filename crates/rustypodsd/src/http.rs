@@ -14,14 +14,14 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, Request as AxumRequest, State},
+    extract::{Path, Query, Request as AxumRequest, State},
     http::StatusCode,
     middleware::Next,
     response::Response,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tonic::{Request, Status};
 
 use rustypods_proto::rpc::pod_control_server::PodControl;
@@ -267,6 +267,161 @@ async fn pod_metrics(
         .ok_or_else(|| api_err(Status::not_found(format!("no metrics for pod {name}"))))
 }
 
+/// `GET /v1/pods/:name` — single-pod detail for agents (same view as
+/// the gRPC Pod message).
+async fn get_pod(State(s): State<Svc>, Path(name): Path<String>) -> Result<Json<Pod>, ApiErr> {
+    let p = s
+        .list_pods(Request::new(ListPodsRequest {}))
+        .await
+        .map_err(api_err)?
+        .into_inner()
+        .pods
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| api_err(Status::not_found(format!("pod {name} not found"))))?;
+    Ok(Json(p))
+}
+
+/// `GET /v1/pods/:name/logs?lines=N` — last N lines as a JSON array:
+/// journal for boot pods, the console log otherwise (same source
+/// selection as the gRPC log stream). Default 200, capped at 5000.
+#[derive(Deserialize)]
+struct LogsQuery {
+    lines: Option<u32>,
+}
+
+async fn pod_logs(
+    State(s): State<Svc>,
+    Path(name): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let lines = q.lines.unwrap_or(200).min(5000);
+    let out = s.pod_log_tail(&name, lines).await.map_err(api_err)?;
+    Ok(Json(serde_json::json!({ "name": name, "lines": out })))
+}
+
+/// `GET /v1/pods/:name/stats` — live cgroup-v2 snapshot read straight
+/// from /sys/fs/cgroup/machine.slice/<scope>/ (no agent needed).
+#[derive(Serialize)]
+struct StatsOut {
+    unit: String,
+    cpu_usage_us: u64,
+    mem_bytes: u64,
+    mem_peak_bytes: Option<u64>,
+    pids: u64,
+}
+
+fn read_u64(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn read_cgroup_stats(unit: &str) -> Option<StatsOut> {
+    let dir = std::path::Path::new("/sys/fs/cgroup/machine.slice").join(unit);
+    let mem_bytes = read_u64(&dir.join("memory.current"))?;
+    let cpu_usage_us = std::fs::read_to_string(dir.join("cpu.stat"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("usage_usec "))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    Some(StatsOut {
+        unit: unit.to_string(),
+        cpu_usage_us,
+        mem_bytes,
+        mem_peak_bytes: read_u64(&dir.join("memory.peak")),
+        pids: read_u64(&dir.join("pids.current")).unwrap_or(0),
+    })
+}
+
+async fn pod_stats(
+    State(s): State<Svc>,
+    Path(name): Path<String>,
+) -> Result<Json<StatsOut>, ApiErr> {
+    if !s.pod_exists(&name).await {
+        return Err(api_err(Status::not_found(format!("pod {name} not found"))));
+    }
+    let Some(unit) = s.pod_scope(&name).await else {
+        return Err(api_err(Status::failed_precondition(format!(
+            "pod {name} is not running"
+        ))));
+    };
+    let stats = tokio::task::spawn_blocking(move || read_cgroup_stats(&unit))
+        .await
+        .map_err(|e| api_err(Status::internal(format!("{e}"))))?
+        .ok_or_else(|| api_err(Status::internal("cgroup scope not readable")))?;
+    Ok(Json(stats))
+}
+
+/// `POST /v1/pods/:name/exec` — run a non-tty command in the pod and
+/// return captured output. The agent-facing alternative to the gRPC
+/// bidi stream: one request, one response.
+#[derive(Deserialize)]
+struct ExecIn {
+    /// Argv, e.g. ["sh","-c","ls -la /data"]. Required — there is no
+    /// interactive login shell over REST.
+    cmd: Vec<String>,
+    /// Container user; empty/absent = root.
+    #[serde(default)]
+    user: Option<String>,
+    /// Absolute in-container cwd; absent = $HOME/inherited.
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Extra "K=V" env for the payload.
+    #[serde(default)]
+    env: Option<Vec<String>>,
+    /// Wall-clock cap in seconds (default 60, max 900). On timeout the
+    /// payload is killed and partial output returns with timed_out.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ExecOut {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    truncated: bool,
+}
+
+async fn pod_exec(
+    State(s): State<Svc>,
+    Path(name): Path<String>,
+    Json(b): Json<ExecIn>,
+) -> Result<Json<ExecOut>, ApiErr> {
+    if b.cmd.is_empty() {
+        return Err(api_err(Status::invalid_argument(
+            "cmd must be a non-empty argv (e.g. [\"sh\",\"-c\",\"...\"])",
+        )));
+    }
+    let timeout_secs = b.timeout_secs.unwrap_or(60).clamp(1, 900);
+    let start = ExecStart {
+        pod: name,
+        user: b.user.unwrap_or_default(),
+        argv: b.cmd,
+        tty: false,
+        rows: 0,
+        cols: 0,
+        env: b.env.unwrap_or_default(),
+        workdir: b.workdir.unwrap_or_default(),
+    };
+    let out = s
+        .exec_collect(start, 4 << 20, std::time::Duration::from_secs(timeout_secs))
+        .await
+        .map_err(api_err)?;
+    Ok(Json(ExecOut {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        exit_code: out.exit_code,
+        timed_out: out.timed_out,
+        truncated: out.truncated,
+    }))
+}
+
 /// Raw stack.toml as the body (application/toml or plain text).
 async fn apply_stack(
     State(s): State<Svc>,
@@ -356,7 +511,13 @@ pub fn router(svc: Svc, token: Arc<str>) -> Router {
         .route("/v1/pods/{name}/start", post(start_pod))
         .route("/v1/pods/{name}/stop", post(stop_pod))
         .route("/v1/pods/{name}/metrics", get(pod_metrics))
-        .route("/v1/pods/{name}", patch(update_pod).delete(destroy_pod))
+        .route("/v1/pods/{name}/stats", get(pod_stats))
+        .route("/v1/pods/{name}/logs", get(pod_logs))
+        .route("/v1/pods/{name}/exec", post(pod_exec))
+        .route(
+            "/v1/pods/{name}",
+            get(get_pod).patch(update_pod).delete(destroy_pod),
+        )
         .route("/v1/stacks", post(apply_stack))
         .route("/v1/stacks/{name}", delete(destroy_stack))
         .route("/v1/volumes", get(list_volumes).post(create_volume))
