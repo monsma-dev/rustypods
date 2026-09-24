@@ -81,7 +81,7 @@ pub fn default_name(reference: &str) -> Result<String> {
 /// Pull `reference` into `dest` (an existing empty dir/subvol) and return
 /// the image's runtime config. Anonymous auth; multi-arch indexes resolve
 /// to the native linux/<arch> manifest (oci-client's default resolver).
-pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
+pub async fn pull(reference: &str, dest: &Path, strip_setuid: bool) -> Result<ImageConfig> {
     let image = Reference::from_str(reference)
         .with_context(|| format!("invalid image reference '{reference}'"))?;
     let client = Client::new(ClientConfig {
@@ -113,7 +113,7 @@ pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
                 MAX_LAYER_BLOB >> 30
             );
         }
-        pull_layer(&client, &image, layer, dest).await?;
+        pull_layer(&client, &image, layer, dest, strip_setuid).await?;
     }
     write_machine_id(dest)?;
     Ok(cfg)
@@ -198,6 +198,7 @@ async fn pull_layer(
     image: &Reference,
     layer: &OciDescriptor,
     dest: &Path,
+    strip_setuid: bool,
 ) -> Result<()> {
     tracing::info!(
         "{image}: layer {} ({}, {} bytes)",
@@ -233,7 +234,7 @@ async fn pull_layer(
     let mt = layer.media_type.clone();
     // `guard` is still live here — its Drop removes the temp file once
     // this fn returns, whatever the unpack outcome.
-    tokio::task::spawn_blocking(move || unpack_layer(&tmp2, &mt, &dest2))
+    tokio::task::spawn_blocking(move || unpack_layer(&tmp2, &mt, &dest2, strip_setuid))
         .await
         .context("untar task")?
         .with_context(|| format!("unpacking layer {}", layer.digest))
@@ -241,7 +242,7 @@ async fn pull_layer(
 
 /// Decompress by media type and untar. Covers the OCI + docker layer types:
 /// `.tar` plain, `+gzip`/`.gzip`, `+zstd`/`.zstd`.
-fn unpack_layer(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
+fn unpack_layer(blob: &Path, media_type: &str, dest: &Path, strip_setuid: bool) -> Result<()> {
     let f = std::fs::File::open(blob).with_context(|| format!("open {}", blob.display()))?;
     let mt = media_type.to_ascii_lowercase();
     let reader: Box<dyn Read> = if mt.ends_with("+gzip") || mt.ends_with(".gzip") {
@@ -257,7 +258,7 @@ fn unpack_layer(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
     // cut mid-stream — the untar then fails on the truncated entry — and a
     // fully-drained reader means the stream hit the cap exactly.
     let mut limited = reader.take(MAX_LAYER_DECOMPRESSED + 1);
-    unpack_tar(&mut limited, dest)?;
+    unpack_tar_mode(&mut limited, dest, strip_setuid)?;
     if limited.limit() == 0 {
         bail!(
             "layer decompresses past {} GiB — refusing (possible decompression bomb)",
@@ -310,6 +311,14 @@ fn remove_children(dir: &Path) {
 /// crate-visible: the distrobox import routes its export stream through
 /// the same hardened untar.
 pub(crate) fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
+    unpack_tar_mode(reader, dest, false)
+}
+
+/// `strip_setuid` clears S_ISUID/S_ISGID after each entry lands. The
+/// default keeps those bits: images ship sudo/ping, and a user namespace
+/// contains host impact. Pods with `private_users = false` are trusted
+/// images only — pass `pull --strip-setuid` when that is not true.
+pub(crate) fn unpack_tar_mode<R: Read>(reader: R, dest: &Path, strip_setuid: bool) -> Result<()> {
     let mut ar = tar::Archive::new(reader);
     // Keep recorded uids/modes — only meaningful (and only permitted) when
     // the daemon runs as root; a rootless run just gets extractor-owned files.
@@ -385,9 +394,28 @@ pub(crate) fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
         }
         if !e.unpack_in(&dest).context("untar entry")? {
             tracing::warn!("skipping entry escaping dest: {}", rel.display());
+        } else if strip_setuid {
+            clear_setid_bits(&dest.join(&rel));
         }
     }
     Ok(())
+}
+
+fn clear_setid_bits(path: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    // chmod follows symlinks; never clear bits on a target outside the rootfs.
+    if md.file_type().is_symlink() {
+        return;
+    }
+    let mode = md.mode() & 0o7777;
+    let cleared = mode & !0o6000;
+    if cleared != mode {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(cleared));
+    }
 }
 
 // --- image config JSON --------------------------------------------------
@@ -669,6 +697,35 @@ mod tests {
             dest.join("x/file").exists(),
             "x/.wh... must not delete x's parent chain"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn strip_setuid_clears_bits_default_keeps_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("rp-oci-suid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let keep = base.join("keep");
+        let strip = base.join("strip");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(&strip).unwrap();
+        let mut t = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_mode(0o4755);
+        hdr.set_size(1);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "bin/ping", std::io::Cursor::new(b"x"))
+            .unwrap();
+        let bytes = t.into_inner().unwrap();
+        unpack_tar(&bytes[..], &keep).unwrap();
+        unpack_tar_mode(&bytes[..], &strip, true).unwrap();
+        let mode = |p: &std::path::Path| {
+            std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+        };
+        assert_eq!(mode(&keep.join("bin/ping")) & 0o6000, 0o4000);
+        assert_eq!(mode(&strip.join("bin/ping")) & 0o6000, 0);
+        assert_eq!(mode(&strip.join("bin/ping")) & 0o755, 0o755);
         let _ = std::fs::remove_dir_all(&base);
     }
 

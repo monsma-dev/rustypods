@@ -364,6 +364,11 @@ Files are owned by uid 1000 so host and pod processes can map them as `nick`.
 ```bash
 rustypods pull busybox:latest        # native OCI pull — no podman/docker needed
 rustypods pull ghcr.io/org/tool:v1 --name tool
+rustypods pull some/image:latest --strip-setuid   # drop S_ISUID/S_ISGID
+rustypods export db -o db.rpod       # RPEX0002 archive (sha256 trailer)
+rustypods export db --format tar -o db.rpod   # tar payload, even on btrfs
+rustypods load db.rpod               # strips binds/ports/env unless --trust
+rustypods load db.rpod --trust --name db2
 rustypods logs dev                   # journal backlog; non-boot pods → console log
 rustypods logs dev -f                # keep following
 rustypods config dev --snap-keep 5 --snap-max-age 7d   # snapshot GC; 0 = keep all
@@ -371,7 +376,18 @@ rustypods config dev --snap-keep 5 --snap-max-age 7d   # snapshot GC; 0 = keep a
 
 Pulled images carry their OCI entrypoint/cmd — pods on them run non-boot
 (the payload replaces systemd), which is also why their `logs` come from the
-console log instead of the journal.
+console log instead of the journal. Layer extract keeps setuid/setgid so
+`sudo` and `ping` work inside a user namespace. That containment is gone
+when `private_users` is off (desktop pods, `--trust` imports that kept it):
+treat those as trusted images only, or pull with `--strip-setuid`.
+
+`export` fails if the `btrfs send`/`tar` child fails, and `export -o`
+deletes the partial file. `load` verifies the RPEX0002 trailer before
+the rootfs is moved into place; a truncated archive leaves no pod and no
+staging dir. Archives whose conf bind-mounts `/root` come up with no
+binds unless `load --trust`. A btrfs-send archive cannot be loaded on
+XFS/ext4 — export it again with `--format tar`. Payload size is capped
+by `RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB).
 
 ### REST API
 
@@ -393,6 +409,8 @@ PATCH  /v1/pods/:name                {"memory_high_bytes","ports","binds",
                                       "snap_keep_last","autostart",…}
 POST   /v1/pods/:name/start|stop     DELETE /v1/pods/:name
 GET    /v1/images                    GET    /v1/pods/:name/metrics
+GET    /v1/pods/:name/export?format=tar
+POST   /v1/import?name=&trust=true
 POST   /v1/stacks   (raw stack.toml) DELETE /v1/stacks/:name
 ```
 

@@ -60,6 +60,11 @@ enum Cmd {
         /// Image name (default: <repo-basename>-<tag>, e.g. "node-20-alpine").
         #[arg(long)]
         name: Option<String>,
+        /// Clear setuid/setgid bits while extracting. Default keeps them
+        /// (sudo, ping). Pods without a user namespace should only run
+        /// images you trust, or pass this flag.
+        #[arg(long)]
+        strip_setuid: bool,
     },
     /// Remove an image.
     Rmi { name: String },
@@ -192,6 +197,14 @@ enum Cmd {
         /// Write to a file instead of stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Force the payload format. `tar` works on non-btrfs hosts;
+        /// default is btrfs send when the data dir is btrfs.
+        #[arg(long, value_parser = ["tar", "btrfs"])]
+        format: Option<String>,
+        /// Export even if cgroup freeze fails. The archive is then only
+        /// crash-consistent (a torn write is possible).
+        #[arg(long)]
+        allow_inconsistent: bool,
     },
     /// Load an exported pod archive onto this host.
     Load {
@@ -200,6 +213,11 @@ enum Cmd {
         /// Register the pod under a different name.
         #[arg(long)]
         name: Option<String>,
+        /// Keep exported binds, ports, env, autostart, restart policy,
+        /// healthchecks and private_users=false. Without this flag those
+        /// host-root grants are stripped.
+        #[arg(long)]
+        trust: bool,
     },
     /// Apply a stack.toml: create/update grouped pods sharing one netns
     /// (K8s-pod model — members reach each other on 127.0.0.1).
@@ -1410,7 +1428,11 @@ async fn main() -> Result<()> {
                 println!("no images — `rustypods pull busybox:latest` or `rustypods import --from-distrobox arch`");
             }
         }
-        Cmd::Pull { reference, name } => {
+        Cmd::Pull {
+            reference,
+            name,
+            strip_setuid,
+        } => {
             println!("pulling {reference} (this can take a while)...");
             // Pulls routinely outlast the default 30s call bound.
             let img = rustypods_client::connect_timeout(
@@ -1422,6 +1444,7 @@ async fn main() -> Result<()> {
             .pull_image(PullImageRequest {
                 reference,
                 name: name.unwrap_or_default(),
+                strip_setuid,
             })
             .await?
             .into_inner();
@@ -1665,14 +1688,21 @@ async fn main() -> Result<()> {
                 println!("no snapshots — `rustypods commit <pod> [label]`");
             }
         }
-        Cmd::Export { pod, output } => {
+        Cmd::Export {
+            pod,
+            output,
+            format,
+            allow_inconsistent,
+        } => {
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
             let mut stream = c
-                .export_pod(PodRef { name: pod.clone() })
+                .export_pod(ExportRequest {
+                    name: pod.clone(),
+                    format: format.unwrap_or_default(),
+                    allow_inconsistent,
+                })
                 .await?
                 .into_inner();
-            // Raw archive bytes go to stdout/file — progress stays on
-            // stderr so `export db | ssh host rustypods load -` works.
             use tokio::io::AsyncWriteExt;
             let mut out: Box<dyn tokio::io::AsyncWrite + Unpin> = match &output {
                 Some(p) => Box::new(
@@ -1682,17 +1712,39 @@ async fn main() -> Result<()> {
                 ),
                 None => Box::new(tokio::io::stdout()),
             };
-            let mut total = 0u64;
-            while let Some(chunk) = stream.next().await {
-                let data = chunk?.data;
-                total += data.len() as u64;
-                out.write_all(&data).await?;
-                eprint!("\rexporting {pod}: {}\x1b[K", fmt_bytes(total));
+            let write = async {
+                let mut total = 0u64;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    if !chunk.warning.is_empty() {
+                        eprintln!("\nwarning: {}", chunk.warning);
+                    }
+                    if chunk.data.is_empty() {
+                        continue;
+                    }
+                    total += chunk.data.len() as u64;
+                    out.write_all(&chunk.data).await?;
+                    eprint!("\rexporting {pod}: {}\x1b[K", fmt_bytes(total));
+                }
+                out.flush().await?;
+                eprintln!("\rexported {pod}: {}", fmt_bytes(total));
+                Ok::<(), anyhow::Error>(())
             }
-            out.flush().await?;
-            eprintln!("\rexported {pod}: {}", fmt_bytes(total));
+            .await;
+            if let Err(e) = write {
+                if let Some(p) = &output {
+                    match tokio::fs::remove_file(p).await {
+                        Ok(()) => eprintln!("removed partial archive {}", p.display()),
+                        Err(rm) => eprintln!(
+                            "warning: failed to remove partial archive {}: {rm}",
+                            p.display()
+                        ),
+                    }
+                }
+                return Err(e);
+            }
         }
-        Cmd::Load { file, name } => {
+        Cmd::Load { file, name, trust } => {
             // The unary reply only lands after the full upload — the
             // default 30s call timeout would cut big archives mid-send.
             let mut c = connect_timeout(
@@ -1714,10 +1766,13 @@ async fn main() -> Result<()> {
             };
             let (tx, rx) = tokio::sync::mpsc::channel::<ImportChunk>(8);
             tokio::spawn(async move {
-                if let Some(r) = &name {
+                if name.is_some() || trust {
                     let _ = tx
                         .send(ImportChunk {
-                            kind: Some(Kind::Options(ImportOptions { rename: r.clone() })),
+                            kind: Some(Kind::Options(ImportOptions {
+                                rename: name.unwrap_or_default(),
+                                trust,
+                            })),
                         })
                         .await;
                 }
@@ -1752,6 +1807,9 @@ async fn main() -> Result<()> {
                 .await?
                 .into_inner();
             eprintln!("\rimported {} ({})", pod.name, pod.rootfs);
+            for n in &pod.notes {
+                eprintln!("import: {n}");
+            }
         }
         Cmd::Rmsnap { pod, id } => {
             connect(cli.socket.clone(), cli.remote.clone())
