@@ -98,6 +98,33 @@ struct PodHealth {
 /// so an unbounded set_len is a RAM DoS.
 const SHM_MAX_BYTES: u64 = 4 << 30;
 
+/// Atomically swap two directory entries on the same mount.
+/// `RENAME_EXCHANGE` is the only way a crash cannot observe "neither
+/// name exists". Returns the raw io error so the caller can fall back.
+pub(crate) fn exchange_rename(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let ca = CString::new(a.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let cb = CString::new(b.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: both pointers are NUL-terminated CStrings live for the call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            ca.as_ptr(),
+            libc::AT_FDCWD,
+            cb.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn bad(e: impl Into<anyhow::Error>) -> Status {
     Status::invalid_argument(format!("{:#}", e.into()))
 }
@@ -2493,27 +2520,66 @@ impl PodControl for Svc {
             .to_path_buf();
         let staging = parent.join(format!("{pod}.rollback-new"));
         let backup = parent.join(format!("{pod}.rollback-old"));
-        // Leftovers from a crashed earlier rollback — clear before staging.
-        for p in [&staging, &backup] {
-            if p.exists() || p.is_symlink() {
-                self.st_delete(p).await?;
-            }
+        // Staging is a disposable clone. `.rollback-old` is the previous
+        // rootfs — never delete it before the swap has succeeded, or a
+        // crash in between leaves the pod with no tree.
+        if staging.exists() || staging.symlink_metadata().is_ok() {
+            self.st_delete(&staging).await?;
+        }
+        if !rootfs.exists() && backup.symlink_metadata().is_ok() {
+            std::fs::rename(&backup, &rootfs).map_err(int)?;
+            tracing::warn!("rollback {pod}: restored missing rootfs from .rollback-old");
         }
         self.st_clone(snap_path, &staging).await?;
-        if let Err(e) = std::fs::rename(&rootfs, &backup) {
-            let _ = self.st_delete(&staging).await;
+        if rootfs.exists() {
+            match exchange_rename(&rootfs, &staging) {
+                Ok(()) => {
+                    // staging now holds the previous tree.
+                    if let Err(e) = self.st_delete(&staging).await {
+                        tracing::warn!(
+                            "rollback {pod}: previous rootfs left at {}: {e}",
+                            staging.display()
+                        );
+                    }
+                    if backup.symlink_metadata().is_ok() {
+                        if let Err(e) = self.st_delete(&backup).await {
+                            tracing::warn!("rollback {pod}: leftover .rollback-old: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    if backup.symlink_metadata().is_ok() {
+                        let _ = self.st_delete(&staging).await;
+                        return Err(int(anyhow::anyhow!(
+                            "atomic exchange failed ({e}) and {pod}.rollback-old already exists — refusing to delete it"
+                        )));
+                    }
+                    if let Err(re) = std::fs::rename(&rootfs, &backup) {
+                        let _ = self.st_delete(&staging).await;
+                        return Err(int(anyhow::anyhow!(
+                            "exchange failed ({e}); rename aside also failed: {re}"
+                        )));
+                    }
+                    if let Err(re) = std::fs::rename(&staging, &rootfs) {
+                        let restore = std::fs::rename(&backup, &rootfs).err();
+                        let _ = self.st_delete(&staging).await;
+                        return Err(int(match restore {
+                            Some(r) => anyhow::anyhow!(
+                                "exchange failed ({e}); install failed ({re}); restore failed ({r})"
+                            ),
+                            None => anyhow::anyhow!(
+                                "exchange failed ({e}); install failed ({re}); original restored"
+                            ),
+                        }));
+                    }
+                    if let Err(de) = self.st_delete(&backup).await {
+                        tracing::warn!("rollback {pod}: leftover .rollback-old: {de}");
+                    }
+                }
+            }
+        } else if let Err(e) = std::fs::rename(&staging, &rootfs) {
             return Err(int(e));
         }
-        if let Err(e) = std::fs::rename(&staging, &rootfs) {
-            // Swap half-done: try to put the original back before reporting.
-            let restore_err = std::fs::rename(&backup, &rootfs).err();
-            let _ = self.st_delete(&staging).await;
-            return Err(int(match restore_err {
-                Some(r) => anyhow::anyhow!("{e:#}; restore also failed: {r:#}"),
-                None => e.into(),
-            }));
-        }
-        self.st_delete(&backup).await?;
         {
             let mut st = self.st.lock().await;
             if let Some(m) = st.pods.get_mut(&pod) {
@@ -4726,6 +4792,54 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Repair pod directories left by a crash: restore `.rollback-old` when
+/// it is the only rootfs, drop disposable staging, and quarantine orphan
+/// rootfs dirs (no conf) so the name can be reused. Nothing here deletes
+/// the only copy of a pod's data. `.import-*` / `.export-*` are left for
+/// the transfer sweep.
+async fn reconcile_pod_dirs(cfg: &Config, storage: &Arc<dyn StorageDriver>, st: &Mutex<State>) {
+    let pods_dir = cfg.pods_dir();
+    let conf_names: BTreeSet<String> = {
+        let guard = st.lock().await;
+        guard.pods.keys().cloned().collect()
+    };
+    let entries: Vec<String> = match std::fs::read_dir(&pods_dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("startup reconcile: read {}: {e}", pods_dir.display());
+            return;
+        }
+    };
+    let actions = state::plan_rootfs_reconcile(&entries, &conf_names);
+    for action in actions {
+        match action {
+            state::RootfsAction::Rename { from, to } => {
+                let src = pods_dir.join(&from);
+                let dst = pods_dir.join(&to);
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => tracing::info!("startup reconcile: renamed {from} → {to}"),
+                    Err(e) => {
+                        tracing::error!("startup reconcile: rename {from} → {to} failed: {e}")
+                    }
+                }
+            }
+            state::RootfsAction::Delete { name } => {
+                let path = pods_dir.join(&name);
+                match storage.delete_rootfs(&path) {
+                    Ok(()) => tracing::info!("startup reconcile: removed {name}"),
+                    Err(e) => tracing::error!("startup reconcile: remove {name} failed: {e:#}"),
+                }
+            }
+            state::RootfsAction::Report { message } => {
+                tracing::error!("startup reconcile: {message}");
+            }
+        }
+    }
+}
+
 pub async fn serve(cfg: Config) -> Result<()> {
     for d in [
         cfg.images_dir(),
@@ -4801,6 +4915,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     engine.init().await?;
 
     let st = Arc::new(Mutex::new(state::load(&cfg.data_dir)?));
+    reconcile_pod_dirs(&cfg, &storage, &st).await;
     let metrics: MetricsMap = Default::default();
     let listeners: ListenerMap = Default::default();
     let svc = Svc {
@@ -5120,6 +5235,31 @@ mod tests {
 
     fn meta_plain(name: &str) -> PodMeta {
         meta_with_ingress(name, &[])
+    }
+
+    #[test]
+    fn exchange_rename_swaps_directories() {
+        let dir = std::env::temp_dir().join(format!("rp-xchg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("old"), "old").unwrap();
+        std::fs::write(b.join("new"), "new").unwrap();
+        match super::exchange_rename(&a, &b) {
+            Ok(()) => {
+                assert_eq!(std::fs::read_to_string(a.join("new")).unwrap(), "new");
+                assert_eq!(std::fs::read_to_string(b.join("old")).unwrap(), "old");
+            }
+            Err(e) => {
+                // Some filesystems reject RENAME_EXCHANGE; the rollback
+                // path falls back. The call itself must not panic.
+                assert!(e.raw_os_error().is_some(), "{e}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -752,6 +752,118 @@ fn migrate_json(data_dir: &Path) {
     tracing::info!("state.json migrated to conf/*.conf");
 }
 
+/// What startup should do with one name under the pods directory.
+/// Deletes are only planned for trees that are no longer the sole copy
+/// (spent `.rollback-old` after the live rootfs is back, or `.rollback-new`
+/// staging once a rootfs exists).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootfsAction {
+    Rename {
+        from: String,
+        to: String,
+    },
+    Delete {
+        name: String,
+    },
+    /// Logged, data left in place.
+    Report {
+        message: String,
+    },
+}
+
+/// Plan startup repair from directory basenames plus the set of pod names
+/// that have a loadable conf. `.import-*` / `.export-*` are ignored (the
+/// transfer path owns them). `.rollback-old` is restored when it is the
+/// only rootfs, and never deleted until a live rootfs exists.
+pub fn plan_rootfs_reconcile(
+    entries: &[String],
+    conf_names: &std::collections::BTreeSet<String>,
+) -> Vec<RootfsAction> {
+    let mut present: std::collections::BTreeSet<String> = entries.iter().cloned().collect();
+    let mut actions = Vec::new();
+    let olds: Vec<String> = present
+        .iter()
+        .filter(|n| n.ends_with(".rollback-old"))
+        .cloned()
+        .collect();
+    for old in olds {
+        let stem = old.trim_end_matches(".rollback-old").to_string();
+        if stem.is_empty() || present.contains(&stem) {
+            actions.push(RootfsAction::Delete { name: old.clone() });
+        } else {
+            actions.push(RootfsAction::Rename {
+                from: old.clone(),
+                to: stem.clone(),
+            });
+            present.insert(stem);
+        }
+        present.remove(&old);
+    }
+    let news: Vec<String> = present
+        .iter()
+        .filter(|n| n.ends_with(".rollback-new"))
+        .cloned()
+        .collect();
+    for staging in news {
+        let stem = staging.trim_end_matches(".rollback-new").to_string();
+        if stem.is_empty() || present.contains(&stem) {
+            actions.push(RootfsAction::Delete {
+                name: staging.clone(),
+            });
+        } else {
+            actions.push(RootfsAction::Rename {
+                from: staging.clone(),
+                to: stem.clone(),
+            });
+            present.insert(stem);
+        }
+        present.remove(&staging);
+    }
+    let mut orphans: Vec<String> = present
+        .iter()
+        .filter(|n| {
+            !n.starts_with(".import-")
+                && !n.starts_with(".export-")
+                && !n.ends_with(".orphan")
+                && !n.contains(".orphan-")
+                && !conf_names.contains(n.as_str())
+        })
+        .cloned()
+        .collect();
+    orphans.sort();
+    for name in orphans {
+        let mut dest = format!("{name}.orphan");
+        if present.contains(&dest) {
+            dest = format!("{name}.orphan-{}", now_unix());
+        }
+        if present.contains(&dest) {
+            actions.push(RootfsAction::Report {
+                message: format!(
+                    "orphan rootfs '{name}' left in place — quarantine name '{dest}' is taken"
+                ),
+            });
+        } else {
+            actions.push(RootfsAction::Rename {
+                from: name.clone(),
+                to: dest.clone(),
+            });
+            present.insert(dest);
+        }
+        present.remove(&name);
+    }
+    let mut missing: Vec<&String> = conf_names
+        .iter()
+        .filter(|n| !present.contains(*n))
+        .collect();
+    missing.sort();
+    for name in missing {
+        actions.push(RootfsAction::Report {
+            message: format!("pod '{name}' has a conf but no rootfs"),
+        });
+    }
+    actions
+}
+
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -993,5 +1105,49 @@ mod tests {
         save_mesh(&dir, &MeshConf::default()).unwrap();
         assert!(load_mesh(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rootfs_reconcile_restores_rollback_and_quarantines_orphans() {
+        let conf = ["web".to_string(), "ghost".to_string()]
+            .into_iter()
+            .collect();
+        let entries = vec![
+            "web.rollback-old".into(),
+            "web.rollback-new".into(),
+            "db".into(),
+            ".import-abc".into(),
+            ".export-xyz".into(),
+        ];
+        let actions = plan_rootfs_reconcile(&entries, &conf);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Rename { from, to }
+                if from == "web.rollback-old" && to == "web"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Delete { name } if name == "web.rollback-new"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Rename { from, to } if from == "db" && to == "db.orphan"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Report { message } if message.contains("ghost")
+        )));
+        assert!(!actions.iter().any(|a| format!("{a:?}").contains("import")));
+        assert!(!actions.iter().any(|a| format!("{a:?}").contains("export")));
+        // Both the live rootfs and the backup: do not delete the live tree.
+        let both = plan_rootfs_reconcile(&["web".into(), "web.rollback-old".into()], &conf);
+        assert!(both.iter().any(|a| matches!(
+            a,
+            RootfsAction::Delete { name } if name == "web.rollback-old"
+        )));
+        assert!(!both.iter().any(|a| matches!(
+            a,
+            RootfsAction::Delete { name } if name == "web"
+        )));
     }
 }
