@@ -5584,10 +5584,23 @@ pub async fn serve(cfg: Config) -> Result<()> {
         std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
     }
     state::secure_conf_dirs(&cfg.data_dir)?;
+    std::fs::create_dir_all(cfg.data_dir.join("snapshots"))
+        .with_context(|| format!("mkdir {}/snapshots", cfg.data_dir.display()))?;
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(cfg.resolv_dir(), std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod 0700 {}", cfg.resolv_dir().display()))?;
+        // Rootfs trees keep image-owned setuid-root binaries (pulled or
+        // imported images included); a traversable parent would let any
+        // local host user execute them. nspawn mounts as root and
+        // pivot_roots, so pods never walk these parents.
+        for d in [
+            cfg.resolv_dir(),
+            cfg.images_dir(),
+            cfg.pods_dir(),
+            cfg.data_dir.join("snapshots"),
+        ] {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 {}", d.display()))?;
+        }
     }
     // SIGKILL'd pulls/imports leave .layer-*/.export-* blobs behind.
     oci::sweep_tmpfiles(&cfg.images_dir());

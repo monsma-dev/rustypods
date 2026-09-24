@@ -370,6 +370,11 @@ through truncation.
   processes do NOT inherit it (nsenter doesn't carry env). Config,
   not a vault. Confs that store env are mode 0600 under 0700
   `conf/` directories.
+- `images/`, `pods/`, `snapshots/` (and `resolv/`) are forced to 0700
+  at every daemon start: rootfs trees carry root-owned setuid binaries
+  from images, and a traversable parent makes each one a local-user
+  privilege escalation on the host. Nothing outside the daemon walks
+  them (nspawn mounts as root, then pivot_roots).
 - `--env-file` parsing: blank lines + `#` comments skipped, no shell
   expansion, `A=$HOME` stays literal; `--env` flags override file
   entries per key.
