@@ -139,7 +139,10 @@ rustypodsd does it itself:
   chain, DOCKER-USER pattern) are `ct state established,related`,
   `ct status dnat`, and `iifname "ve-*"` (pod egress and pod↔pod).
   Never `ip daddr 10.220.0.0/16 accept` — that let any neighbour routing
-  the pod prefix hit unpublished ports. firewalld still gets the veth
+  the pod prefix hit unpublished ports. Pod↔pod is allowed only because
+  both ends are `ve-*` (Kubernetes-style). `isolated = true` drops
+  forwarded traffic whose source or dest is that pod and the other
+  address is still inside the pod pool. firewalld still gets the veth
   in the trusted zone for egress; the DNAT match is what limits who
   can open a published port.
 - Required sysctls: `net.ipv4.ip_forward=1`,

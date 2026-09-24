@@ -70,6 +70,9 @@ pub struct StackPod {
     /// Let this member open connections to host-local addresses.
     #[serde(default)]
     pub host_access: bool,
+    /// Drop forwarded traffic between this member and other pod veths.
+    #[serde(default)]
+    pub isolated: bool,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.

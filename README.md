@@ -190,7 +190,9 @@ pool overlaps an existing host route. The daemon manages its own `ip rustypods` 
 - masquerade for pod egress
 - foreign FORWARD chains get marker accepts for DNATed flows, established
   replies, and packets that arrive on `ve-*` — not a blanket accept of
-  the whole pod prefix, so an L2 neighbour cannot reach unpublished ports
+  the whole pod prefix, so an L2 neighbour cannot reach unpublished ports.
+  Pod-to-pod traffic is allowed (both ends are `ve-*`). Set
+  `isolated = true` on a pod to drop traffic between it and other pods.
 
 We do **not** use nspawn's `--port`: it depends on the host side of the veth
 being managed by systemd-networkd (its `80-container-ve.network` provides the

@@ -144,6 +144,7 @@ mod tests {
             env: vec![],
             volumes: vec![],
             host_access: false,
+            isolated: false,
         }
     }
 

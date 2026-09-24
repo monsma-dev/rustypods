@@ -995,10 +995,23 @@ pub fn nat_script<'a>(
     let mut gw: Option<u32> = None;
     let mut host_access_v4: Vec<String> = Vec::new();
     let mut host_access_v6: Vec<String> = Vec::new();
+    let mut isolate = String::new();
+    let v4cidr_pool = pool().v4_cidr();
+    let v6cidr_pool = pool().v6_cidr();
     for m in pods.filter(|m| m.net_index > 0 && running.contains(&m.name)) {
         if m.host_access {
             host_access_v4.push(pod_ip(m.net_index).to_string());
             host_access_v6.push(pod_ip6(m.net_index).to_string());
+        }
+        if m.isolated {
+            let v4 = pod_ip(m.net_index);
+            let v6 = pod_ip6(m.net_index);
+            isolate.push_str(&format!(
+                "    ip saddr {v4} ip daddr {v4cidr_pool} drop\n\
+                 \x20   ip daddr {v4} ip saddr {v4cidr_pool} drop\n\
+                 \x20   ip6 saddr {v6} ip6 daddr {v6cidr_pool} drop\n\
+                 \x20   ip6 daddr {v6} ip6 saddr {v6cidr_pool} drop\n"
+            ));
         }
         if m.ingress_gateway {
             // Exactly one gateway is enforced at load; last one wins if
@@ -1143,6 +1156,11 @@ pub fn nat_script<'a>(
          \x20   iifname \"ve-*\" ip6 daddr fd00::/8 udp dport 5305 accept\n\
          {host_ok}\
          \x20   iifname \"ve-*\" fib daddr type local drop\n\
+         \x20 }}\n\
+         \x20 chain isolate {{\n\
+         \x20   type filter hook forward priority -10; policy accept;\n\
+         \x20   # isolated pods: no pod↔pod. Outside egress and DNAT stay.\n\
+         {isolate}\
          \x20 }}\n\
          }}\n"
     );
@@ -1322,6 +1340,7 @@ mod tests {
             env: vec![],
             volumes: vec![],
             host_access: false,
+            isolated: false,
         }
     }
 
@@ -1424,6 +1443,18 @@ mod tests {
         assert!(s.contains("ip saddr != { 10.220.2.2 } ip daddr 127.0.0.0/8 drop"));
         assert!(s.contains("ip saddr 10.220.2.2 accept"));
         assert!(s.contains("ip6 saddr fd22:220:2::2 accept"));
+    }
+
+    #[test]
+    fn isolated_pod_drops_pod_to_pod_only() {
+        let mut db = pod_meta("db", 2, &["5432:5432"]);
+        db.isolated = true;
+        let s = nat_script([&db].into_iter(), &running(&["db"]));
+        assert!(s.contains("ip saddr 10.220.2.2 ip daddr 10.220.0.0/16 drop"));
+        assert!(s.contains("ip daddr 10.220.2.2 ip saddr 10.220.0.0/16 drop"));
+        let plain = pod_meta("web", 1, &["0.0.0.0:8080:80"]);
+        let s = nat_script([&plain].into_iter(), &running(&["web"]));
+        assert!(!s.contains("ip saddr 10.220.1.2 ip daddr"));
     }
 
     #[test]
