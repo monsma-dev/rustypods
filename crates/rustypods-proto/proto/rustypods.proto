@@ -58,7 +58,7 @@ service PodControl {
   // and reconstruct it on any host. Export streams the archive out;
   // Import consumes the archive as a client stream (first chunk may
   // carry ImportOptions for a rename).
-  rpc ExportPod(PodRef) returns (stream ExportChunk);
+  rpc ExportPod(ExportRequest) returns (stream ExportChunk);
   rpc ImportPod(stream ImportChunk) returns (Pod);
 
   // Multi-host mesh (Wave I): userspace WireGuard (BoringTun) between
@@ -165,6 +165,10 @@ message PullImageRequest {
   string reference = 1;
   // Optional image name; default = "<repo-basename>-<tag>" slug.
   string name = 2;
+  // Clear S_ISUID/S_ISGID while extracting layers. Default keeps them:
+  // images ship sudo/ping, and a user namespace contains that. Pods with
+  // private_users=false are trusted-images-only.
+  bool strip_setuid = 3;
 }
 
 enum PodState {
@@ -235,6 +239,8 @@ message Pod {
   // every peer host. "" when the mesh is not initialized or the pod
   // has no private netns.
   string mesh_ip = 24;
+  // Import response only: what sanitize stripped. Empty on every other RPC.
+  repeated string notes = 25;
 }
 
 message PodList {
@@ -273,8 +279,21 @@ message VolumeInfoList {
 // One frame of a pod export archive (header+manifest in the first
 // chunk, then raw btrfs-send/tar payload bytes). The archive format is
 // opaque to the wire — the daemon owns it.
+message ExportRequest {
+  string name = 1;
+  // "" = auto (btrfs send on btrfs, tar elsewhere). "tar" forces tar
+  // even on a btrfs host. "btrfs" requires btrfs storage.
+  string format = 2;
+  // When cgroup freeze fails, still export (crash-consistent, like a
+  // power cut). Default is to abort so that failure is not silent.
+  bool allow_inconsistent = 3;
+}
+
 message ExportChunk {
   bytes data = 1;
+  // Operator notice (freeze skipped, …). Not archive bytes — clients
+  // print it and write only `data`.
+  string warning = 2;
 }
 
 // Client → daemon import stream: an optional leading options frame,
@@ -288,6 +307,9 @@ message ImportChunk {
 
 message ImportOptions {
   string rename = 1; // import under a different pod name ("" = keep)
+  // Keep exported binds, ports, env, autostart, restart, healthcheck
+  // and private_users=false. Default strips those host-root grants.
+  bool trust = 2;
 }
 
 // --- Multi-host mesh (Wave I) ---

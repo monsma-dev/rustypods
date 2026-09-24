@@ -428,15 +428,29 @@ async fn pod_exec(
     }))
 }
 
-/// `GET /v1/pods/:name/export` — stream the pod archive
-/// (rootfs + conf + image conf + attached volumes) as an octet-stream
-/// download. Pipe straight into `rustypods import` on another host.
+/// `GET /v1/pods/:name/export?format=tar&allow_inconsistent=true`
 async fn export_pod_http(
     State(s): State<Svc>,
     Path(name): Path<String>,
+    Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiErr> {
-    let stream = s.export_archive(&name).await.map_err(api_err)?;
-    let bytes = stream.map(|c| c.map(|c| Bytes::from(c.data)));
+    let stream = s
+        .export_archive(
+            &name,
+            q.format.as_deref().unwrap_or(""),
+            q.allow_inconsistent.unwrap_or(false),
+        )
+        .await
+        .map_err(api_err)?;
+    let warn_name = name.clone();
+    let bytes = stream.map(move |c| {
+        c.map(|c| {
+            if !c.warning.is_empty() {
+                tracing::warn!("export {warn_name}: {}", c.warning);
+            }
+            Bytes::from(c.data)
+        })
+    });
     Response::builder()
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(
@@ -447,12 +461,18 @@ async fn export_pod_http(
         .map_err(|e| api_err(Status::internal(format!("{e}"))))
 }
 
-/// `POST /v1/import?name=<rename>` — upload an archive produced by
-/// export (same wire format as the gRPC client stream) and register
-/// the reconstructed pod. `?name=` imports under a different name.
+/// `POST /v1/import?name=<rename>&trust=true` — upload an archive.
+/// Without `trust=true` host-root grants in the pod conf are stripped.
+#[derive(Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+    allow_inconsistent: Option<bool>,
+}
+
 #[derive(Deserialize)]
 struct ImportQuery {
     name: Option<String>,
+    trust: Option<bool>,
 }
 
 async fn import_pod_http(
@@ -462,9 +482,17 @@ async fn import_pod_http(
 ) -> Result<Json<Pod>, ApiErr> {
     use rustypods_proto::rpc::import_chunk::Kind;
     let rename = q.name.filter(|n| !n.is_empty());
-    let options = rename.map(|r| ImportChunk {
-        kind: Some(Kind::Options(ImportOptions { rename: r })),
-    });
+    let trust = q.trust.unwrap_or(false);
+    let options = if rename.is_some() || trust {
+        Some(ImportChunk {
+            kind: Some(Kind::Options(ImportOptions {
+                rename: rename.unwrap_or_default(),
+                trust,
+            })),
+        })
+    } else {
+        None
+    };
     let data = req.into_body().into_data_stream().map(|b| {
         b.map(|b| ImportChunk {
             kind: Some(Kind::Data(b.to_vec())),

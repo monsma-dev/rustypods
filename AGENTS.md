@@ -376,37 +376,71 @@ through truncation.
 
 ## Pod export/import (Wave H)
 
-`rustypods export <pod> [-o file]` → one opaque archive stream:
-`[8B magic "RPEX0001"][u32 len][manifest JSON][payload]`. Payload =
-multi-subvolume `btrfs send` (needs `-r` ro snapshots — `clone_rootfs`
-makes rw ones, use `storage::btrfs::snapshot_ro`) on btrfs hosts, `tar`
-elsewhere; both name entries `<pod>`/`<vol>` so `btrfs receive`/`tar
--x` recreate the same layout in staging. `rustypods load <file|->
-[--name x]` imports.
+`rustypods export <pod> [-o file] [--format tar|btrfs] [--allow-inconsistent]`
+writes one archive stream. New archives are version 2:
 
-- Running pods are cgroup-frozen (`cgroup.freeze` on the machined
-  scope) for the snapshot window only — point-in-time across rootfs +
-  volumes, ms-scale pause. Freeze is inside the SAME blocking closure
-  as the snapshots so unfreeze can't be skipped.
-- `btrfs receive` lands subvols ro WITH `received_uuid` — `property
-  set ro false` is REFUSED on those (the uuid serves incremental
-  sends). The canonical move is an rw `subvolume snapshot` into place
-  (= clone_rootfs) and deleting the ro staging copy.
-- Import sanitizes: started=false, net_index=0 (a /30 can't move
-  hosts), stack="", ingress_gateway=false. Image CONF travels (pods
-  resolve entrypoint/env from ImageMeta at start) — the image tree
-  never does; the pod rootfs is complete.
-- Export refuses the managed gateway pod (per-host infrastructure).
-- Name/volume collisions refuse before payload lands; existing volume
-  names fail hard (never overwrite data). Volume dirs get 0777 like
+```
+[8B "RPEX0002"][u32 LE manifest_len][manifest JSON]
+[payload]
+[8B "RPEXEND1"][u64 LE payload_len][32B SHA-256(payload)]
+```
+
+The hash covers payload bytes only. `load` stages the payload, checks
+the trailer, and only then unpacks and moves the trees into place. A
+mismatch or a short file deletes staging and fails; `export -o file`
+deletes the partial file when the stream errors (non-zero exit).
+`RPEX0001` (no trailer) still loads, and the CLI prints that the
+checksum was not verified.
+
+Payload is multi-subvolume `btrfs send` (needs `-r` ro snapshots —
+`clone_rootfs` makes rw ones, use `storage::btrfs::snapshot_ro`) on
+btrfs hosts, or `tar` elsewhere and whenever `--format tar` is set.
+Both name entries `<pod>`/`<vol>`. Tar uses GNU tar
+`--numeric-owner --xattrs --xattrs-include='*' --acls` on create.
+Trusted extract uses the same flags plus `--no-overwrite-dir` and does
+not pass `--absolute-names` (GNU tar strips a leading `/`) or
+`--no-same-permissions` (rootfs setuid bits must survive). Untrusted
+tar extract is in-process: numeric ownership when root, device/fifo
+nodes skipped (nspawn provides `/dev`), `..` and absolute paths
+refused. `btrfs receive --chroot` confines receive to the staging dir;
+the payload is fed on stdin so the stream is open before the chroot.
+
+`rustypods load <file|-> [--name x] [--trust]` imports. The pod op lock
+is held for the whole export stream and the whole import, so
+destroy/rollback cannot run mid-transfer. Staging dirs are
+`.export-<pid>-<n>-<rand>` / `.import-…`. Daemon start removes leftover
+staging dirs older than the process (`transfer::sweep_stale_staging`).
+
+- Running pods are cgroup-frozen for the snapshot window only. A drop
+  guard writes `0` back (retried); if that still fails the daemon logs
+  an error — the pod may stay frozen. Freeze failure aborts the export
+  unless `--allow-inconsistent` (crash-consistent, same as a power cut);
+  that warning is also stored in the manifest and printed by the CLI.
+- `btrfs receive` lands subvols ro WITH `received_uuid` — `property set
+  ro false` is REFUSED on those. The canonical move is an rw `subvolume
+  snapshot` into place and deleting the ro staging copy.
+- Import always clears started, net_index, stack and ingress_gateway.
+  Without `--trust` (REST `?trust=true` to keep them) it also forces
+  `private_users`, and strips binds, ports, ingress, host_access,
+  autostart, restart policy, healthchecks and pod env. Image env still
+  applies at start. The CLI prints each note. `--trust` keeps the
+  exported conf. Image CONF travels; the image tree never does.
+- A btrfs-send archive is rejected on a non-btrfs host before the
+  payload is unpacked — re-export with `--format tar`.
+- Import payload bytes are counted as they arrive, capped by
+  `RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB).
+- Export refuses the managed gateway pod.
+- Name/volume collisions refuse before the payload is committed;
+  existing volume names fail hard. Volume dirs get 0777 like
   ensure_volume.
-- REST: `GET /v1/pods/{name}/export` (octet-stream download) and
-  `POST /v1/import?name=` (body upload) — same archive, no temp copy.
-- Import is client-streaming→unary: the default 30s call timeout
-  would cut large uploads — the CLI uses connect_timeout(1h).
+- REST: `GET /v1/pods/{name}/export?format=tar&allow_inconsistent=true`
+  and `POST /v1/import?name=&trust=true`.
+- Import is client-streaming→unary: the CLI uses connect_timeout(1h).
 - Known gap: multi-subvolume consistency is freeze-window only, not a
-  memory checkpoint — apps see a crash-consistent state (like a clean
-  power cut). True live migration needs CRIU, out of scope.
+  memory checkpoint. True live migration needs CRIU, out of scope.
+- `pull --strip-setuid` clears S_ISUID/S_ISGID on OCI extract. The
+  default keeps them (sudo/ping) because user-namespace pods contain
+  that. Pods with `private_users=false` are trusted images only.
 
 ## Multi-host mesh (Wave I)
 
