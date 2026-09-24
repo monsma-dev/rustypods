@@ -419,6 +419,8 @@ fn health_from_proto(h: &HealthCheck) -> Result<state::HealthSpec> {
         interval_secs: h.interval_secs,
         timeout_secs: h.timeout_secs,
         retries: h.retries,
+        // Not on the wire yet — conf-only; config updates carry it over.
+        user: String::new(),
     })
 }
 
@@ -1850,15 +1852,27 @@ impl Svc {
         }
     }
 
-    /// exec probe: run argv inside the pod via the same nsenter+setpriv
-    /// path as `rustypods exec` — exit 0 = healthy.
+    /// exec probe: run argv inside the pod via the same nsenter path as
+    /// `rustypods exec` — exit 0 = healthy. Identity is `healthcheck.user`
+    /// from the conf; unset means pod root in userns pods but an
+    /// unprivileged user (nobody/65534) in pods WITHOUT a user namespace,
+    /// where root would be host root. A hung probe is group-killed and
+    /// reaped on timeout so it can't accumulate every interval.
     async fn probe_exec(&self, m: &PodMeta, spec: &state::HealthSpec, timeout: Duration) -> bool {
         let Some(leader) = self.engine.running_pid(&m.name).await else {
             return false;
         };
+        let rootfs = self.pod_rootfs(&m.name);
+        let user = if !spec.user.is_empty() {
+            spec.user.clone()
+        } else if m.private_users {
+            String::new()
+        } else {
+            exec::default_probe_user(&rootfs)
+        };
         let start = ExecStart {
             pod: m.name.clone(),
-            user: String::new(), // root
+            user,
             argv: spec.argv.clone(),
             tty: false,
             rows: 0,
@@ -1866,31 +1880,29 @@ impl Svc {
             env: vec![],
             workdir: String::new(),
         };
-        let argv = match exec::exec_argv(leader, &self.pod_rootfs(&m.name), &start, m.private_users)
-        {
-            Ok(a) => a,
+        let plan = match exec::exec_plan(leader, &rootfs, &start, m.private_users) {
+            Ok(p) => p,
             Err(e) => {
-                tracing::warn!("{}: exec probe argv: {e:#}", m.name);
+                tracing::warn!("{}: exec probe: {e:#}", m.name);
                 return false;
             }
         };
-        // Same spawn discipline as exec.rs run_pipe: pre_exec preserves
-        // stdin on STDIN_DUP_FD — without it the argv's `exec 0<&N`
-        // wrapper fails and every probe exits non-zero.
-        let mut scmd = std::process::Command::new(&argv[0]);
-        scmd.args(&argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            scmd.pre_exec(exec::preserve_stdin);
+        if plan.host_root {
+            tracing::debug!(
+                "{}: exec probe runs as HOST root (healthcheck.user = root, no userns)",
+                m.name
+            );
         }
-        let mut cmd = tokio::process::Command::from(scmd);
-        cmd.kill_on_drop(true);
-        match tokio::time::timeout(timeout, cmd.status()).await {
-            Ok(Ok(s)) => s.success(),
-            _ => false,
+        match exec::run_status(&plan, timeout).await {
+            Ok(Some(s)) => s.success(),
+            Ok(None) => {
+                tracing::warn!("{}: exec probe timed out — killed", m.name);
+                false
+            }
+            Err(e) => {
+                tracing::warn!("{}: exec probe spawn: {e:#}", m.name);
+                false
+            }
         }
     }
 
@@ -3473,7 +3485,9 @@ impl Svc {
             if let Some(r) = req.restart {
                 m.restart = r;
             }
-            if let Some(h) = new_hc {
+            if let Some(mut h) = new_hc {
+                // healthcheck.user is conf-only — keep it across proto updates.
+                h.user = std::mem::take(&mut m.healthcheck.user);
                 m.healthcheck = h;
             }
             if let Some(el) = req.env {

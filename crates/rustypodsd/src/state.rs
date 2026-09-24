@@ -269,6 +269,12 @@ pub struct HealthSpec {
     pub timeout_secs: u32,
     #[serde(default)]
     pub retries: u32,
+    /// exec probe identity (image passwd name or numeric uid). "" = pod
+    /// root in userns pods, nobody/65534 in pods without a user namespace
+    /// (root there is HOST root — set `user = "root"` explicitly to accept).
+    /// Conf-only for now; survives `config --healthcheck` updates.
+    #[serde(default)]
+    pub user: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1426,6 +1432,7 @@ mod tests {
             interval_secs: 15,
             timeout_secs: 2,
             retries: 5,
+            user: String::new(),
         };
         save_pod(&dir, &m).unwrap();
         let back = load_pod(&dir, "hc").unwrap();
@@ -1445,6 +1452,22 @@ mod tests {
         let old = load_pod(&dir, "legacy").unwrap();
         assert_eq!(old.restart, "");
         assert_eq!(old.healthcheck.kind, "");
+        // A [healthcheck] table written before `user` existed loads with
+        // "" (→ probe identity chosen by userns mode), and an explicit
+        // user round-trips.
+        let pre_user = dir.join("conf").join("pods").join("preuser.conf");
+        std::fs::write(
+            &pre_user,
+            "name = 'preuser'\nimage = 'img'\ncreated_unix = 0\n\
+             [healthcheck]\nkind = 'exec'\nargv = ['true']\n",
+        )
+        .unwrap();
+        let pu = load_pod(&dir, "preuser").unwrap();
+        assert_eq!(pu.healthcheck.kind, "exec");
+        assert_eq!(pu.healthcheck.user, "");
+        m.healthcheck.user = "nobody".into();
+        save_pod(&dir, &m).unwrap();
+        assert_eq!(load_pod(&dir, "hc").unwrap().healthcheck.user, "nobody");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

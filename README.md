@@ -155,6 +155,16 @@ namespace. They join a pre-made shared netns via
 the netns's owning userns (init_user_ns) — a pick-userns child never has
 that, so the pod can't even boot. Standalone `create` pods do get userns.
 
+**Pods without a user namespace are for trusted code only.** Root inside
+such a pod (`--desktop`, `--no-private-users`, stack members) *is* host
+uid 0 — confined by nspawn's mount/pid/net namespaces and its default
+capability set, not by a userns. `rustypods shell`/`exec`/`cp` therefore
+refuse an unspecified user there and require an explicit `--user root`
+(logged as a warning on the daemon); the default `--user $USER` path runs
+as that unprivileged user with `NO_NEW_PRIVS` set, so `sudo` inside such
+a session does not work — use `--user root` instead. Exec healthchecks in
+these pods default to `nobody` (see below).
+
 ## Storage quotas (btrfs qgroups)
 
 ```bash
@@ -283,13 +293,26 @@ stack.toml is idempotent — confs update, running rootfs stays.
 
 `rustypods shell` no longer uses `machinectl`: the daemon runs
 `nsenter -t <leader> -m -u -i -n -p` with a host pty (`setsid`+`TIOCSCTTY`
-→ real job control), drops to the container user via `setpriv` with passwd
-data from the image, and joins the leader's cgroup atomically
+→ real job control) and joins the leader's cgroup atomically
 (`nsenter --cgroup --join-cgroup`): exec'd processes land in
 `machine-<pod>.scope/payload/init.scope` — inside the pod's scope, so the
 pod's MemoryHigh/CPUQuota apply to them. SIGWINCH and exit codes are
 forwarded over the stream; machined is only used for the leader-pid
 lookup.
+
+No binary from the pod image ever runs with more privilege than the
+requested user: the daemon prepares the identity host-side (bounding set
+reduced to nspawn's default, gid + supplementary groups from the image's
+`/etc/group`, environment via a cleared env) and `nsenter --setuid`
+switches uid right after entering the namespaces, so the first image
+binary executed is already the unprivileged user. In userns pods root is
+pod root; in pods without a userns root is host root and must be requested
+explicitly (`--user root`).
+
+A session's processes form one process group; a timeout, a dropped REST
+call or a vanished client kills the whole group, including the pod-side
+child `nsenter -p` forks. Only payloads that call `setsid()` themselves
+survive that.
 
 Known limitation: `tty(1)` fails on path resolution (the pty fd lives in the
 host devpts); the fd itself works fully.
@@ -335,11 +358,11 @@ The host's `LANG` is forwarded on exec — a fresh OCI rootfs that hasn't
 generated it gets `C.UTF-8` instead, so locale-aware tools don't die; run
 `locale-gen` in the pod for the real locale.
 
-Note: non-userns pods (including `--desktop`) require util-linux `setpriv`
-inside the image for secure exec — the daemon drops the capability
-bounding set through it. Minimal BusyBox images lack a usable `setpriv`,
-so `shell`/`exec` there is intentionally refused rather than retaining
-host-root's bounding set.
+Exec healthchecks (`--healthcheck exec …`) run through the same path. In
+pods without a user namespace they default to the image's `nobody` (or
+bare uid 65534), never host root; set `user = "root"` (or any image user)
+under `[healthcheck]` in the pod conf to change that. A probe that
+outlives its timeout is killed as a whole process group and reaped.
 
 or over REST/JSON with the bearer token in `/run/rustypods/http-token`:
 
