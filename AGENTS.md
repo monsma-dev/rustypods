@@ -89,9 +89,67 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
 - `nsenter --wd=<path>` resolves against the host mountns before setns →
   `getcwd` fails in the container. Don't use it; `cd $HOME` in the login
   shell wrapper instead.
-- PTY: `openpty` via libc (`posix_openpt`+`grantpt`+`unlockpt`+`ptsname`),
-  slave as stdio + `setsid`/`TIOCSCTTY` in `pre_exec`. `tty(1)` fails on
-  path lookup (host devpts), fd semantics work fully.
+- **Privilege model (security audit 2026-09): no image binary may ever
+  run above the target identity.** The old chain nsenter→image
+  `setpriv`→image `env`→`/bin/sh` executed three pod-controlled binaries
+  as host root in non-userns pods (stack members, `--desktop`,
+  `--no-private-users`) — pod root replacing `/usr/bin/setpriv` owned
+  the host on the next `shell`/`cp`/REST exec/exec probe. Now
+  `exec::exec_plan` → `ExecPlan { argv, env, gid, groups, no_new_privs }`
+  and all identity work happens in the daemon's `pre_exec`
+  (`pre_exec_identity`, async-signal-safe syscalls only) or inside
+  nsenter itself:
+  - non-root target, no userns: pre_exec `setgroups`+`setgid` (from the
+    image's /etc/group — host ids == pod ids there), then a bare
+    `nsenter --setuid=<uid>`. Verified in util-linux 2.41 nsenter.c
+    main(): `-S` alone only calls `setuid()` (post-fork, after setns);
+    `-G` — and `--user` without `--preserve-credentials` — calls
+    `setgroups(0, NULL)` first, which is why gid work is daemon-side.
+    setuid root→non-root clears permitted/effective caps.
+  - non-root target, userns: `nsenter --user --setuid --setgid` (ids are
+    pod-relative, so they must be set after setns(user)). Supplementary
+    groups are dropped by nsenter here — accepted trade-off.
+  - root target, userns: nsenter's default uid/gid 0 in the pod userns;
+    the image's `setpriv --bounding-set` still runs (post-userns, as pod
+    root = the target's own trust domain) to restore nspawn's cap set.
+    The kernel resets the bounding set to FULL on setns(user)
+    (`set_cred_user_ns`), so a daemon-side drop can't do this.
+  - root target, no userns: HOST root minus nspawn's bounding set,
+    NO_NEW_PRIVS on, no seccomp. Refused unless the user is an explicit
+    `root`/`0` (CLI `--user root`, REST `"user":"root"`); `""` errors
+    with a hint. `run` logs a warning. Non-userns pods are **trusted
+    code only**.
+  - pre_exec always PR_CAPBSET_DROPs every cap outside
+    `NSPAWN_DEFAULT_CAPS` (nsenter needs only sys_admin/sys_ptrace/
+    setuid/setgid/dac_override — all kept) and sets
+    `PR_SET_NO_NEW_PRIVS` in non-userns pods (task flag, survives
+    setns/setuid/exec). nnp is deliberately NOT set in userns pods so
+    `sudo`/`yay` keep working there — a setuid binary only reaches pod
+    root, which the same caller may request with `--user root`.
+  - Payload env goes through `Command::env_clear().envs()` — nsenter
+    execvp()s with its environ — no image `env` binary. `nsenter` is
+    resolved on the DAEMON's PATH (`host_nsenter`): with env_clear std
+    would otherwise search the child's (container!) PATH, and a client
+    `PATH=` override could steer the host lookup.
+  - Verified host-side (util-linux 2.41.5, unprivileged `unshare -Ur`):
+    `-U --preserve-credentials -S 0` keeps the supplementary list and
+    only setuid()s; `-U` / `-U -S -G` call setgroups first.
+- Every spawn setsid()s in pre_exec (tty: + TIOCSCTTY). Timeout, client
+  disconnect and probe timeout kill the whole group (`kill(-pid,
+  SIGKILL)`, `exec::kill_pgrp`) — process groups are kernel-global, so
+  this reaches nsenter's forked child inside the pod pidns and its
+  descendants. Residual: a payload that setsid()s itself (daemons)
+  escapes; the pod cgroup can't be used (it's the pod's own init.scope).
+- PTY: `openpty` via libc (`posix_openpt`+`grantpt`+`unlockpt`+
+  `ptsname_r` — never `ptsname`, its static buffer races between
+  concurrent tty execs), master wrapped in `OwnedFd` immediately, then
+  O_NONBLOCK + `tokio::io::unix::AsyncFd` for BOTH directions (a
+  blocking `write_all` inside tokio::spawn parked a worker per stalled
+  session). The reader is a tokio task the waiter aborts after
+  DRAIN_GRACE, so a detached grandchild holding the slave can no longer
+  leak a thread+fd per session (old "L5"). Slave as stdio +
+  `setsid`/`TIOCSCTTY` in `pre_exec`. `tty(1)` fails on path lookup
+  (host devpts), fd semantics work fully.
 - util-linux ≤2.42 `nsenter --join-cgroup` **closes fd 0**: its
   `open_cgroup_procs()` declares `int cgroup_fd = 0` (not -1), so
   `open_target_fd` close()s stdin and /proc/<pid>/cgroup lands on it —
@@ -181,12 +239,20 @@ rustypodsd does it itself:
   means "was ever started" (drives Created/Stopped display), NOT "should
   be running". stop_pod records intent before engine.stop; start_pod
   clears it; a daemon restart loses intent (Docker-"always"-like).
-- Exec probes reuse `exec_argv` — the payload ends with an
-  `exec 0<&200` stdin-restore wrapper that ONLY works with
-  `pre_exec(exec::preserve_stdin)` on the spawn (util-linux ≤2.42
-  --join-cgroup closes fd 0). Spawning the argv without that hook makes
-  every probe exit non-zero — probes always "fail" while `rustypods exec`
-  works fine (burned an hour on this).
+- Exec probes reuse `exec::exec_plan` and spawn ONLY via
+  `exec::run_status` — the payload starts with an `exec 0<&9 9<&-`
+  stdin-restore wrapper that only works with exec.rs's pre_exec hook
+  (util-linux ≤2.42 --join-cgroup closes fd 0). Spawning the argv by
+  hand makes every probe exit non-zero — probes always "fail" while
+  `rustypods exec` works fine (burned an hour on this). `run_status`
+  also group-kills and reaps a probe that outlives its timeout — before,
+  a hung probe added one lingering pod-side process per interval.
+- Probe identity = `healthcheck.user` in the pod conf (`[healthcheck]
+  user = "…"`, image passwd name or numeric uid; conf-only, no
+  proto/CLI flag yet, preserved across `config --healthcheck`). Unset:
+  pod root in userns pods, but `nobody` (or bare uid 65534 when the
+  image has no nobody) in pods WITHOUT a user namespace — root there is
+  HOST root. Set `user = "root"` explicitly to accept that.
 - tcp/http probes dial `10.220.<idx>.2` (pod veth) for ":port"/"/path",
   or a numeric host:port verbatim — the daemon never resolves DNS.
 - Backoff: 2^n s per restart attempt, cap 60s, decays after 60s of
@@ -389,11 +455,16 @@ exit_code,timed_out,truncated}, 4MiB/stream cap, timeout ≤900s).
 
 - exec.rs's `run`/`run_pipe`/`run_tty` are generic over the inbound
   Stream — gRPC passes `tonic::Streaming`, REST `tokio_stream::empty()`.
-- Timeout kill is best-effort: dropping the receiver fires tx.closed()
-  → the waiter SIGKILLs the host-side nsenter — but `nsenter -p` forks,
-  so the in-pod payload is reparented to pod init and can linger until
-  it exits or the pod stops. Agents that must not leak should exec a
-  `pkill` cleanup or keep payloads self-terminating.
+- REST `user` follows the same rules as the CLI: `""` = pod root in
+  userns pods, REFUSED (400-ish internal error with a hint) in pods
+  without a user namespace — pass `"user":"root"` explicitly to run as
+  host root there, or an unprivileged image user.
+- Timeout kill: dropping the receiver fires tx.closed() → the waiter
+  `kill(-pgid, SIGKILL)`s the session's process group (every spawn
+  setsid()s), which includes nsenter's forked in-pod child and its
+  descendants, then reaps nsenter. Only payloads that setsid()
+  themselves survive; agents running such daemons should still `pkill`
+  or keep them self-terminating.
 
 ## Rootless podman caveat
 
