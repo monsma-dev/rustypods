@@ -38,6 +38,11 @@ LimitNOFILE=1048576
 # it does not load modules, set the clock, or use realtime scheduling,
 # and it is native-arch only.
 ProtectSystem=full
+# `ingress init --install-ca` / `uninstall-ca` write the CA into the host
+# trust store and run update-ca-certificates / update-ca-trust, which
+# rewrite the bundles under /etc. "-" skips paths another distro lacks.
+ReadWritePaths=-/usr/local/share/ca-certificates -/etc/ssl/certs \
+               -/etc/ca-certificates -/etc/pki/ca-trust
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectClock=true
