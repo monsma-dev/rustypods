@@ -1165,11 +1165,14 @@ pub fn plan_rootfs_reconcile(
                 name: staging.clone(),
             });
         } else {
-            actions.push(RootfsAction::Rename {
-                from: staging.clone(),
-                to: stem.clone(),
+            // A lone staging tree may be a half-finished clone (the
+            // reflink fallback copies file by file); never promote it
+            // to the live rootfs unattended.
+            actions.push(RootfsAction::Report {
+                message: format!(
+                    "'{staging}' has no live rootfs next to it — possibly an interrupted rollback clone; left in place, inspect and rename to '{stem}' by hand"
+                ),
             });
-            present.insert(stem);
         }
         present.remove(&staging);
     }
@@ -1644,5 +1647,13 @@ mod tests {
             a,
             RootfsAction::Delete { name } if name == "web"
         )));
+        let lone = plan_rootfs_reconcile(&["web.rollback-new".into()], &conf);
+        assert!(lone.iter().any(|a| matches!(
+            a,
+            RootfsAction::Report { message } if message.contains("web.rollback-new")
+        )));
+        assert!(!lone
+            .iter()
+            .any(|a| matches!(a, RootfsAction::Rename { .. } | RootfsAction::Delete { .. })));
     }
 }

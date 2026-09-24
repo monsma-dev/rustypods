@@ -5299,9 +5299,16 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
 /// the transfer sweep.
 async fn reconcile_pod_dirs(cfg: &Config, storage: &Arc<dyn StorageDriver>, st: &Mutex<State>) {
     let pods_dir = cfg.pods_dir();
+    // Quarantined confs still own their rootfs: fixing the conf by hand
+    // must find the tree where it was, not under `.orphan`.
     let conf_names: BTreeSet<String> = {
         let guard = st.lock().await;
-        guard.pods.keys().cloned().collect()
+        guard
+            .pods
+            .keys()
+            .cloned()
+            .chain(guard.quarantined.iter().map(|q| q.name.clone()))
+            .collect()
     };
     let entries: Vec<String> = match std::fs::read_dir(&pods_dir) {
         Ok(rd) => rd
