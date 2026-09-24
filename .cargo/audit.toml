@@ -1,10 +1,4 @@
-# Same three advisories as deny.toml. They are reachable only through
-# boringtun 0.6 (ring 0.16.20, curve25519-dalek 4.0.0-rc.3) and are fixed
-# on the mesh branch by upgrading boringtun to 0.7.1.
+# Keep in sync with [advisories].ignore in deny.toml.
 
 [advisories]
-ignore = [
-    "RUSTSEC-2024-0344",
-    "RUSTSEC-2025-0009",
-    "RUSTSEC-2025-0010",
-]
+ignore = []

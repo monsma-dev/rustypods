@@ -5,15 +5,9 @@
 
 [advisories]
 yanked = "deny"
-# boringtun 0.6 pulls ring 0.16.20 and curve25519-dalek 4.0.0-rc.3.
-# Fixed on the mesh branch by upgrading boringtun to 0.7.1. This branch
-# does not float that pin. cargo-audit ignores the same IDs in
-# .cargo/audit.toml so a new advisory still fails the scan.
-ignore = [
-    "RUSTSEC-2024-0344",
-    "RUSTSEC-2025-0009",
-    "RUSTSEC-2025-0010",
-]
+# Never ignore a reachable advisory to make the scan green; record any
+# exception here with its reason.
+ignore = []
 
 [licenses]
 unused-allowed-license = "allow"
@@ -33,13 +27,6 @@ allow = [
     "Unlicense",
     "CDLA-Permissive-2.0",
 ]
-
-# ring 0.16 publishes no SPDX field. The LICENSE file is the usual
-# MIT AND ISC AND OpenSSL combination; hash is what cargo-deny computed.
-[[licenses.clarify]]
-crate = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 multiple-versions = "warn"
