@@ -86,6 +86,36 @@ fn parse_positive_u64(s: &str) -> bool {
     s.trim().parse::<u64>().map(|v| v > 0).unwrap_or(false)
 }
 
+/// `/sys/fs/selinux/enforce` contents → a stable word for the doctor line.
+fn selinux_mode(enforce: Option<&str>) -> &'static str {
+    match enforce.map(str::trim) {
+        Some("1") => "enforcing",
+        Some("0") => "permissive",
+        _ => "disabled",
+    }
+}
+
+/// SELinux context of `path`, or a short reason it could not be read.
+/// `ls -Zd` prints `system_u:object_r:var_lib_t:s0 /path`.
+fn selinux_context(path: &Path) -> String {
+    if !path.exists() {
+        return format!("absent ({})", path.display());
+    }
+    let out = Command::new("ls")
+        .args(["-Zd", path.to_str().unwrap_or("")])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.split_whitespace()
+                .next()
+                .unwrap_or("unlabeled")
+                .to_string()
+        }
+        _ => "unreadable (ls -Zd failed)".into(),
+    }
+}
+
 /// Storage check verdict: btrfs only counts when btrfs-progs is installed —
 /// the driver shells out to `btrfs` for every subvolume op.
 fn storage_check(target: &Path, fs: Option<&str>, btrfs_progs: Option<&Path>) -> (Level, String) {
@@ -475,17 +505,16 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         Err(e) => chk!(Level::Warn, "systemd", "version probe failed: {e:#}"),
     }
 
-    let selinux = std::fs::read_to_string("/sys/fs/selinux/enforce")
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false);
-    if selinux {
-        chk!(
+    let enforce = std::fs::read_to_string("/sys/fs/selinux/enforce").ok();
+    let mode = selinux_mode(enforce.as_deref());
+    let ctx = selinux_context(Path::new("/var/lib/rustypods"));
+    match mode {
+        "enforcing" | "permissive" => chk!(
             Level::Warn,
             "selinux",
-            "enforcing; Fedora 44 validated — inspect AVCs on other SELinux policies"
-        );
-    } else {
-        chk!(Level::Pass, "selinux", "disabled or absent");
+            "{mode}; context of /var/lib/rustypods: {ctx}. Fedora 44 was validated enforcing — other policies are unverified. Opt in with `scripts/install-daemon.sh --selinux-label` (semanage fcontext var_lib_t + restorecon) and watch ausearch -m avc -ts recent"
+        ),
+        _ => chk!(Level::Pass, "selinux", "disabled or absent"),
     }
 
     // ── report ─────────────────────────────────────────────────────────
@@ -591,6 +620,14 @@ mod tests {
             missing_flags("--private-users", &["--private-users-chown"]),
             vec!["--private-users-chown".to_string()]
         );
+    }
+
+    #[test]
+    fn selinux_mode_words() {
+        assert_eq!(selinux_mode(Some("1\n")), "enforcing");
+        assert_eq!(selinux_mode(Some("0")), "permissive");
+        assert_eq!(selinux_mode(Some("")), "disabled");
+        assert_eq!(selinux_mode(None), "disabled");
     }
 
     #[test]

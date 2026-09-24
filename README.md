@@ -57,7 +57,7 @@ Supported distro families — the installer maps each to its package set
 | --- | --- | --- |
 | Debian/Ubuntu | Debian, Ubuntu, Mint, Pop!_OS, Neon, Raspbian, Kali | runtime + deployment live-tested on Debian 13 |
 | Fedora | Fedora 44 | full runtime + deployment live-tested under KVM with SELinux Enforcing, Btrfs, cgroup v2 |
-| RHEL family | RHEL, CentOS, Alma, Rocky, Oracle | package mapping checked; runtime/SELinux unverified |
+| RHEL family | RHEL, CentOS, Alma, Rocky, Oracle | required packages mapped; `btrfs-progs` is optional (not in RHEL 8/9 repos — reflink fallback). Runtime/SELinux still unverified |
 | Arch | Arch, Manjaro, EndeavourOS, CachyOS | distro detection + installer dry-run validated; runtime unverified |
 
 Release artifacts are currently built from source and should be compiled
@@ -70,10 +70,33 @@ On Arch-family systems the package database and installed packages must
 be current before installing (`pacman -Syu`) — the installer deliberately
 uses `pacman -S`, never `-Sy`, to avoid partial upgrades.
 
+On the RHEL family the installer does **not** fail the transaction when
+`btrfs-progs` is absent (Alma/RHEL/Rocky 8 and 9 do not ship it). It
+installs the required set (`systemd-container`, `nftables`, `iproute`,
+`util-linux`, `socat`) and warns that the reflink fallback will be used.
+If `dnf` cannot see `socat` or `systemd-container`, enable CRB (RHEL 9)
+or PowerTools (RHEL 8) and EPEL yourself — the installer does not enable
+repos. `--dry-run` prints that decision.
+
+SELinux: `rustypods doctor` reports the mode and the context of
+`/var/lib/rustypods`. Fedora 44 was validated enforcing with the default
+`var_lib_t`. Other policies are unverified. `--selinux-label` is opt-in:
+it runs `semanage fcontext` + `restorecon` (needs
+`policycoreutils-python-utils`) and is a no-op when SELinux is off.
+
 Unsupported distro: install the packages manually and re-run with
 `--skip-packages`. `--dry-run` prints the detected family, target
 user/uid, package commands and every path it would touch, without
-changing anything.
+changing anything and without root.
+
+Uninstall: `sudo bash scripts/uninstall-daemon.sh` stops and disables the
+unit, runs `rustypodsd teardown-net` (or deletes the nft tables and
+`rustypods-forward*` / `rustypods-mesh-*` rules), removes binaries, the
+unit, the polkit rule, `/etc/rustypods`, and the ingress CA from the host
+trust store. It prints `ip_forward`, IPv6 forwarding, and `accept_ra`
+and does **not** revert them. `/var/lib/rustypods` is kept unless
+`--purge-data` is passed, and `--purge-data` is refused while a pod is
+running. `--dry-run` needs no root.
 
 The daemon's allowed non-root uid goes in `/etc/rustypods/daemon.env`
 (written by the installer); the unit's `Environment=` default is 1000.
