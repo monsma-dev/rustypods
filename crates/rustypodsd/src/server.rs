@@ -5388,6 +5388,27 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
         );
     }
     let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
+    let inspect = SyncCommand::new("runuser")
+        .args(["-u", user, "--"])
+        .arg("env")
+        .arg(format!("XDG_RUNTIME_DIR=/run/user/{uid}"))
+        .args([
+            "podman",
+            "inspect",
+            "--format",
+            "{{json .HostConfig.IDMappings}}",
+            container,
+        ])
+        .output()
+        .context("runuser podman inspect")?;
+    if !inspect.status.success() {
+        bail!(
+            "podman inspect '{container}' failed — does the box exist? (podman ps -a): {}",
+            String::from_utf8_lossy(&inspect.stderr).trim()
+        );
+    }
+    let idmap = oci::IdMap::from_podman_json(&String::from_utf8_lossy(&inspect.stdout))
+        .with_context(|| format!("reading the id mapping of '{container}'"))?;
     let mut exp = SyncCommand::new("runuser")
         .args(["-u", user, "--"])
         .arg("env")
@@ -5421,7 +5442,7 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
     }
     std::fs::File::open(&tmp)
         .with_context(|| format!("open {}", tmp.display()))
-        .and_then(|f| oci::unpack_tar(f, dest))
+        .and_then(|f| oci::unpack_tar_remapped(f, dest, &idmap))
         .with_context(|| format!("extracting export into {}", dest.display()))
 }
 
