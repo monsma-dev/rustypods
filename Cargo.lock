@@ -2430,6 +2430,7 @@ dependencies = [
  "clap",
  "flate2",
  "http",
+ "hyper",
  "hyper-util",
  "libc",
  "oci-client",

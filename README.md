@@ -378,13 +378,31 @@ console log instead of the journal.
 The same PodControl surface is exposed as REST/JSON for automation and
 agents: `rustypodsd --http-addr 127.0.0.1:9180` (the default; `--http-addr ""`
 disables it). Every `/v1/*` request needs
-`Authorization: Bearer <token>` — the daemon generates the token at startup
-and writes it to `/run/rustypods/http-token` (mode `0400`, owned by the
-allowed uid). Requests carrying `Origin`/`Sec-Fetch-Site` headers are
-rejected (no browser-driven calls); `/healthz` stays open. The bind is
-loopback-only — a non-loopback `--http-addr` is refused unless
-`RUSTYPODS_HTTP_INSECURE=1` is set. Request bodies are snake_case;
-responses are the proto messages in camelCase JSON:
+`Authorization: Bearer <token>`. The daemon writes two tokens, mode `0400`,
+owned by the allowed uid, and **reuses them across restarts**:
+
+- `/run/rustypods/http-token` — full access (root-equivalent)
+- `/run/rustypods/http-token-ro` — GET only (list, stats, logs, export)
+
+Set `RUSTYPODS_HTTP_TOKEN_ROTATE=1` to mint new tokens at the next start.
+Requests carrying `Origin`/`Sec-Fetch-Site` are rejected (no browser-driven
+calls). `/healthz` stays open and returns 503 when the daemon cannot lock
+its state or reach machined. The bind is loopback-only. A non-loopback
+`--http-addr` is refused unless `RUSTYPODS_HTTP_INSECURE=1` is set; that
+flag logs a warning on every start and is **not** a supported remote path.
+Use SSH forwarding or the gRPC client instead:
+
+```bash
+ssh -L 9180:127.0.0.1:9180 host
+rustypods --remote host exec dev -- true
+```
+
+JSON bodies are limited to 1 MiB. `POST /v1/import` streams up to
+`RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB). Other handlers time out
+after 60s; `exec` may run up to 900s. Export, import, and logs are not
+cut by that deadline. The listener caps connections at 256 and drops
+HTTP/1 clients that don't finish their headers within 10s. Request bodies
+are snake_case; responses are the proto messages in camelCase JSON:
 
 ```
 GET    /healthz                      GET    /v1/daemon

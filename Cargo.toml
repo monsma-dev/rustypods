@@ -39,7 +39,7 @@ protoc-bin-vendored = "3"
 tower = "0.5"
 http = "1"
 hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1", "server-auto", "service"] }
 http-body-util = "0.1"
 arc-swap = "=1.9.2"
 axum-server = { version = "=0.8.0", features = ["tls-rustls-no-provider"] }
