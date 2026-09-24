@@ -42,8 +42,9 @@ pub struct Svc {
     /// How rootfs trees are cloned/capped — btrfs CoW or reflink fallback.
     storage: Arc<dyn StorageDriver>,
     /// Per-pod op serializer: start/stop/destroy/commit/clone/rollback and
-    /// stack member ops must never interleave on the same pod name. Entries
-    /// are never evicted — keyed by ≤32-char pod names, a few bytes each.
+    /// stack member ops must never interleave on the same pod name. A slot
+    /// is removed only when its Arc is unreferenced, so a waiter cannot
+    /// race a new caller on a freshly inserted mutex.
     ops: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Monotonic snapshot counter handed to the ingress gateway — the ACK
     /// must echo it back so a stale push can never look applied.
@@ -336,6 +337,37 @@ fn supervised(m: &PodMeta) -> bool {
 /// restart with `stopped_by_user == false` is still a restart candidate.
 pub(crate) fn supervisor_idle(started: bool, stopped_by_user: bool, stop_intent: bool) -> bool {
     !started || stopped_by_user || stop_intent
+}
+
+/// Pods and quarantined confs whose volume specs mount `name`.
+pub(crate) fn volume_refs(st: &State, name: &str) -> Vec<String> {
+    let uses = |specs: &[String]| {
+        specs.iter().any(|s| {
+            proto::parse_volume_spec(s)
+                .map(|v| v.name == name)
+                .unwrap_or(false)
+        })
+    };
+    let mut out: Vec<String> = st
+        .pods
+        .values()
+        .filter(|m| uses(&m.volumes))
+        .map(|m| m.name.clone())
+        .collect();
+    for q in &st.quarantined {
+        if uses(&q.volumes) {
+            out.push(q.name.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// True when the map's Arc is the only reference, so removing the slot
+/// cannot split a waiter onto a different mutex.
+pub(crate) fn op_slot_unreferenced(strong_count: usize) -> bool {
+    strong_count <= 1
 }
 
 /// ":port" or a bare "port" → the pod's own veth address; "host:port"
@@ -703,6 +735,19 @@ impl Svc {
         m.try_lock_owned().ok()
     }
 
+    /// Drop an op-lock map entry only when nobody else still holds the
+    /// Arc. Removing a referenced mutex lets a waiter and a new caller
+    /// run on two different locks for the same name.
+    async fn release_op_slot(&self, name: &str) {
+        let mut ops = self.ops.lock().await;
+        if ops
+            .get(name)
+            .is_some_and(|m| op_slot_unreferenced(Arc::strong_count(m)))
+        {
+            ops.remove(name);
+        }
+    }
+
     /// Storage/net helpers spawn subprocesses (btrfs, cp, rm, ip, nft) —
     /// never let them block the async executor; hop to the blocking pool.
     async fn blocking<T, F>(f: F) -> Result<T, Status>
@@ -736,6 +781,7 @@ impl Svc {
     /// adopted rather than rejected.
     async fn ensure_volume(&self, name: &str) -> Result<VolumeMeta, Status> {
         let name = proto::validate_name(name).map_err(bad)?.to_string();
+        let _vol = self.pod_op(&format!("volume:{name}")).await;
         {
             let st = self.st.lock().await;
             if let Some(v) = st.volumes.get(&name) {
@@ -782,17 +828,7 @@ impl Svc {
     /// Pod names whose conf references this volume (for `volume ls`/`rm`).
     async fn volume_attachers(&self, name: &str) -> Vec<String> {
         let st = self.st.lock().await;
-        st.pods
-            .values()
-            .filter(|m| {
-                m.volumes.iter().any(|s| {
-                    proto::parse_volume_spec(s)
-                        .map(|v| v.name == name)
-                        .unwrap_or(false)
-                })
-            })
-            .map(|m| m.name.clone())
-            .collect()
+        volume_refs(&st, name)
     }
 
     /// VolumeMeta → wire view: path, byte usage, attaching pods.
@@ -2194,6 +2230,9 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        // Same key create_pod holds across the clone, so a remove cannot
+        // delete the tree mid-copy.
+        let _img = self.pod_op(&format!("image:{name}")).await;
         {
             let st = self.st.lock().await;
             if st.pods.values().any(|p| p.image == name) {
@@ -2219,6 +2258,7 @@ impl PodControl for Svc {
         }
         let _op = self.pod_op(&name).await;
         let image = proto::validate_name(&req.image).map_err(bad)?.to_string();
+        let _img = self.pod_op(&format!("image:{image}")).await;
         let img_dir = self.cfg.images_dir().join(&image);
         if !img_dir.is_dir() {
             return Err(Status::not_found(format!("image {image} not found")));
@@ -2998,12 +3038,9 @@ impl PodControl for Svc {
         // Evict op-lock entries for the destroyed members and the stack key —
         // the pods are gone, so ops stays bounded by live pod names. Held
         // guards keep working on their (now orphaned) Arc harmlessly.
-        {
-            let mut ops = self.ops.lock().await;
-            ops.remove(&format!("stack:{name}"));
-            for pname in &members {
-                ops.remove(pname);
-            }
+        self.release_op_slot(&format!("stack:{name}")).await;
+        for pname in &members {
+            self.release_op_slot(pname).await;
         }
         Ok(Response::new(Empty {}))
     }
@@ -3463,6 +3500,22 @@ impl PodControl for Svc {
             // means a stale route could point at a recycled IP later.
             self.sync_ingress(Some(&name), true).await?;
         }
+        // Snapshots before the conf: a failure here must leave the pod
+        // registered so a retry can finish, and a later pod of the same
+        // name cannot inherit this time machine. Console logs are left
+        // for the log-retention path.
+        let snaps = self.snaps_dir(&name);
+        if snaps.is_dir() {
+            let entries: Vec<_> = std::fs::read_dir(&snaps)
+                .map_err(int)?
+                .flatten()
+                .map(|e| e.path())
+                .collect();
+            for path in entries {
+                self.st_delete(&path).await?;
+            }
+            std::fs::remove_dir(&snaps).map_err(int)?;
+        }
         self.st_delete(&self.pod_rootfs(&name)).await?;
         state::remove_pod(&self.cfg.data_dir, &name);
         agent::cleanup_pod_dirs(
@@ -3478,14 +3531,6 @@ impl PodControl for Svc {
             .filter(|s| !s.is_empty())
             .filter(|s| !st.pods.values().any(|m| &m.stack == s));
         drop(st);
-        // Its time machine dies with the pod — each snapshot is a subvol.
-        let snaps = self.snaps_dir(&name);
-        if let Ok(rd) = std::fs::read_dir(&snaps) {
-            for e in rd.flatten() {
-                let _ = self.st_delete(&e.path()).await;
-            }
-            let _ = std::fs::remove_dir(&snaps);
-        }
         if let Some(stack) = orphan_netns {
             let _ = Self::blocking(move || {
                 net::teardown_stack_net(&stack);
@@ -3501,7 +3546,7 @@ impl PodControl for Svc {
         // locked is harmless (the guard just holds a dead Arc), but
         // explicit order keeps it obvious.
         drop(_op);
-        self.ops.lock().await.remove(&name);
+        self.release_op_slot(&name).await;
         self.stop_intent.lock().await.remove(&name);
         self.health.lock().await.remove(&name);
         self.sync_mesh_names().await;
@@ -4396,6 +4441,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
+        let _vol = self.pod_op(&format!("volume:{name}")).await;
         let attachers = self.volume_attachers(&name).await;
         if !attachers.is_empty() {
             return Err(Status::failed_precondition(format!(
@@ -5200,8 +5246,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        probe_addr, restart_policy, snapshot_expired, supervised, supervisor_idle,
-        validate_ingress_conflicts, validate_ingress_conflicts_excluding,
+        op_slot_unreferenced, probe_addr, restart_policy, snapshot_expired, supervised,
+        supervisor_idle, validate_ingress_conflicts, validate_ingress_conflicts_excluding,
+        volume_refs,
     };
     use crate::state::{IngressSpec, LimitsSpec, PodMeta, State};
     use rustypods_proto::rpc::IngressRule;
@@ -5268,6 +5315,33 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn volume_refs_include_quarantine() {
+        let mut st = State {
+            images: BTreeMap::new(),
+            pods: BTreeMap::new(),
+            volumes: BTreeMap::new(),
+            quarantined: vec![crate::state::QuarantinedConf {
+                name: "held".into(),
+                reason: "bad".into(),
+                net_index: 3,
+                volumes: vec!["pg:/var/lib/pg".into()],
+            }],
+            reserved_net: BTreeSet::new(),
+        };
+        st.pods.insert(
+            "live".into(),
+            PodMeta {
+                volumes: vec!["other:/x".into()],
+                ..meta_plain("live")
+            },
+        );
+        assert_eq!(volume_refs(&st, "pg"), vec!["held".to_string()]);
+        assert!(volume_refs(&st, "missing").is_empty());
+        assert!(!op_slot_unreferenced(2));
+        assert!(op_slot_unreferenced(1));
     }
 
     #[test]
