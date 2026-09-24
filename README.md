@@ -228,7 +228,16 @@ rustypods ingress status
 `--install-ca` writes the generated CA (`/var/lib/rustypods/pki/ca.crt`)
 into the host's system trust store (`update-ca-certificates` /
 `update-ca-trust`) — it **mutates system trust**; skip it and import the
-CA into your browser/store yourself if you prefer. Host loopback
+CA into your browser/store yourself if you prefer. The public proxy
+caps request bodies (`RUSTYPODS_INGRESS_MAX_BODY`, default 32 MiB),
+waits `RUSTYPODS_INGRESS_UPSTREAM_TIMEOUT_SECS` (default 30) for upstream
+response headers, drops a silent WebSocket after
+`RUSTYPODS_INGRESS_WS_IDLE_SECS` (default 60), and admits
+`RUSTYPODS_INGRESS_MAX_CONNS` in-flight requests (default 1024). TLS
+handshakes and HTTP/1 header reads time out after
+`RUSTYPODS_INGRESS_TLS_HANDSHAKE_SECS` and
+`RUSTYPODS_INGRESS_HEADER_TIMEOUT_SECS` (both default 10). HTTP/2 is
+capped at 100 concurrent streams with a 20s keepalive. Host loopback
 `127.0.0.0/8` and `::1` ports 80/443 are redirected to the gateway via
 nft OUTPUT rules only — nothing on the LAN can reach it, and init/start
 refuses if either port is already bound.
