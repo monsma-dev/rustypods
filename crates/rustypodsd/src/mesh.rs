@@ -49,6 +49,17 @@ pub const HOST_SUFFIX: u128 = 1;
 const GOSSIP_PORT: u16 = 5305;
 /// Pod-facing DNS on the host mesh addr.
 const DNS_PORT: u16 = 53;
+/// Concurrent UDP queries. Each may block up to 3s on upstream; the
+/// recv loop must not await them inline or one slow resolver stalls
+/// every pod.
+const DNS_UDP_INFLIGHT: usize = 64;
+/// Simultaneous DNS-over-TCP clients. Extra accepts are dropped.
+const DNS_TCP_MAX_CONNS: usize = 32;
+/// RFC 1035 length prefix cap. Matches the UDP buffer so a client
+/// can't force a 64KiB allocation per connection.
+const DNS_TCP_MAX_MSG: usize = 4096;
+/// Per-read idle timeout on a DNS TCP connection.
+const DNS_TCP_IDLE: Duration = Duration::from_secs(5);
 /// Announce cadence; remote registries expire after 3 intervals.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 const NAME_TTL: Duration = Duration::from_secs(95);
@@ -886,7 +897,10 @@ impl Mesh {
     /// Pod-facing DNS on [fd<host>::1]:53. Mesh names answer locally
     /// (AAAA → addr, A → NODATA); everything else relays upstream so a
     /// pod's resolv.conf can point only at us without losing real DNS.
+    /// Queries run on spawned tasks behind `DNS_UDP_INFLIGHT` so a slow
+    /// upstream (dns_forward waits up to 3s) cannot stall the socket.
     async fn dns_server(self: Arc<Self>) {
+        let sem = Arc::new(tokio::sync::Semaphore::new(DNS_UDP_INFLIGHT));
         let mut buf = vec![0u8; 4096];
         let mut shutdown = self.shutdown_tx.subscribe();
         loop {
@@ -894,9 +908,18 @@ impl Mesh {
                 _ = shutdown.changed() => break,
                 r = self.dns.recv_from(&mut buf) => {
                     let Ok((n, src)) = r else { continue };
-                    if let Some(rep) = self.answer_query(&buf[..n]).await {
-                        let _ = self.dns.send_to(&rep, src).await;
-                    }
+                    let pkt = buf[..n].to_vec();
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        tracing::debug!("mesh dns: udp inflight cap, dropping {src}");
+                        continue;
+                    };
+                    let m = self.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Some(rep) = m.answer_query(&pkt).await {
+                            let _ = m.dns.send_to(&rep, src).await;
+                        }
+                    });
                 }
             }
         }
@@ -904,32 +927,24 @@ impl Mesh {
 
     /// DNS-over-TCP on the same addr — RFC requires it for truncated
     /// answers and some resolvers probe TCP first. 2-byte length
-    /// prefix framing per RFC 1035 §4.2.2.
+    /// prefix framing per RFC 1035 §4.2.2. Connections are capped and
+    /// each read is idle-bounded so a client can't pin an fd forever.
     async fn dns_tcp_server(self: Arc<Self>) {
+        let sem = Arc::new(tokio::sync::Semaphore::new(DNS_TCP_MAX_CONNS));
         let mut shutdown = self.shutdown_tx.subscribe();
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
                 r = self.dns_tcp.accept() => {
-                    let Ok((mut s, _)) = r else { continue };
+                    let Ok((s, peer)) = r else { continue };
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        tracing::debug!("mesh dns: tcp conn cap, dropping {peer}");
+                        continue;
+                    };
                     let m = self.clone();
                     tokio::spawn(async move {
-                        let mut len = [0u8; 2];
-                        while s.read_exact(&mut len).await.is_ok() {
-                            let n = u16::from_be_bytes(len) as usize;
-                            let mut q = vec![0u8; n];
-                            if s.read_exact(&mut q).await.is_err() {
-                                return;
-                            }
-                            if let Some(rep) = m.answer_query(&q).await {
-                                let l = (rep.len() as u16).to_be_bytes();
-                                if s.write_all(&l).await.is_err()
-                                    || s.write_all(&rep).await.is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
+                        let _permit = permit;
+                        dns_tcp_conn(m, s).await;
                     });
                 }
             }
@@ -958,6 +973,64 @@ impl Mesh {
         match tokio::time::timeout(Duration::from_secs(3), s.recv_from(&mut buf)).await {
             Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
             _ => None,
+        }
+    }
+}
+
+/// Accept a DNS-over-TCP length prefix, or None when it is empty or
+/// above `DNS_TCP_MAX_MSG`.
+fn dns_tcp_payload_len(n: u16) -> Option<usize> {
+    let n = n as usize;
+    if n == 0 || n > DNS_TCP_MAX_MSG {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// One DNS TCP client. Returns on idle timeout, a short read, or an
+/// oversize length prefix — the connection is then dropped.
+async fn dns_tcp_conn(m: Arc<Mesh>, mut s: tokio::net::TcpStream) {
+    let mut len = [0u8; 2];
+    loop {
+        if tokio::time::timeout(DNS_TCP_IDLE, s.read_exact(&mut len))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_none()
+        {
+            return;
+        }
+        let Some(n) = dns_tcp_payload_len(u16::from_be_bytes(len)) else {
+            return;
+        };
+        let mut q = vec![0u8; n];
+        if tokio::time::timeout(DNS_TCP_IDLE, s.read_exact(&mut q))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_none()
+        {
+            return;
+        }
+        if let Some(rep) = m.answer_query(&q).await {
+            if rep.len() > u16::MAX as usize {
+                return;
+            }
+            let l = (rep.len() as u16).to_be_bytes();
+            let write = async {
+                s.write_all(&l).await?;
+                s.write_all(&rep).await?;
+                Ok::<(), std::io::Error>(())
+            };
+            if tokio::time::timeout(DNS_TCP_IDLE, write)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .is_none()
+            {
+                return;
+            }
         }
     }
 }
@@ -1310,6 +1383,23 @@ mod tests {
 
     /// Every parser/builder must survive arbitrary input. xorshift so
     /// the sequence is deterministic and dependency-free.
+    #[test]
+    fn dns_tcp_rejects_empty_and_oversize_lengths() {
+        assert_eq!(dns_tcp_payload_len(0), None);
+        assert_eq!(dns_tcp_payload_len(1), Some(1));
+        assert_eq!(
+            dns_tcp_payload_len(DNS_TCP_MAX_MSG as u16),
+            Some(DNS_TCP_MAX_MSG)
+        );
+        assert_eq!(
+            dns_tcp_payload_len((DNS_TCP_MAX_MSG as u16).saturating_add(1)),
+            None
+        );
+        assert_eq!(DNS_UDP_INFLIGHT, 64);
+        assert!(DNS_TCP_MAX_CONNS > 0 && DNS_TCP_MAX_CONNS <= DNS_UDP_INFLIGHT);
+        assert_eq!(DNS_TCP_IDLE, Duration::from_secs(5));
+    }
+
     #[test]
     fn dns_random_bytes_never_panic() {
         let mut state = 0xA5A5_1234u32;
