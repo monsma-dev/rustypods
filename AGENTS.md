@@ -182,6 +182,13 @@ rustypodsd does it itself:
   configured probe, or `ingress_gateway` (managed ⇒ always "always").
   Pods are supervised concurrently (cap 8); the tick awaits them, so
   each pod has at most one in-flight action.
+- SIGTERM and SIGINT stop the accept loop and wait up to 30s for
+  in-flight mutating RPCs (start/stop/create/destroy/clone/commit/
+  rollback/apply/config). Those handlers run on a detached task so a
+  client disconnect does not cancel the critical section.
+- The gRPC server, HTTP server, and supervisor exiting or panicking
+  exits the process non-zero (systemd restarts it; pods survive).
+  Ingress reconcile and snapshot GC log and restart with backoff.
 - Death-watch keys on `PodMeta.stopped_by_user` (persisted in the pod
   conf, serde default false) plus an in-memory `stop_intent` mirror for
   the tick that races the conf write. `PodMeta.started` means "was ever

@@ -46,6 +46,8 @@ pub struct Svc {
     /// is removed only when its Arc is unreferenced, so a waiter cannot
     /// race a new caller on a freshly inserted mutex.
     ops: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Mutating RPCs in flight. Shutdown waits for this to hit zero.
+    inflight: Arc<Inflight>,
     /// Monotonic snapshot counter handed to the ingress gateway — the ACK
     /// must echo it back so a stale push can never look applied.
     ingress_generation: Arc<AtomicU64>,
@@ -100,6 +102,104 @@ struct PodHealth {
 const SHM_MAX_BYTES: u64 = 4 << 30;
 /// How many pods the supervisor may probe or restart at once.
 const SUPERVISE_PARALLEL: usize = 8;
+
+/// Count of detached mutating RPCs. Dropping the handler future (client
+/// gone, tonic timeout) must not cancel the task that holds the guard.
+struct Inflight {
+    n: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+struct InflightGuard {
+    inner: Arc<Inflight>,
+}
+
+impl Inflight {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            n: std::sync::atomic::AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn enter(self: &Arc<Self>) -> InflightGuard {
+        self.n.fetch_add(1, Ordering::SeqCst);
+        InflightGuard {
+            inner: Arc::clone(self),
+        }
+    }
+
+    async fn drained(&self) {
+        loop {
+            if self.n.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inner.n.fetch_sub(1, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+}
+
+/// Run `fut` on a task that outlives the RPC handler. The handler awaits
+/// the join; if tonic drops the handler, the task keeps running and
+/// shutdown waits for it (bounded).
+async fn drive<T: Send + 'static>(
+    inflight: &Arc<Inflight>,
+    fut: impl std::future::Future<Output = Result<T, Status>> + Send + 'static,
+) -> Result<T, Status> {
+    let inflight = Arc::clone(inflight);
+    let handle = tokio::spawn(async move {
+        let _guard = inflight.enter();
+        fut.await
+    });
+    match handle.await {
+        Ok(r) => r,
+        Err(e) => Err(Status::internal(format!("operation task ended: {e}"))),
+    }
+}
+
+/// Critical background task: a panic or a clean return exits the process
+/// so systemd restarts the daemon. Pods are nspawn children and survive.
+fn spawn_critical<F>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let name = name;
+        let result = tokio::spawn(fut).await;
+        match result {
+            Ok(()) => tracing::error!("{name} exited"),
+            Err(e) => tracing::error!("{name} panicked: {e}"),
+        }
+        std::process::exit(1);
+    })
+}
+
+/// Non-critical loop: log and restart with exponential backoff.
+fn spawn_restarting<F, Fut>(name: &'static str, mut make: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut delay = 1u64;
+        loop {
+            let result = tokio::spawn(make()).await;
+            match result {
+                Ok(()) => tracing::error!("{name} exited; restarting"),
+                Err(e) => tracing::error!("{name} panicked: {e}; restarting"),
+            }
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            delay = (delay * 2).min(30);
+        }
+    });
+}
 
 /// Atomically swap two directory entries on the same mount.
 /// `RENAME_EXCHANGE` is the only way a crash cannot observe "neither
@@ -508,7 +608,13 @@ fn same_ingress(a: &[IngressSpec], b: &[IngressSpec]) -> bool {
 impl Svc {
     /// The live mesh handle, if the Wave I mesh is up.
     fn mesh(&self) -> Option<Arc<mesh::Mesh>> {
-        self.mesh.read().ok()?.clone()
+        match self.mesh.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                tracing::error!("mesh lock poisoned; continuing with the inner value");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     /// This host's mesh /48 when the Wave I mesh is up — to_pod derives
@@ -2057,231 +2163,11 @@ impl Svc {
     }
 }
 
-#[tonic::async_trait]
-impl PodControl for Svc {
-    async fn ping(&self, _req: Request<PingRequest>) -> Result<Response<DaemonInfo>, Status> {
-        Ok(Response::new(DaemonInfo {
-            version: env!("CARGO_PKG_VERSION").into(),
-            socket_path: self.cfg.socket.display().to_string(),
-            data_dir: self.cfg.data_dir.display().to_string(),
-            machined: self.engine.healthy().await,
-            btrfs: self.storage.supports_quota(),
-            storage_driver: self.storage.name().into(),
-            runtime_engine: self.engine.name().into(),
-            quarantined: self
-                .st
-                .lock()
-                .await
-                .quarantined
-                .iter()
-                .map(|q| format!("{}: {}", q.name, q.reason))
-                .collect(),
-        }))
-    }
-
-    /// Wave I: create (or reuse) this host's WG identity and bring the
-    /// mesh up. Idempotent — calling init on a live mesh just returns
-    /// status, and an existing conf/mesh.conf keeps its key so the /48
-    /// (and every pod's mesh addr) survives daemon restarts.
-    async fn mesh_init(
+impl Svc {
+    async fn create_pod_work(
         &self,
-        req: Request<MeshInitRequest>,
-    ) -> Result<Response<MeshStatus>, Status> {
-        Ok(Response::new(
-            self.mesh_up(req.into_inner().listen_port).await?,
-        ))
-    }
-
-    async fn get_mesh_status(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
-        match self.mesh() {
-            Some(m) => Ok(Response::new(m.status().await)),
-            None => Ok(Response::new(MeshStatus {
-                enabled: false,
-                ..Default::default()
-            })),
-        }
-    }
-
-    async fn mesh_add_peer(&self, req: Request<MeshPeer>) -> Result<Response<MeshStatus>, Status> {
-        let p = req.into_inner();
-        let Some(m) = self.mesh() else {
-            return Err(Status::failed_precondition(
-                "mesh not initialized — run `rustypods mesh init` first",
-            ));
-        };
-        m.add_peer(&p.endpoint, &p.pubkey).await.map_err(bad)?;
-        Ok(Response::new(m.status().await))
-    }
-
-    async fn mesh_remove_peer(
-        &self,
-        req: Request<MeshPeer>,
-    ) -> Result<Response<MeshStatus>, Status> {
-        let p = req.into_inner();
-        let Some(m) = self.mesh() else {
-            return Err(Status::failed_precondition(
-                "mesh not initialized — run `rustypods mesh init` first",
-            ));
-        };
-        if !m.remove_peer(&p.pubkey).await.map_err(bad)? {
-            return Err(Status::not_found("no such mesh peer"));
-        }
-        Ok(Response::new(m.status().await))
-    }
-
-    async fn mesh_deinit(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
-        Ok(Response::new(self.mesh_down().await?))
-    }
-
-    async fn import_image(
-        &self,
-        req: Request<ImportImageRequest>,
-    ) -> Result<Response<Image>, Status> {
-        let req = req.into_inner();
-        let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
-        proto::validate_container_ref(&req.distrobox).map_err(bad)?;
-        let dest = self.cfg.images_dir().join(&name);
-        if dest.exists() {
-            return Err(Status::already_exists(format!(
-                "image {name} already exists"
-            )));
-        }
-        // runuser runs the export as this user — the request may only ever
-        // name the configured import_user, never root or another account.
-        let user = if req.import_user.is_empty() {
-            self.cfg.import_user.clone()
-        } else if req.import_user == self.cfg.import_user {
-            req.import_user.clone()
-        } else {
-            return Err(Status::invalid_argument(format!(
-                "import_user must be '{}' (the daemon's --import-user)",
-                self.cfg.import_user
-            )));
-        };
-        proto::validate_unix_user(&user).map_err(bad)?;
-        self.st_create(&dest).await?;
-        let d = dest.clone();
-        let cont = req.distrobox.clone();
-        let res = tokio::task::spawn_blocking(move || import_distrobox(&user, &cont, &d)).await;
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = self.st_delete(&dest).await;
-                return Err(int(e));
-            }
-            Err(je) => {
-                let _ = self.st_delete(&dest).await;
-                return Err(int(anyhow::anyhow!("task: {je}")));
-            }
-        }
-        sanitize_rootfs(&dest, &req.distrobox).map_err(int)?;
-        let meta = ImageMeta {
-            name: name.clone(),
-            source: format!("distrobox:{}", req.distrobox),
-            created_unix: state::now_unix(),
-            entrypoint: vec![],
-            cmd: vec![],
-            env: vec![],
-            working_dir: String::new(),
-        };
-        let mut st = self.st.lock().await;
-        st.images.insert(name.clone(), meta.clone());
-        self.save_image(&meta).map_err(int)?;
-        Ok(Response::new(to_image(&meta, &dest)))
-    }
-
-    /// `rustypods pull <ref>`: native OCI pull — manifest+config+layers
-    /// straight from the registry, untarred into a fresh rootfs. Pulled
-    /// images carry their entrypoint/cmd and run non-boot (no systemd).
-    async fn pull_image(&self, req: Request<PullImageRequest>) -> Result<Response<Image>, Status> {
-        let req = req.into_inner();
-        let name = if req.name.is_empty() {
-            oci::default_name(&req.reference).map_err(bad)?
-        } else {
-            proto::validate_name(&req.name).map_err(bad)?.to_string()
-        };
-        let dest = self.cfg.images_dir().join(&name);
-        if dest.exists() {
-            return Err(Status::already_exists(format!(
-                "image {name} already exists"
-            )));
-        }
-        self.st_create(&dest).await?;
-        let cfg = match oci::pull(&req.reference, &dest).await {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = self.st_delete(&dest).await;
-                return Err(int(e));
-            }
-        };
-        let meta = ImageMeta {
-            name: name.clone(),
-            source: format!("oci:{}", req.reference),
-            created_unix: state::now_unix(),
-            entrypoint: cfg.entrypoint,
-            cmd: cfg.cmd,
-            env: cfg.env,
-            working_dir: cfg.working_dir,
-        };
-        let mut st = self.st.lock().await;
-        st.images.insert(name.clone(), meta.clone());
-        self.save_image(&meta).map_err(int)?;
-        Ok(Response::new(to_image(&meta, &dest)))
-    }
-
-    async fn list_images(
-        &self,
-        _req: Request<ListImagesRequest>,
-    ) -> Result<Response<ImageList>, Status> {
-        let st = self.st.lock().await;
-        let mut out: Vec<Image> = st
-            .images
-            .values()
-            .map(|m| to_image(m, &self.cfg.images_dir().join(&m.name)))
-            .collect();
-        // Reconcile: directories on disk the state file doesn't know about.
-        if let Ok(rd) = std::fs::read_dir(self.cfg.images_dir()) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if e.path().is_dir() && !st.images.contains_key(&n) {
-                    out.push(Image {
-                        name: n,
-                        path: e.path().display().to_string(),
-                        source: "(on-disk)".into(),
-                        created_unix: 0,
-                        entrypoint: vec![],
-                        cmd: vec![],
-                    });
-                }
-            }
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Response::new(ImageList { images: out }))
-    }
-
-    async fn remove_image(&self, req: Request<ImageRef>) -> Result<Response<Empty>, Status> {
-        let name = proto::validate_name(&req.into_inner().name)
-            .map_err(bad)?
-            .to_string();
-        // Same key create_pod holds across the clone, so a remove cannot
-        // delete the tree mid-copy.
-        let _img = self.pod_op(&format!("image:{name}")).await;
-        {
-            let st = self.st.lock().await;
-            if st.pods.values().any(|p| p.image == name) {
-                return Err(Status::failed_precondition(format!(
-                    "image {name} is still in use by a pod"
-                )));
-            }
-        }
-        self.st_delete(&self.cfg.images_dir().join(&name)).await?;
-        let mut st = self.st.lock().await;
-        st.images.remove(&name);
-        state::remove_image(&self.cfg.data_dir, &name);
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn create_pod(&self, req: Request<CreatePodRequest>) -> Result<Response<Pod>, Status> {
+        req: Request<CreatePodRequest>,
+    ) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
         if name == proto::INGRESS_POD {
@@ -2396,12 +2282,7 @@ impl PodControl for Svc {
             self.mesh_prefix(),
         )))
     }
-
-    /// `rustypods clone <src> <dest>`: instant btrfs snapshot of the pod
-    /// rootfs + a copied conf with fresh identity. Cloning a running pod is
-    /// allowed (subvolume snapshot is atomic) but the runtime state is
-    /// reset — the clone starts stopped.
-    async fn clone_pod(&self, req: Request<ClonePodRequest>) -> Result<Response<Pod>, Status> {
+    async fn clone_pod_work(&self, req: Request<ClonePodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let src = proto::validate_name(&req.source).map_err(bad)?.to_string();
         let dest = proto::validate_name(&req.dest).map_err(bad)?.to_string();
@@ -2493,10 +2374,7 @@ impl PodControl for Svc {
             self.mesh_prefix(),
         )))
     }
-
-    /// `rustypods commit <pod> [label]`: atomic CoW snapshot of the live
-    /// rootfs into snapshots/<pod>/<ts>[-label]. The live pod keeps running.
-    async fn commit_pod(
+    async fn commit_pod_work(
         &self,
         req: Request<CommitPodRequest>,
     ) -> Result<Response<Snapshot>, Status> {
@@ -2548,11 +2426,7 @@ impl PodControl for Svc {
             label: slug,
         }))
     }
-
-    /// `rustypods rollback <pod> [--to <id>]`: swap the live rootfs for a
-    /// commit. The pod is stopped first — rollback discards current state.
-    /// The snapshot itself survives (it becomes the new live rootfs' source).
-    async fn rollback_pod(
+    async fn rollback_pod_work(
         &self,
         req: Request<RollbackPodRequest>,
     ) -> Result<Response<Pod>, Status> {
@@ -2685,50 +2559,7 @@ impl PodControl for Svc {
             self.mesh_prefix(),
         )))
     }
-
-    async fn list_snapshots(&self, req: Request<PodRef>) -> Result<Response<SnapshotList>, Status> {
-        let pod = proto::validate_name(&req.into_inner().name)
-            .map_err(bad)?
-            .to_string();
-        {
-            let st = self.st.lock().await;
-            if !st.pods.contains_key(&pod) {
-                return Err(Status::not_found(format!("pod {pod} not found")));
-            }
-        }
-        Ok(Response::new(SnapshotList {
-            snapshots: self.snapshots(&pod),
-        }))
-    }
-
-    async fn delete_snapshot(&self, req: Request<SnapshotRef>) -> Result<Response<Empty>, Status> {
-        let req = req.into_inner();
-        let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
-        {
-            let st = self.st.lock().await;
-            if !st.pods.contains_key(&pod) {
-                return Err(Status::not_found(format!("pod {pod} not found")));
-            }
-        }
-        let _op = self.pod_op(&pod).await;
-        proto::validate_snapshot_id(&req.id).map_err(bad)?;
-        // Guard: the id may only ever resolve inside this pod's snap dir.
-        let path = self.snaps_dir(&pod).join(&req.id);
-        if !path.starts_with(self.snaps_dir(&pod)) || !path.exists() {
-            return Err(Status::not_found(format!(
-                "snapshot '{}' not found",
-                req.id
-            )));
-        }
-        self.st_delete(&path).await?;
-        Ok(Response::new(Empty {}))
-    }
-
-    /// `rustypods apply stack.toml`: one shared netns for all members
-    /// (they see each other on 127.0.0.1), one /30 + one net_index for the
-    /// stack, members stored as pods named <stack>-<member>. Re-applying an
-    /// existing stack is idempotent: confs update, rootfs is kept.
-    async fn apply_stack(
+    async fn apply_stack_work(
         &self,
         req: Request<ApplyStackRequest>,
     ) -> Result<Response<ApplyStackResponse>, Status> {
@@ -3006,87 +2837,7 @@ impl PodControl for Svc {
             pods,
         }))
     }
-
-    /// `rustypods stack destroy <name>`: stop+delete every member, then
-    /// tear down the shared netns and veth pair.
-    async fn destroy_stack(&self, req: Request<PodRef>) -> Result<Response<Empty>, Status> {
-        let name = proto::validate_name(&req.into_inner().name)
-            .map_err(bad)?
-            .to_string();
-        // Cheap membership check before touching the append-only ops map.
-        {
-            let st = self.st.lock().await;
-            if !st.pods.values().any(|m| m.stack == name) {
-                return Err(Status::not_found(format!("stack {name} not found")));
-            }
-        }
-        // Serialize against apply_stack and per-pod ops: take the stack key
-        // FIRST — an in-flight apply must finish before we enumerate members
-        // (a member added after listing would escape teardown).
-        let _stack_op = self.pod_op(&format!("stack:{name}")).await;
-        let members: Vec<String> = {
-            let st = self.st.lock().await;
-            st.pods
-                .values()
-                .filter(|m| m.stack == name)
-                .map(|m| m.name.clone())
-                .collect()
-        };
-        if members.is_empty() {
-            return Err(Status::not_found(format!("stack {name} not found")));
-        }
-        // Every member's op lock too, in sorted order (ordered acquisition).
-        let mut sorted = members.clone();
-        sorted.sort();
-        sorted.dedup();
-        let mut _guards = Vec::with_capacity(sorted.len());
-        for n in &sorted {
-            _guards.push(self.pod_op(n).await);
-        }
-        for pname in &members {
-            self.stop_engine(pname).await?;
-            if self.engine.registered(pname).await.map_err(int)? {
-                return Err(Status::failed_precondition(format!(
-                    "pod {pname} is still registered with machined — refusing to destroy stack"
-                )));
-            }
-            agent::stop_listener(&self.listeners, &self.metrics, pname).await;
-            self.st_delete(&self.pod_rootfs(pname)).await?;
-            state::remove_pod(&self.cfg.data_dir, pname);
-            agent::cleanup_pod_dirs(
-                &proto::run_dir(&self.cfg.data_dir, pname),
-                &proto::shm_host_dir(pname),
-            );
-            let mut st = self.st.lock().await;
-            st.pods.remove(pname);
-        }
-        let n = name.clone();
-        let _ = Self::blocking(move || {
-            net::teardown_stack_net(&n);
-            Ok(())
-        })
-        .await;
-        if let Err(e) = self.sync_nat().await {
-            tracing::warn!("nft rebuild after stack destroy failed: {e}");
-        }
-        // Members carrying ingress rules are gone — drop their routes
-        // promptly instead of waiting for the next reconcile tick (the
-        // shared net_index is free for reuse now). Best-effort: an
-        // unreachable gateway is healed by the reconciler.
-        if let Err(e) = self.sync_ingress(None, false).await {
-            tracing::warn!("ingress resync after stack {name} destroy failed: {e}");
-        }
-        // Evict op-lock entries for the destroyed members and the stack key —
-        // the pods are gone, so ops stays bounded by live pod names. Held
-        // guards keep working on their (now orphaned) Arc harmlessly.
-        self.release_op_slot(&format!("stack:{name}")).await;
-        for pname in &members {
-            self.release_op_slot(pname).await;
-        }
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn start_pod(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
+    async fn start_pod_work(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
         {
@@ -3455,43 +3206,13 @@ impl PodControl for Svc {
         self.sync_mesh_names().await;
         Ok(Response::new(pod))
     }
-
-    async fn stop_pod(&self, req: Request<PodRef>) -> Result<Response<Pod>, Status> {
+    async fn stop_pod_work(&self, req: Request<PodRef>) -> Result<Response<Pod>, Status> {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
         self.halt_pod(&name, true).await
     }
-
-    async fn list_pods(&self, _req: Request<ListPodsRequest>) -> Result<Response<PodList>, Status> {
-        // Clone the metas and DROP the state lock before the machined
-        // lookups — a D-Bus await under the global lock stalls every other
-        // RPC touching state.
-        let pods: Vec<PodMeta> = {
-            let st = self.st.lock().await;
-            st.pods.values().cloned().collect()
-        };
-        let hmap: HashMap<String, String> = {
-            let h = self.health.lock().await;
-            h.iter()
-                .map(|(k, v)| (k.clone(), v.status.to_string()))
-                .collect()
-        };
-        let mut out = Vec::new();
-        for m in &pods {
-            out.push(to_pod(
-                m,
-                &self.pod_rootfs(&m.name),
-                self.engine.running_pid(&m.name).await,
-                hmap.get(&m.name).map(String::as_str).unwrap_or(""),
-                self.mesh_prefix(),
-            ));
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Response::new(PodList { pods: out }))
-    }
-
-    async fn destroy_pod(&self, req: Request<PodRef>) -> Result<Response<Empty>, Status> {
+    async fn destroy_pod_work(&self, req: Request<PodRef>) -> Result<Response<Empty>, Status> {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
@@ -3593,9 +3314,7 @@ impl PodControl for Svc {
         self.sync_mesh_names().await;
         Ok(Response::new(Empty {}))
     }
-
-    /// `rustypods config`: update the conf + live-apply to the scope.
-    async fn update_pod_config(
+    async fn update_pod_config_work(
         &self,
         req: Request<UpdatePodConfigRequest>,
     ) -> Result<Response<Pod>, Status> {
@@ -3771,6 +3490,460 @@ impl PodControl for Svc {
             &self.health_view(&name).await,
             self.mesh_prefix(),
         )))
+    }
+}
+
+#[tonic::async_trait]
+impl PodControl for Svc {
+    async fn ping(&self, _req: Request<PingRequest>) -> Result<Response<DaemonInfo>, Status> {
+        Ok(Response::new(DaemonInfo {
+            version: env!("CARGO_PKG_VERSION").into(),
+            socket_path: self.cfg.socket.display().to_string(),
+            data_dir: self.cfg.data_dir.display().to_string(),
+            machined: self.engine.healthy().await,
+            btrfs: self.storage.supports_quota(),
+            storage_driver: self.storage.name().into(),
+            runtime_engine: self.engine.name().into(),
+            quarantined: self
+                .st
+                .lock()
+                .await
+                .quarantined
+                .iter()
+                .map(|q| format!("{}: {}", q.name, q.reason))
+                .collect(),
+        }))
+    }
+
+    /// Wave I: create (or reuse) this host's WG identity and bring the
+    /// mesh up. Idempotent — calling init on a live mesh just returns
+    /// status, and an existing conf/mesh.conf keeps its key so the /48
+    /// (and every pod's mesh addr) survives daemon restarts.
+    async fn mesh_init(
+        &self,
+        req: Request<MeshInitRequest>,
+    ) -> Result<Response<MeshStatus>, Status> {
+        Ok(Response::new(
+            self.mesh_up(req.into_inner().listen_port).await?,
+        ))
+    }
+
+    async fn get_mesh_status(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
+        match self.mesh() {
+            Some(m) => Ok(Response::new(m.status().await)),
+            None => Ok(Response::new(MeshStatus {
+                enabled: false,
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn mesh_add_peer(&self, req: Request<MeshPeer>) -> Result<Response<MeshStatus>, Status> {
+        let p = req.into_inner();
+        let Some(m) = self.mesh() else {
+            return Err(Status::failed_precondition(
+                "mesh not initialized — run `rustypods mesh init` first",
+            ));
+        };
+        m.add_peer(&p.endpoint, &p.pubkey).await.map_err(bad)?;
+        Ok(Response::new(m.status().await))
+    }
+
+    async fn mesh_remove_peer(
+        &self,
+        req: Request<MeshPeer>,
+    ) -> Result<Response<MeshStatus>, Status> {
+        let p = req.into_inner();
+        let Some(m) = self.mesh() else {
+            return Err(Status::failed_precondition(
+                "mesh not initialized — run `rustypods mesh init` first",
+            ));
+        };
+        if !m.remove_peer(&p.pubkey).await.map_err(bad)? {
+            return Err(Status::not_found("no such mesh peer"));
+        }
+        Ok(Response::new(m.status().await))
+    }
+
+    async fn mesh_deinit(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
+        Ok(Response::new(self.mesh_down().await?))
+    }
+
+    async fn import_image(
+        &self,
+        req: Request<ImportImageRequest>,
+    ) -> Result<Response<Image>, Status> {
+        let req = req.into_inner();
+        let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        proto::validate_container_ref(&req.distrobox).map_err(bad)?;
+        let dest = self.cfg.images_dir().join(&name);
+        if dest.exists() {
+            return Err(Status::already_exists(format!(
+                "image {name} already exists"
+            )));
+        }
+        // runuser runs the export as this user — the request may only ever
+        // name the configured import_user, never root or another account.
+        let user = if req.import_user.is_empty() {
+            self.cfg.import_user.clone()
+        } else if req.import_user == self.cfg.import_user {
+            req.import_user.clone()
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "import_user must be '{}' (the daemon's --import-user)",
+                self.cfg.import_user
+            )));
+        };
+        proto::validate_unix_user(&user).map_err(bad)?;
+        self.st_create(&dest).await?;
+        let d = dest.clone();
+        let cont = req.distrobox.clone();
+        let res = tokio::task::spawn_blocking(move || import_distrobox(&user, &cont, &d)).await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = self.st_delete(&dest).await;
+                return Err(int(e));
+            }
+            Err(je) => {
+                let _ = self.st_delete(&dest).await;
+                return Err(int(anyhow::anyhow!("task: {je}")));
+            }
+        }
+        sanitize_rootfs(&dest, &req.distrobox).map_err(int)?;
+        let meta = ImageMeta {
+            name: name.clone(),
+            source: format!("distrobox:{}", req.distrobox),
+            created_unix: state::now_unix(),
+            entrypoint: vec![],
+            cmd: vec![],
+            env: vec![],
+            working_dir: String::new(),
+        };
+        let mut st = self.st.lock().await;
+        st.images.insert(name.clone(), meta.clone());
+        self.save_image(&meta).map_err(int)?;
+        Ok(Response::new(to_image(&meta, &dest)))
+    }
+
+    /// `rustypods pull <ref>`: native OCI pull — manifest+config+layers
+    /// straight from the registry, untarred into a fresh rootfs. Pulled
+    /// images carry their entrypoint/cmd and run non-boot (no systemd).
+    async fn pull_image(&self, req: Request<PullImageRequest>) -> Result<Response<Image>, Status> {
+        let req = req.into_inner();
+        let name = if req.name.is_empty() {
+            oci::default_name(&req.reference).map_err(bad)?
+        } else {
+            proto::validate_name(&req.name).map_err(bad)?.to_string()
+        };
+        let dest = self.cfg.images_dir().join(&name);
+        if dest.exists() {
+            return Err(Status::already_exists(format!(
+                "image {name} already exists"
+            )));
+        }
+        self.st_create(&dest).await?;
+        let cfg = match oci::pull(&req.reference, &dest).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.st_delete(&dest).await;
+                return Err(int(e));
+            }
+        };
+        let meta = ImageMeta {
+            name: name.clone(),
+            source: format!("oci:{}", req.reference),
+            created_unix: state::now_unix(),
+            entrypoint: cfg.entrypoint,
+            cmd: cfg.cmd,
+            env: cfg.env,
+            working_dir: cfg.working_dir,
+        };
+        let mut st = self.st.lock().await;
+        st.images.insert(name.clone(), meta.clone());
+        self.save_image(&meta).map_err(int)?;
+        Ok(Response::new(to_image(&meta, &dest)))
+    }
+
+    async fn list_images(
+        &self,
+        _req: Request<ListImagesRequest>,
+    ) -> Result<Response<ImageList>, Status> {
+        let st = self.st.lock().await;
+        let mut out: Vec<Image> = st
+            .images
+            .values()
+            .map(|m| to_image(m, &self.cfg.images_dir().join(&m.name)))
+            .collect();
+        // Reconcile: directories on disk the state file doesn't know about.
+        if let Ok(rd) = std::fs::read_dir(self.cfg.images_dir()) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if e.path().is_dir() && !st.images.contains_key(&n) {
+                    out.push(Image {
+                        name: n,
+                        path: e.path().display().to_string(),
+                        source: "(on-disk)".into(),
+                        created_unix: 0,
+                        entrypoint: vec![],
+                        cmd: vec![],
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Response::new(ImageList { images: out }))
+    }
+
+    async fn remove_image(&self, req: Request<ImageRef>) -> Result<Response<Empty>, Status> {
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        // Same key create_pod holds across the clone, so a remove cannot
+        // delete the tree mid-copy.
+        let _img = self.pod_op(&format!("image:{name}")).await;
+        {
+            let st = self.st.lock().await;
+            if st.pods.values().any(|p| p.image == name) {
+                return Err(Status::failed_precondition(format!(
+                    "image {name} is still in use by a pod"
+                )));
+            }
+        }
+        self.st_delete(&self.cfg.images_dir().join(&name)).await?;
+        let mut st = self.st.lock().await;
+        st.images.remove(&name);
+        state::remove_image(&self.cfg.data_dir, &name);
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn create_pod(&self, req: Request<CreatePodRequest>) -> Result<Response<Pod>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.create_pod_work(req).await }).await
+    }
+
+    /// `rustypods clone <src> <dest>`: instant btrfs snapshot of the pod
+    /// rootfs + a copied conf with fresh identity. Cloning a running pod is
+    /// allowed (subvolume snapshot is atomic) but the runtime state is
+    /// reset — the clone starts stopped.
+    async fn clone_pod(&self, req: Request<ClonePodRequest>) -> Result<Response<Pod>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.clone_pod_work(req).await }).await
+    }
+
+    /// `rustypods commit <pod> [label]`: atomic CoW snapshot of the live
+    /// rootfs into snapshots/<pod>/<ts>[-label]. The live pod keeps running.
+    async fn commit_pod(
+        &self,
+        req: Request<CommitPodRequest>,
+    ) -> Result<Response<Snapshot>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.commit_pod_work(req).await }).await
+    }
+
+    /// `rustypods rollback <pod> [--to <id>]`: swap the live rootfs for a
+    /// commit. The pod is stopped first — rollback discards current state.
+    /// The snapshot itself survives (it becomes the new live rootfs' source).
+    async fn rollback_pod(
+        &self,
+        req: Request<RollbackPodRequest>,
+    ) -> Result<Response<Pod>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.rollback_pod_work(req).await }).await
+    }
+
+    async fn list_snapshots(&self, req: Request<PodRef>) -> Result<Response<SnapshotList>, Status> {
+        let pod = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&pod) {
+                return Err(Status::not_found(format!("pod {pod} not found")));
+            }
+        }
+        Ok(Response::new(SnapshotList {
+            snapshots: self.snapshots(&pod),
+        }))
+    }
+
+    async fn delete_snapshot(&self, req: Request<SnapshotRef>) -> Result<Response<Empty>, Status> {
+        let req = req.into_inner();
+        let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&pod) {
+                return Err(Status::not_found(format!("pod {pod} not found")));
+            }
+        }
+        let _op = self.pod_op(&pod).await;
+        proto::validate_snapshot_id(&req.id).map_err(bad)?;
+        // Guard: the id may only ever resolve inside this pod's snap dir.
+        let path = self.snaps_dir(&pod).join(&req.id);
+        if !path.starts_with(self.snaps_dir(&pod)) || !path.exists() {
+            return Err(Status::not_found(format!(
+                "snapshot '{}' not found",
+                req.id
+            )));
+        }
+        self.st_delete(&path).await?;
+        Ok(Response::new(Empty {}))
+    }
+
+    /// `rustypods apply stack.toml`: one shared netns for all members
+    /// (they see each other on 127.0.0.1), one /30 + one net_index for the
+    /// stack, members stored as pods named <stack>-<member>. Re-applying an
+    /// existing stack is idempotent: confs update, rootfs is kept.
+    async fn apply_stack(
+        &self,
+        req: Request<ApplyStackRequest>,
+    ) -> Result<Response<ApplyStackResponse>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.apply_stack_work(req).await }).await
+    }
+
+    /// `rustypods stack destroy <name>`: stop+delete every member, then
+    /// tear down the shared netns and veth pair.
+    async fn destroy_stack(&self, req: Request<PodRef>) -> Result<Response<Empty>, Status> {
+        let name = proto::validate_name(&req.into_inner().name)
+            .map_err(bad)?
+            .to_string();
+        // Cheap membership check before touching the append-only ops map.
+        {
+            let st = self.st.lock().await;
+            if !st.pods.values().any(|m| m.stack == name) {
+                return Err(Status::not_found(format!("stack {name} not found")));
+            }
+        }
+        // Serialize against apply_stack and per-pod ops: take the stack key
+        // FIRST — an in-flight apply must finish before we enumerate members
+        // (a member added after listing would escape teardown).
+        let _stack_op = self.pod_op(&format!("stack:{name}")).await;
+        let members: Vec<String> = {
+            let st = self.st.lock().await;
+            st.pods
+                .values()
+                .filter(|m| m.stack == name)
+                .map(|m| m.name.clone())
+                .collect()
+        };
+        if members.is_empty() {
+            return Err(Status::not_found(format!("stack {name} not found")));
+        }
+        // Every member's op lock too, in sorted order (ordered acquisition).
+        let mut sorted = members.clone();
+        sorted.sort();
+        sorted.dedup();
+        let mut _guards = Vec::with_capacity(sorted.len());
+        for n in &sorted {
+            _guards.push(self.pod_op(n).await);
+        }
+        for pname in &members {
+            self.stop_engine(pname).await?;
+            if self.engine.registered(pname).await.map_err(int)? {
+                return Err(Status::failed_precondition(format!(
+                    "pod {pname} is still registered with machined — refusing to destroy stack"
+                )));
+            }
+            agent::stop_listener(&self.listeners, &self.metrics, pname).await;
+            self.st_delete(&self.pod_rootfs(pname)).await?;
+            state::remove_pod(&self.cfg.data_dir, pname);
+            agent::cleanup_pod_dirs(
+                &proto::run_dir(&self.cfg.data_dir, pname),
+                &proto::shm_host_dir(pname),
+            );
+            let mut st = self.st.lock().await;
+            st.pods.remove(pname);
+        }
+        let n = name.clone();
+        let _ = Self::blocking(move || {
+            net::teardown_stack_net(&n);
+            Ok(())
+        })
+        .await;
+        if let Err(e) = self.sync_nat().await {
+            tracing::warn!("nft rebuild after stack destroy failed: {e}");
+        }
+        // Members carrying ingress rules are gone — drop their routes
+        // promptly instead of waiting for the next reconcile tick (the
+        // shared net_index is free for reuse now). Best-effort: an
+        // unreachable gateway is healed by the reconciler.
+        if let Err(e) = self.sync_ingress(None, false).await {
+            tracing::warn!("ingress resync after stack {name} destroy failed: {e}");
+        }
+        // Evict op-lock entries for the destroyed members and the stack key —
+        // the pods are gone, so ops stays bounded by live pod names. Held
+        // guards keep working on their (now orphaned) Arc harmlessly.
+        self.release_op_slot(&format!("stack:{name}")).await;
+        for pname in &members {
+            self.release_op_slot(pname).await;
+        }
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn start_pod(&self, req: Request<StartPodRequest>) -> Result<Response<Pod>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.start_pod_work(req).await }).await
+    }
+
+    async fn stop_pod(&self, req: Request<PodRef>) -> Result<Response<Pod>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.stop_pod_work(req).await }).await
+    }
+
+    async fn list_pods(&self, _req: Request<ListPodsRequest>) -> Result<Response<PodList>, Status> {
+        // Clone the metas and DROP the state lock before the machined
+        // lookups — a D-Bus await under the global lock stalls every other
+        // RPC touching state.
+        let pods: Vec<PodMeta> = {
+            let st = self.st.lock().await;
+            st.pods.values().cloned().collect()
+        };
+        let hmap: HashMap<String, String> = {
+            let h = self.health.lock().await;
+            h.iter()
+                .map(|(k, v)| (k.clone(), v.status.to_string()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for m in &pods {
+            out.push(to_pod(
+                m,
+                &self.pod_rootfs(&m.name),
+                self.engine.running_pid(&m.name).await,
+                hmap.get(&m.name).map(String::as_str).unwrap_or(""),
+                self.mesh_prefix(),
+            ));
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Response::new(PodList { pods: out }))
+    }
+
+    async fn destroy_pod(&self, req: Request<PodRef>) -> Result<Response<Empty>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(&inflight, async move { svc.destroy_pod_work(req).await }).await
+    }
+
+    /// `rustypods config`: update the conf + live-apply to the scope.
+    async fn update_pod_config(
+        &self,
+        req: Request<UpdatePodConfigRequest>,
+    ) -> Result<Response<Pod>, Status> {
+        let svc = self.clone();
+        let inflight = Arc::clone(&self.inflight);
+        drive(
+            &inflight,
+            async move { svc.update_pod_config_work(req).await },
+        )
+        .await
     }
 
     /// `rustypods reload`: reread the conf from disk (hand edits) + apply.
@@ -5030,6 +5203,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         engine: engine.clone(),
         storage,
         ops: Default::default(),
+        inflight: Inflight::new(),
         ingress_generation: Arc::new(AtomicU64::new(0)),
         ingress_mu: Arc::new(Mutex::new(())),
         ingress_last_err: Arc::new(Mutex::new(None)),
@@ -5106,7 +5280,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
         match mesh::Mesh::start(&cfg.data_dir, conf).await {
             Ok(m) => {
                 tracing::info!("mesh up: {} on [::]:{}", m.prefix, m.port);
-                *svc.mesh.write().unwrap() = Some(m);
+                match svc.mesh.write() {
+                    Ok(mut g) => *g = Some(m),
+                    Err(poisoned) => {
+                        tracing::error!("mesh lock poisoned; recovering to store the mesh");
+                        *poisoned.into_inner() = Some(m);
+                    }
+                }
                 svc.assign_mesh_addrs().await;
             }
             Err(e) => tracing::error!("mesh start failed (mesh disabled): {e:#}"),
@@ -5161,37 +5341,40 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // recovery logs once.
     {
         let svc = svc.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                tick.tick().await;
-                let gw_name = {
-                    let st = svc.st.lock().await;
-                    st.pods
-                        .get(proto::INGRESS_POD)
-                        .filter(|m| m.ingress_gateway)
-                        .map(|m| m.name.clone())
-                };
-                let (configured, gw_running) = match gw_name {
-                    Some(n) => (true, svc.engine.running_pid(&n).await.is_some()),
-                    None => (false, false),
-                };
-                if !configured || !gw_running {
-                    continue;
-                }
-                match svc.sync_ingress(None, false).await {
-                    Ok(()) => {
-                        let mut last = svc.ingress_last_err.lock().await;
-                        if last.take().is_some() {
-                            tracing::info!("ingress reconciliation recovered");
-                        }
+        spawn_restarting("ingress reconciler", move || {
+            let svc = svc.clone();
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(2));
+                loop {
+                    tick.tick().await;
+                    let gw_name = {
+                        let st = svc.st.lock().await;
+                        st.pods
+                            .get(proto::INGRESS_POD)
+                            .filter(|m| m.ingress_gateway)
+                            .map(|m| m.name.clone())
+                    };
+                    let (configured, gw_running) = match gw_name {
+                        Some(n) => (true, svc.engine.running_pid(&n).await.is_some()),
+                        None => (false, false),
+                    };
+                    if !configured || !gw_running {
+                        continue;
                     }
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        let mut last = svc.ingress_last_err.lock().await;
-                        if last.as_deref() != Some(msg.as_str()) {
-                            tracing::warn!("ingress reconciliation: {msg}");
-                            *last = Some(msg);
+                    match svc.sync_ingress(None, false).await {
+                        Ok(()) => {
+                            let mut last = svc.ingress_last_err.lock().await;
+                            if last.take().is_some() {
+                                tracing::info!("ingress reconciliation recovered");
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("{e}");
+                            let mut last = svc.ingress_last_err.lock().await;
+                            if last.as_deref() != Some(msg.as_str()) {
+                                tracing::warn!("ingress reconciliation: {msg}");
+                                *last = Some(msg);
+                            }
                         }
                     }
                 }
@@ -5203,7 +5386,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // a restart policy or a healthcheck (and the managed gateway).
     {
         let svc = svc.clone();
-        tokio::spawn(async move {
+        spawn_critical("supervisor", async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -5227,9 +5410,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
                         token_path.display()
                     );
                     let router = crate::http::router(svc.clone(), token);
-                    tokio::spawn(async move {
+                    spawn_critical("http server", async move {
                         if let Err(e) = axum::serve(l, router).await {
-                            tracing::warn!("http api: {e}");
+                            tracing::error!("http api: {e}");
                         }
                     });
                 }
@@ -5244,40 +5427,80 @@ pub async fn serve(cfg: Config) -> Result<()> {
     {
         let gc = svc.clone();
         let every = Duration::from_secs(cfg.gc_interval_secs.max(1));
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(every);
-            loop {
-                tick.tick().await;
-                gc.gc_snapshots().await;
+        spawn_restarting("snapshot gc", move || {
+            let gc = gc.clone();
+            let every = every;
+            async move {
+                let mut tick = tokio::time::interval(every);
+                loop {
+                    tick.tick().await;
+                    gc.gc_snapshots().await;
+                }
             }
         });
     }
 
     let allowed = cfg.allowed_uid;
     let (tx, rx) = tokio::sync::mpsc::channel::<tokio::net::UnixStream>(32);
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((s, _)) => match s.peer_cred() {
-                    Ok(c) if c.uid() == 0 || c.uid() == allowed => {
-                        if tx.try_send(s).is_err() {
-                            tracing::warn!("accept queue full, connection dropped");
-                        }
-                    }
-                    Ok(c) => tracing::warn!("uid {} refused on rustypods.sock", c.uid()),
-                    Err(e) => tracing::warn!("peer_cred: {e}"),
-                },
+    let (shut_tx, shut_rx) = tokio::sync::watch::channel(false);
+    {
+        let shut_tx = shut_tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("accept: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tracing::error!("SIGTERM handler: {e}");
+                    std::process::exit(1);
                 }
+            };
+            let mut intr = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("SIGINT handler: {e}");
+                    std::process::exit(1);
+                }
+            };
+            tokio::select! {
+                _ = term.recv() => tracing::info!("SIGTERM — draining"),
+                _ = intr.recv() => tracing::info!("SIGINT — draining"),
+            }
+            let _ = shut_tx.send(true);
+        });
+    }
+    let mut shut_accept = shut_rx.clone();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                changed = shut_accept.changed() => {
+                    if changed.is_err() || *shut_accept.borrow() {
+                        break;
+                    }
+                }
+                acc = listener.accept() => match acc {
+                    Ok((s, _)) => match s.peer_cred() {
+                        Ok(c) if c.uid() == 0 || c.uid() == allowed => {
+                            if tx.try_send(s).is_err() {
+                                tracing::warn!("accept queue full, connection dropped");
+                            }
+                        }
+                        Ok(c) => tracing::warn!("uid {} refused on rustypods.sock", c.uid()),
+                        Err(e) => tracing::warn!("peer_cred: {e}"),
+                    },
+                    Err(e) => {
+                        tracing::warn!("accept: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                },
             }
         }
     });
-
+    let inflight = Arc::clone(&svc.inflight);
     let incoming = ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
     tracing::info!("rustypodsd listening on {}", cfg.socket.display());
-    Server::builder()
+    let mut shut_serve = shut_rx.clone();
+    let grpc = Server::builder()
         // The socket admits uid 0 and the allowed uid — both can spawn
         // streaming RPCs (journalctl/tail/nsenter). Cap in-flight requests
         // per connection and across the whole server so one chatty client
@@ -5285,10 +5508,32 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .concurrency_limit_per_connection(32)
         .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256))
         .add_service(PodControlServer::new(svc))
-        .serve_with_incoming_shutdown(incoming, async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+        .serve_with_incoming_shutdown(incoming, async move {
+            let _ = shut_serve.wait_for(|v| *v).await;
+        });
+    tokio::pin!(grpc);
+    let mut shut_main = shut_rx;
+    tokio::select! {
+        result = &mut grpc => {
+            result?;
+        }
+        joined = accept_task => {
+            if let Err(e) = joined {
+                tracing::error!("grpc accept panicked: {e}");
+                std::process::exit(1);
+            }
+            // Accept loop returned: shutdown closed it, or it stopped.
+            // Dropping `grpc` cancels handlers; detached mutating tasks
+            // keep running until the drain below.
+        }
+        _ = shut_main.changed() => {
+            tracing::info!("stopping accept; draining in-flight operations");
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(30), inflight.drained()).await {
+        Ok(()) => tracing::info!("in-flight operations finished"),
+        Err(_) => tracing::error!("drain timed out after 30s; exiting"),
+    }
     let _ = std::fs::remove_file(&cfg.socket);
     Ok(())
 }
