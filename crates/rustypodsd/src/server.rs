@@ -2139,6 +2139,8 @@ impl PodControl for Svc {
             healthcheck: hc,
             env: req.env.clone(),
             volumes: req.volumes.clone(),
+            host_access: false,
+            isolated: false,
         };
         let mut st = self.st.lock().await;
         if let Err(e) = validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress)) {
@@ -2666,6 +2668,8 @@ impl PodControl for Svc {
                         healthcheck: Default::default(),
                         env: sp.env.clone(),
                         volumes: sp.volumes.clone(),
+                        host_access: sp.host_access,
+                        isolated: sp.isolated,
                     };
                     let mut st = self.st.lock().await;
                     if st.pods.contains_key(&pname) {
@@ -3751,6 +3755,8 @@ impl PodControl for Svc {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
+            isolated: false,
         };
         // Copy the dataplane binary + LEAF pair into the rootfs via
         // symlink-safe helpers. The CA key NEVER leaves the host.
@@ -4873,6 +4879,7 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
+    net::load_pool().context("pod address pool")?;
     for d in [
         cfg.images_dir(),
         cfg.pods_dir(),
@@ -4940,11 +4947,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     // Engine + storage drivers, auto-detected. The nspawn engine owns the
     // shared system-bus connection (zbus multiplexes all calls over it).
-    let engine: Arc<dyn RuntimeEngine> = Arc::new(runtime::SystemdNspawn {
-        dbus: zbus::Connection::system()
-            .await
-            .context("connecting to system D-Bus")?,
-    });
+    let dbus = zbus::Connection::system()
+        .await
+        .context("connecting to system D-Bus")?;
+    let engine: Arc<dyn RuntimeEngine> = Arc::new(runtime::SystemdNspawn { dbus: dbus.clone() });
     // `detect` probes the fs with `stat -f` — a subprocess; off the
     // executor even though nothing is serving yet.
     let dd = cfg.data_dir.clone();
@@ -5121,6 +5127,28 @@ pub async fn serve(cfg: Config) -> Result<()> {
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // firewalld --reload and an nft flush drop pod NAT and zone bindings.
+    // Rebuild on a 30s tick and immediately on firewalld's Reloaded signal.
+    {
+        let svc = svc.clone();
+        let mut reloaded = net::watch_firewalld_reloads(dbus);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = reloaded.recv() => {
+                        tracing::info!("firewalld reloaded — reconciling pod firewall");
+                    }
+                }
+                if let Err(e) = svc.sync_nat().await {
+                    tracing::warn!("net reconcile: {e}");
+                }
+                let _ = tokio::task::spawn_blocking(net::rebind_firewalld_ifaces).await;
             }
         });
     }
@@ -5310,6 +5338,8 @@ mod tests {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
+            isolated: false,
         }
     }
 

@@ -71,8 +71,9 @@ enum Cmd {
         /// Btrfs quota cap on the pod rootfs, e.g. 20G (0 = none).
         #[arg(long)]
         storage_max: Option<String>,
-        /// Port mapping hostPort:podPort[/tcp|/udp]; repeatable.
-        /// Implies private networking (--network-veth), so no host-net parity.
+        /// Port mapping [hostIp:]hostPort:podPort[/tcp|/udp]; repeatable.
+        /// No host IP binds 127.0.0.1 only. 0.0.0.0 publishes on every
+        /// address. Implies private networking (--network-veth).
         #[arg(long)]
         port: Vec<String>,
         /// Desktop preset: your home + /tmp rw, /run/user/<uid> + /dev/dri ro.
@@ -1006,6 +1007,22 @@ fn pod_state(p: &Pod) -> &'static str {
     }
 }
 
+/// One line when a publish omits the host address. The daemon then
+/// binds 127.0.0.1 — a deliberate change from "every interface".
+fn note_implicit_port_binds(ports: &[String]) {
+    let implicit = ports.iter().any(|s| {
+        rustypods_proto::parse_port(s)
+            .ok()
+            .is_some_and(|p| p.implicit_loopback())
+    });
+    if implicit {
+        eprintln!(
+            "note: a port without a host address is published on 127.0.0.1 only — \
+             use 0.0.0.0:HOST:POD to publish on every address"
+        );
+    }
+}
+
 fn print_pod(p: &Pod) {
     let lim = p.limits.as_ref().map(|l| {
         let mut s = String::new();
@@ -1483,6 +1500,7 @@ async fn main() -> Result<()> {
             if !port.is_empty() || !ingress.is_empty() {
                 eprintln!("note: --port/--ingress imply a private netns (--network-veth); the pod no longer shares host networking");
             }
+            note_implicit_port_binds(&port);
             let mut ingress_rules = Vec::with_capacity(ingress.len());
             for spec in &ingress {
                 ingress_rules.push(rustypods_proto::parse_ingress_rule(spec)?);
@@ -1762,6 +1780,8 @@ async fn main() -> Result<()> {
                 print_pod(p);
             }
             println!("start: rustypods stack start {}", r.name);
+            let published: Vec<String> = r.pods.iter().flat_map(|p| p.ports.clone()).collect();
+            note_implicit_port_binds(&published);
         }
         Cmd::Stack { sub } => {
             let start = matches!(sub, StackCmd::Start { .. });

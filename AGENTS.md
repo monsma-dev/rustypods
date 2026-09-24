@@ -126,18 +126,48 @@ rustypodsd does it itself:
 
 - Pods with ports or ingress rules → `--network-veth` (private netns, no
   host-net parity).
-- Dual-stack pair per pod: host `ve-<name>` = 10.220.<idx>.1 plus
-  fd22:220:<idx>::1; pod `host0` = .2 / ::2. `net_index` is persisted.
+- Dual-stack pair per pod: host `ve-<name>` = <v4>.<idx>.1 plus
+  <v6>:<idx>::1; pod `host0` = .2 / ::2. Defaults `10.220.0.0/16` and
+  `fd22:220::/32` (max 255). Override with `RUSTYPODS_POD_NET4` /
+  `RUSTYPODS_POD_NET6` (must be `x.y.0.0/16` and `x:y::/32`). `doctor`
+  warns when the v4 pool overlaps a host route. `net_index` is persisted.
 - The daemon configures both veth ends through the leader's netns before
   start returns, so bare OCI payloads need no in-image `ip` or networkd.
   Boot images also get a matching dual-stack networkd file as persistence.
-- NAT = own `ip rustypods` nftables table, rebuilt from state on every
-  change: DNAT in prerouting+output, masquerade for pod egress, and
-  `fib saddr type local … masquerade` for host-originated traffic (without
-  it the pod answers 127.0.0.1 on ITS loopback).
+- Port spec is `[hostIp:]hostPort:podPort[/tcp|/udp]` (IPv4 literal, or
+  IPv6 in brackets). **No host IP means 127.0.0.1 only** — a deliberate
+  default so `-p 5432:5432` is not a public listener. `0.0.0.0:hp:pp`
+  is every IPv4 address (explicit). `::1` is rejected: it can never work.
+- NAT = own `ip rustypods` / `ip6 rustypods6` nftables tables, rebuilt
+  from state on every change. DNAT matches `ip daddr <hostIp>` (or
+  `fib daddr type local` for an explicit wildcard). A 127.0.0.1 publish
+  is **output-hook only**. Masquerade covers pod egress, and
+  `fib saddr type local … masquerade` covers host-originated traffic
+  (without it the pod answers 127.0.0.1 on ITS loopback).
+- Foreign FORWARD accepts (marker `rustypods-forward-v2`, top of the
+  chain, DOCKER-USER pattern) are `ct state established,related`,
+  `ct status dnat`, and `iifname "ve-*"` (pod egress and pod↔pod).
+  Never `ip daddr 10.220.0.0/16 accept` — that let any neighbour routing
+  the pod prefix hit unpublished ports. Pod↔pod is allowed only because
+  both ends are `ve-*` (Kubernetes-style). `isolated = true` drops
+  forwarded traffic whose source or dest is that pod and the other
+  address is still inside the pod pool. firewalld still gets the veth
+  in the trusted zone for egress; the DNAT match is what limits who
+  can open a published port.
 - Required sysctls: `net.ipv4.ip_forward=1`,
-  `net.ipv6.conf.all.forwarding=1`, and per-veth IPv4 `route_localnet=1` —
+  `net.ipv6.conf.all.forwarding=1` (after setting `accept_ra=2` on every
+  non-pod iface that was at `accept_ra=1`, otherwise the kernel drops
+  router advertisements and the IPv6 default route disappears — SLAAC
+  / kernel-RA hosts, not NetworkManager), and per-veth IPv4 `route_localnet=1` —
   without the latter, localhost→pod replies are dropped as martians.
+  `route_localnet` also lets a pod inject dst 127/8 toward the host
+  (CVE-2020-8558). The `inet rustypods` table drops that in raw
+  prerouting (`iifname "ve-*" ip daddr 127.0.0.0/8`). Replies of a
+  host→pod localhost DNAT arrive with dst = the veth .1 and are
+  de-NATed later, so the drop does not break them. A second input
+  rule drops NEW flows from pod veths to `fib daddr type local`,
+  except established replies, mesh DNS :53 / gossip :5305 on
+  `fd00::/8`, and pods with `host_access = true`.
 - nft scripts use `#` comments — `//` is a syntax error (broke a rebuild).
 - `pkexec` strips PATH to sbin-less dirs → always use absolute paths for
   nft/sysctl/tcpdump in scripts and one-off checks.
@@ -146,6 +176,13 @@ rustypodsd does it itself:
   in init_user_ns) → stack members run with `private_users: false`;
   standalone `create` pods get userns by default.
 - Privileged pod ports (<1024) need `--user root` inside the pod.
+- Stack uplinks are `ve-<4-char stem>-<7 hex>` (15 chars). A truncated
+  `ve-<first 12>` was reused when it already existed, so two stacks
+  sharing a prefix shared one veth and the second had no uplink. An
+  existing link is reused only when its peer sits in that stack's netns.
+- `rustypodsd teardown-net` (root) deletes the rustypods nft tables,
+  marker FORWARD/INPUT inserts (including mesh), and firewalld runtime
+  bindings. It does not restore sysctls; it logs what may still be set.
 - Hard-won: nspawn's host veth name for a >12-char machine name is NOT a
   plain truncation — systemd v257 rewrites it with a hash suffix
   (`ve-rustypod0iFF`). Resolve the host veth by peer ifindex
@@ -169,6 +206,10 @@ rustypodsd does it itself:
   adds each pod veth to the built-in `trusted` zone (ACCEPT target) —
   runtime-only, zero config mutation, inert once the veth dies.
   Verified on Fedora 44 / firewalld 2.4.4 / SELinux Enforcing.
+  `firewall-cmd --reload` drops those runtime bindings (and a flush
+  drops the nft table). `serve()` reconciles every 30s and on
+  firewalld's D-Bus `Reloaded` signal: rebuild the nft tables, reinsert
+  marker FORWARD/INPUT rules, and re-bind `ve-*` / `rp-mesh*` to trusted.
 - Hard-won: `::1`→pod dnat can NEVER work — the kernel hard-drops
   loopback tuples on non-loopback devices (tcp_v6_rcv; no v6
   `route_localnet` exists — same wall Docker hits). Leaving `::1:80/443`

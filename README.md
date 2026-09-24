@@ -161,24 +161,52 @@ limits are re-applied at every pod start.
 
 ```bash
 rustypods create web --image arch-base --port 18080:80 --port 53:53/udp
+# those two bind 127.0.0.1 only. To publish on every host address:
+rustypods create web --image arch-base --port 0.0.0.0:18080:80
+# or on one address: --port 192.0.2.10:18080:80
+# IPv6 host addresses go in brackets: --port [2001:db8::10]:18080:80
 ```
 
-Any pod with `--port` gets a private network namespace (`--network-veth`):
-host side `ve-<pod>` gets `10.220.<idx>.1/30`, the pod's `host0` gets a static
-`10.220.<idx>.2/30` (written into the rootfs before boot; index is stable per
-pod). The daemon manages its own `ip rustypods` nftables table:
+**Default bind is loopback.** A spec without a host address
+(`[hostIp:]hostPort:podPort[/tcp|/udp]`) publishes on **127.0.0.1 only**.
+`0.0.0.0:host:pod` is the explicit "every IPv4 address" form. This is
+intentional: `-p 5432:5432` must not open Postgres on the public zone
+just because the pod exists. The CLI prints a one-line notice when it
+creates an implicit loopback publish.
 
-- DNAT `host:port → pod:port` in prerouting + output (external *and*
-  localhost clients work)
+Any pod with `--port` gets a private network namespace (`--network-veth`):
+host side `ve-<pod>` gets `<pool>.<idx>.1/30`, the pod's `host0` gets a static
+`<pool>.<idx>.2/30` (written into the rootfs before boot; index is stable per
+pod). The pool defaults to `10.220.0.0/16` and `fd22:220::/32` (255 pods).
+Override it with `RUSTYPODS_POD_NET4` and `RUSTYPODS_POD_NET6` on the
+daemon if those ranges collide with a VPN; `doctor` warns when the v4
+pool overlaps an existing host route. The daemon manages its own `ip rustypods` nftables table:
+
+- DNAT matches `ip daddr <hostIp>`. Loopback publishes are **output-hook
+  only** (a prerouting rule cannot see them and must not exist).
+  `0.0.0.0` uses `fib daddr type local` in prerouting and output.
 - SNAT of host-originated traffic to the veth address (otherwise the pod
   would answer 127.0.0.1 on *its* loopback)
 - masquerade for pod egress
+- foreign FORWARD chains get marker accepts for DNATed flows, established
+  replies, and packets that arrive on `ve-*` — not a blanket accept of
+  the whole pod prefix, so an L2 neighbour cannot reach unpublished ports.
+  Pod-to-pod traffic is allowed (both ends are `ve-*`). Set
+  `isolated = true` on a pod to drop traffic between it and other pods.
 
 We do **not** use nspawn's `--port`: it depends on the host side of the veth
 being managed by systemd-networkd (its `80-container-ve.network` provides the
 DHCP+nft glue), which NetworkManager/Netplan desktops don't run. Required
 sysctls (`ip_forward`, `route_localnet` on the veth) are enabled
-automatically. Privileged pod ports (<1024) need `--user root` inside the
+automatically. Before IPv6 forwarding is turned on, interfaces still at
+`accept_ra=1` are set to `2` so kernel router advertisements keep
+working; NetworkManager hosts already learn RAs in userspace. `doctor`
+warns if a non-pod interface is left at `accept_ra=1` while forwarding
+is on. These sysctls are not restored on teardown. `route_localnet` is required for localhost→pod replies;
+the daemon compensates by dropping pod packets aimed at `127.0.0.0/8`
+and by refusing new connections from a pod to host-local addresses.
+Set `host_access = true` in the pod conf (or stack.toml) for a pod
+that must reach host services. Privileged pod ports (<1024) need `--user root` inside the
 pod, same as anywhere. Note: pods with ports lose host-net parity — DNS and
 outbound go through the NAT, and the pod's own IP replaces `localhost`.
 
@@ -213,7 +241,7 @@ name = "demo"
 
 [pods.web]
 image = "arch-base"
-ports = ["8081:8080"]        # published on the shared stack IP
+ports = ["8081:8080"]        # 127.0.0.1 only; DNAT to the shared stack IP
 
 [pods.api]
 image = "arch-base"

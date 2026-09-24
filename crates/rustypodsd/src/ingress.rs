@@ -144,6 +144,8 @@ mod tests {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
+            isolated: false,
         }
     }
 

@@ -327,6 +327,15 @@ pub struct PodMeta {
     /// subvols under volumes/ that outlive the pod.
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Allow this pod to open new connections to host-local addresses
+    /// (including 127.0.0.1). Default false: pod root can otherwise
+    /// reach host loopback services via the veth (route_localnet).
+    #[serde(default)]
+    pub host_access: bool,
+    /// Drop forwarded traffic between this pod and other pod veths.
+    /// Pod egress to the outside and published ports still work.
+    #[serde(default)]
+    pub isolated: bool,
 }
 
 /// A named volume: a btrfs subvolume under volumes/<name> that pods
@@ -902,6 +911,8 @@ fn migrate_json(data_dir: &Path) {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
+            isolated: false,
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");
@@ -968,6 +979,8 @@ mod tests {
             healthcheck: Default::default(),
             env: vec!["A=1".into(), "B=two=parts".into()],
             volumes: vec!["data:/data".into(), "cfg:/etc/app:ro".into()],
+            host_access: false,
+            isolated: false,
         };
         save_pod(&dir, &pod).unwrap();
         let st = load(&dir).unwrap();
@@ -1028,6 +1041,8 @@ mod tests {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
+            isolated: false,
         }
     }
 
