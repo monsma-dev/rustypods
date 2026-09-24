@@ -1290,6 +1290,42 @@ fn stdio_bridge(socket: &std::path::Path) -> Result<()> {
 /// Pull, export/load, apply, create, and start can outlast the 30s default.
 const LONG_RPC: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// A `\r`-redrawn byte counter on stderr. Redraws at most every 100ms and
+/// stays silent when stderr is not a terminal (logs, CI, `2>file`).
+struct Progress {
+    tty: bool,
+    last: Option<std::time::Instant>,
+}
+
+impl Progress {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            tty: std::io::stderr().is_terminal(),
+            last: None,
+        }
+    }
+
+    fn tick(&mut self, line: impl FnOnce() -> String) {
+        let due = self
+            .last
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
+        if self.tty && due {
+            self.last = Some(std::time::Instant::now());
+            eprint!("\r{}\x1b[K", line());
+        }
+    }
+
+    /// Final line; clears a redrawn counter first.
+    fn done(&self, line: &str) {
+        if self.tty {
+            eprintln!("\r{line}\x1b[K");
+        } else {
+            eprintln!("{line}");
+        }
+    }
+}
+
 async fn print_versions(cli: &Cli) -> Result<()> {
     println!("rustypods {}", env!("CARGO_PKG_VERSION"));
     match connect(cli.socket.clone(), cli.remote.clone()).await {
@@ -1851,20 +1887,21 @@ async fn main() -> Result<()> {
             };
             let write = async {
                 let mut total = 0u64;
+                let mut progress = Progress::new();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
                     if !chunk.warning.is_empty() {
-                        eprintln!("\nwarning: {}", chunk.warning);
+                        progress.done(&format!("warning: {}", chunk.warning));
                     }
                     if chunk.data.is_empty() {
                         continue;
                     }
                     total += chunk.data.len() as u64;
                     out.write_all(&chunk.data).await?;
-                    eprint!("\rexporting {pod}: {}\x1b[K", fmt_bytes(total));
+                    progress.tick(|| format!("exporting {pod}: {}", fmt_bytes(total)));
                 }
                 out.flush().await?;
-                eprintln!("\rexported {pod}: {}", fmt_bytes(total));
+                progress.done(&format!("exported {pod}: {}", fmt_bytes(total)));
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -1911,12 +1948,16 @@ async fn main() -> Result<()> {
                 use tokio::io::AsyncReadExt;
                 let mut buf = vec![0u8; 1 << 20];
                 let mut total = 0u64;
+                let mut progress = Progress::new();
                 loop {
                     match input.read(&mut buf).await {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            progress.done(&format!("uploaded: {}", fmt_bytes(total)));
+                            break;
+                        }
                         Ok(n) => {
                             total += n as u64;
-                            eprint!("\ruploading: {}\x1b[K", fmt_bytes(total));
+                            progress.tick(|| format!("uploading: {}", fmt_bytes(total)));
                             if tx
                                 .send(ImportChunk {
                                     kind: Some(Kind::Data(buf[..n].to_vec())),
@@ -1928,7 +1969,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            eprintln!("\nread error after {}: {e}", fmt_bytes(total));
+                            progress.done(&format!("read error after {}: {e}", fmt_bytes(total)));
                             break;
                         }
                     }
@@ -1938,7 +1979,7 @@ async fn main() -> Result<()> {
                 .import_pod(tokio_stream::wrappers::ReceiverStream::new(rx))
                 .await?
                 .into_inner();
-            eprintln!("\rimported {} ({})", pod.name, pod.rootfs);
+            eprintln!("imported {} ({})", pod.name, pod.rootfs);
             for n in &pod.notes {
                 eprintln!("import: {n}");
             }
