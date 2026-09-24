@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
     tokio::try_join!(
         async move { http.await.map_err(|e| anyhow::anyhow!("http: {e}")) },
         async move { https.await.map_err(|e| anyhow::anyhow!("https: {e}")) },
-        async move { ctrl.await },
+        ctrl,
     )
     .map(|_| ())
 }

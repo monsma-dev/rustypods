@@ -27,6 +27,9 @@ use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State, Vol
 use crate::storage::StorageDriver;
 use crate::{exec, ingress, mesh, net, pki, runtime, stack, storage, transfer, Config};
 
+/// (generation, routes) last committed to the ingress gateway.
+type IngressPush = (u64, Vec<ActiveIngressRoute>);
+
 #[derive(Clone)]
 pub struct Svc {
     cfg: Config,
@@ -61,7 +64,7 @@ pub struct Svc {
     /// GetStatus instead of committing an identical snapshot every 2s
     /// (each commit logs on the dataplane). `None` after daemon restart
     /// always forces a push — clearing whatever the gateway kept.
-    ingress_last_push: Arc<Mutex<Option<(u64, Vec<ActiveIngressRoute>)>>>,
+    ingress_last_push: Arc<Mutex<Option<IngressPush>>>,
     /// Per-pod supervisor state for liveness probes and restarts.
     /// Entries exist only while a pod is under supervision (running
     /// with a restart policy or a configured probe).
@@ -802,7 +805,7 @@ impl Svc {
                 });
             }
         }
-        out.sort_by(|a, b| b.created_unix.cmp(&a.created_unix));
+        out.sort_by_key(|s| std::cmp::Reverse(s.created_unix));
         out
     }
 
@@ -1250,9 +1253,7 @@ impl Svc {
         let feed_res = feed.await.map_err(int)?;
         if !out.status.success() || feed_res.is_err() {
             clean_staging(&staging, &self.storage).await;
-            if let Err(e) = feed_res {
-                return Err(e);
-            }
+            feed_res?;
             return Err(Status::internal(format!(
                 "unpack failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
@@ -1368,7 +1369,7 @@ impl Svc {
             .lock()
             .await
             .get(pod)
-            .map(|tx| tx.borrow().clone())
+            .map(|tx| *tx.borrow())
             .filter(|m| m.ts_unix_ms > 0)
     }
 
@@ -4104,7 +4105,7 @@ impl PodControl for Svc {
             // The watch channel's initial value is Metric::default() until
             // the agent's first push — don't stream a bogus all-zero
             // sample (ts_unix_ms == 0 marks it synthetic).
-            let first = rx.borrow().clone();
+            let first = *rx.borrow();
             if first.ts_unix_ms > 0 && tx.send(Ok(first)).await.is_err() {
                 return;
             }
@@ -4112,7 +4113,7 @@ impl PodControl for Svc {
                 if rx.changed().await.is_err() {
                     break;
                 }
-                let m = rx.borrow_and_update().clone();
+                let m = *rx.borrow_and_update();
                 if tx.send(Ok(m)).await.is_err() {
                     break;
                 }
@@ -4481,9 +4482,7 @@ fn import_distrobox(user: &str, container: &str, dest: &Path) -> Result<()> {
                 .context("reading podman export stream")
         });
     let s_exp = exp.wait()?;
-    if let Err(e) = copy_res {
-        return Err(e);
-    }
+    copy_res?;
     if !s_exp.success() {
         bail!("podman export '{container}' failed — does the box exist? (podman ps -a)");
     }

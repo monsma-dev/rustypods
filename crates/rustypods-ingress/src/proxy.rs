@@ -83,7 +83,7 @@ async fn health() -> &'static str {
 /// hyper exposes it via `uri().authority()`, so check the header first
 /// (h1 semantics) then the URI (h2 / absolute-form), same precedence as
 /// axum's `Host` extractor.
-fn canonical_host(req: &Request) -> Result<String, Response> {
+fn canonical_host(req: &Request) -> Result<String, &'static str> {
     let raw = req
         .headers()
         .get(header::HOST)
@@ -91,15 +91,15 @@ fn canonical_host(req: &Request) -> Result<String, Response> {
         .map(str::to_owned)
         .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()));
     let Some(s) = raw else {
-        return Err(bad_request("missing Host"));
+        return Err("missing Host");
     };
-    let authority: http::uri::Authority = s.parse().map_err(|_| bad_request("malformed Host"))?;
+    let authority: http::uri::Authority = s.parse().map_err(|_| "malformed Host")?;
     let host = authority.host().to_ascii_lowercase();
     validate_ingress_rule(&IngressRule {
         host: host.clone(),
         pod_port: 80,
     })
-    .map_err(|_| bad_request("host is not an ingress name"))?;
+    .map_err(|_| "host is not an ingress name")?;
     Ok(host)
 }
 
@@ -182,7 +182,7 @@ fn is_websocket_upgrade(h: &HeaderMap) -> bool {
 async fn http_redirect(req: Request) -> Response {
     let host = match canonical_host(&req) {
         Ok(h) => h,
-        Err(e) => return e,
+        Err(e) => return bad_request(e),
     };
     let pq = req
         .uri()
@@ -206,7 +206,7 @@ async fn proxy_request(st: &ProxyState, mut req: Request) -> Response {
     }
     let host = match canonical_host(&req) {
         Ok(h) => h,
-        Err(e) => return e,
+        Err(e) => return bad_request(e),
     };
     let Some(backend) = st.routes.lookup(&host) else {
         return StatusCode::NOT_FOUND.into_response();

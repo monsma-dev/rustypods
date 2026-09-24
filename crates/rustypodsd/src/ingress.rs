@@ -69,7 +69,7 @@ async fn control_client(data_dir: &Path) -> Result<IngressControlClient<Channel>
             async move {
                 UnixStream::connect(&p)
                     .await
-                    .map(|s| hyper_util::rt::TokioIo::new(s))
+                    .map(hyper_util::rt::TokioIo::new)
                     .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", p.display())))
             }
         }))

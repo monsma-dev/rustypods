@@ -51,6 +51,12 @@ pub struct RouteState {
     live: ArcSwap<LiveRoutes>,
 }
 
+impl Default for RouteState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RouteState {
     pub fn new() -> Self {
         Self {

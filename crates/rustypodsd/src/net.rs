@@ -959,6 +959,27 @@ pub fn check_ingress_ports_free() -> Result<()> {
     Ok(())
 }
 
+/// First usable upstream resolver for DNS forwarding. Prefers
+/// systemd-resolved's real upstream file over the 127.0.0.53 stub —
+/// either is reachable for the host daemon, but only the real one is
+/// usable as a pod's fallback nameserver.
+pub(crate) fn upstream_resolver() -> Option<std::net::SocketAddr> {
+    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(ns) = line.trim().strip_prefix("nameserver") else {
+                continue;
+            };
+            if let Ok(ip) = ns.trim().parse::<std::net::IpAddr>() {
+                return Some(std::net::SocketAddr::new(ip, 53));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,25 +1080,4 @@ mod tests {
         assert!(text.contains("Gateway=fd22:220:7::1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// First usable upstream resolver for DNS forwarding. Prefers
-/// systemd-resolved's real upstream file over the 127.0.0.53 stub —
-/// either is reachable for the host daemon, but only the real one is
-/// usable as a pod's fallback nameserver.
-pub(crate) fn upstream_resolver() -> Option<std::net::SocketAddr> {
-    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for line in text.lines() {
-            let Some(ns) = line.trim().strip_prefix("nameserver") else {
-                continue;
-            };
-            if let Ok(ip) = ns.trim().parse::<std::net::IpAddr>() {
-                return Some(std::net::SocketAddr::new(ip, 53));
-            }
-        }
-    }
-    None
 }

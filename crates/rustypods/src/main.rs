@@ -1841,7 +1841,7 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .find(|p| p.name == name)
                 .context(format!("pod {name} not found"))?;
-            let cur_lim = cur.limits.clone().unwrap_or_default();
+            let cur_lim = cur.limits.unwrap_or_default();
             let lim = Limits {
                 memory_high_bytes: memory_high
                     .as_deref()
@@ -2003,14 +2003,10 @@ async fn main() -> Result<()> {
                     }
                     break;
                 }
-                loop {
-                    match s.message().await {
-                        Ok(Some(l)) => {
-                            retries = 0; // healthy stream resets the budget
-                            print(&l.data)?;
-                        }
-                        Ok(None) | Err(_) => break, // EOF or error → reconnect
-                    }
+                // EOF or error ends the loop → reconnect
+                while let Ok(Some(l)) = s.message().await {
+                    retries = 0; // healthy stream resets the budget
+                    print(&l.data)?;
                 }
                 // Reconnect only while the pod is alive and running — a
                 // dead pod's stream ending is a normal exit, not a retry.

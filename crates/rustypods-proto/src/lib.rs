@@ -551,11 +551,11 @@ pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
 pub fn fmt_duration(secs: u64) -> String {
     if secs == 0 {
         "0s".into()
-    } else if secs % 86400 == 0 {
+    } else if secs.is_multiple_of(86400) {
         format!("{}d", secs / 86400)
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")

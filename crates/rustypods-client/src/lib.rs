@@ -6,7 +6,7 @@
 //! Used by both the `rustypods` CLI and the Tauri GUI backend.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
@@ -69,7 +69,7 @@ impl tokio::io::AsyncWrite for Conn {
     }
 }
 
-fn ssh_pipe(dest: &str, sock: &PathBuf) -> std::io::Result<Conn> {
+fn ssh_pipe(dest: &str, sock: &Path) -> std::io::Result<Conn> {
     // A dest starting with '-' would be read by ssh as an option.
     if dest.starts_with('-') {
         return Err(std::io::Error::new(

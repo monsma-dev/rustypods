@@ -140,6 +140,9 @@ pub fn in_prefix(prefix: Ipv6Addr, addr: Ipv6Addr) -> bool {
     addr.segments()[..3] == prefix.segments()[..3]
 }
 
+/// pod name → mesh address.
+type NameMap = std::collections::BTreeMap<String, Ipv6Addr>;
+
 /// Per-peer WG session + its announced endpoint.
 struct Peer {
     tunn: Tunn,
@@ -197,15 +200,7 @@ pub struct Mesh {
     local_names: Mutex<std::collections::BTreeMap<String, Ipv6Addr>>,
     /// peer /48 → (last refresh, its registry). Entries expire after
     /// NAME_TTL without an announce — a dead peer's names decay.
-    remote_names: Mutex<
-        HashMap<
-            Ipv6Addr,
-            (
-                std::time::Instant,
-                std::collections::BTreeMap<String, Ipv6Addr>,
-            ),
-        >,
-    >,
+    remote_names: Mutex<HashMap<Ipv6Addr, (std::time::Instant, NameMap)>>,
     /// Set by set_local_names/add_peer/remove_peer — wakes the
     /// announcer for an immediate push instead of waiting out the
     /// interval.

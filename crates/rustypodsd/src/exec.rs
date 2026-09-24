@@ -701,16 +701,13 @@ mod tests {
             "--"
         ]));
         // helpers resolve to absolute in-container paths
-        assert!(
-            s.iter().any(|x| *x == "/bin/setpriv"),
-            "everyone gets the cap drop"
-        );
-        assert!(s.iter().any(|x| *x == "/bin/env"));
+        assert!(s.contains(&"/bin/setpriv"), "everyone gets the cap drop");
+        assert!(s.contains(&"/bin/env"));
         assert!(
             !s.iter().any(|x| x.starts_with("--reuid")),
             "root gets no reuid"
         );
-        assert!(s.iter().any(|x| *x == "HOME=/root"));
+        assert!(s.contains(&"HOME=/root"));
         assert!(s.ends_with(&["echo", "hi"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -788,9 +785,9 @@ mod tests {
         let dir = fake_rootfs("login", true);
         let a = exec_argv(7, &dir, &start("nick", &[]), false).unwrap();
         let s: Vec<&str> = a.iter().map(|o| o.to_str().unwrap()).collect();
-        assert!(s.iter().any(|x| *x == "--reuid=1000"));
-        assert!(s.iter().any(|x| *x == "HOME=/home/nick"));
-        assert!(s.iter().any(|x| *x == "/bin/bash"));
+        assert!(s.contains(&"--reuid=1000"));
+        assert!(s.contains(&"HOME=/home/nick"));
+        assert!(s.contains(&"/bin/bash"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

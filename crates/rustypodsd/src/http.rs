@@ -223,7 +223,7 @@ async fn update_pod(
         .into_iter()
         .find(|p| p.name == name)
         .ok_or_else(|| api_err(Status::not_found(format!("pod {name} not found"))))?;
-    let cur_lim = cur.limits.clone().unwrap_or_default();
+    let cur_lim = cur.limits.unwrap_or_default();
     let p = s
         .update_pod_config(Request::new(UpdatePodConfigRequest {
             name,
