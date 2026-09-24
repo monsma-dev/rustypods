@@ -193,7 +193,11 @@ We do **not** use nspawn's `--port`: it depends on the host side of the veth
 being managed by systemd-networkd (its `80-container-ve.network` provides the
 DHCP+nft glue), which NetworkManager/Netplan desktops don't run. Required
 sysctls (`ip_forward`, `route_localnet` on the veth) are enabled
-automatically. Privileged pod ports (<1024) need `--user root` inside the
+automatically. `route_localnet` is required for localhost→pod replies;
+the daemon compensates by dropping pod packets aimed at `127.0.0.0/8`
+and by refusing new connections from a pod to host-local addresses.
+Set `host_access = true` in the pod conf (or stack.toml) for a pod
+that must reach host services. Privileged pod ports (<1024) need `--user root` inside the
 pod, same as anywhere. Note: pods with ports lose host-net parity — DNS and
 outbound go through the NAT, and the pod's own IP replaces `localhost`.
 

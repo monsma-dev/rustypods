@@ -142,6 +142,14 @@ rustypodsd does it itself:
 - Required sysctls: `net.ipv4.ip_forward=1`,
   `net.ipv6.conf.all.forwarding=1`, and per-veth IPv4 `route_localnet=1` —
   without the latter, localhost→pod replies are dropped as martians.
+  `route_localnet` also lets a pod inject dst 127/8 toward the host
+  (CVE-2020-8558). The `inet rustypods` table drops that in raw
+  prerouting (`iifname "ve-*" ip daddr 127.0.0.0/8`). Replies of a
+  host→pod localhost DNAT arrive with dst = the veth .1 and are
+  de-NATed later, so the drop does not break them. A second input
+  rule drops NEW flows from pod veths to `fib daddr type local`,
+  except established replies, mesh DNS :53 / gossip :5305 on
+  `fd00::/8`, and pods with `host_access = true`.
 - nft scripts use `#` comments — `//` is a syntax error (broke a rebuild).
 - `pkexec` strips PATH to sbin-less dirs → always use absolute paths for
   nft/sysctl/tcpdump in scripts and one-off checks.

@@ -809,7 +809,13 @@ pub fn nat_script<'a>(
     let mut dnat6_pre = String::new();
     let mut dnat6_out = String::new();
     let mut gw: Option<u32> = None;
+    let mut host_access_v4: Vec<String> = Vec::new();
+    let mut host_access_v6: Vec<String> = Vec::new();
     for m in pods.filter(|m| m.net_index > 0 && running.contains(&m.name)) {
+        if m.host_access {
+            host_access_v4.push(pod_ip(m.net_index).to_string());
+            host_access_v6.push(pod_ip6(m.net_index).to_string());
+        }
         if m.ingress_gateway {
             // Exactly one gateway is enforced at load; last one wins if
             // a hand-built state slips through — harmless, same shape.
@@ -882,6 +888,24 @@ pub fn nat_script<'a>(
              \x20   ip daddr 127.0.0.0/8 tcp dport 443 dnat ip to {v4}:8443\n"
         ));
     }
+    // host_access pods may open real connections to host services, including
+    // 127.0.0.1. Everyone else is dropped before conntrack so a forged
+    // 127/8 destination never becomes a flow.
+    let raw_drop = if host_access_v4.is_empty() {
+        "    iifname \"ve-*\" ip daddr 127.0.0.0/8 drop\n".to_string()
+    } else {
+        format!(
+            "    iifname \"ve-*\" ip saddr != {{ {} }} ip daddr 127.0.0.0/8 drop\n",
+            host_access_v4.join(", ")
+        )
+    };
+    let mut host_ok = host_access_v4
+        .iter()
+        .map(|ip| format!("    ip saddr {ip} accept\n"))
+        .collect::<String>();
+    for ip in &host_access_v6 {
+        host_ok.push_str(&format!("    ip6 saddr {ip} accept\n"));
+    }
     let rules = format!(
         "table ip rustypods {{\n\
          \x20 chain prerouting {{\n\
@@ -916,6 +940,24 @@ pub fn nat_script<'a>(
          \x20   # ULA pod egress onto the real network\n\
          \x20   ip6 saddr fd22:220::/32 oifname != \"ve-*\" masquerade\n\
          \x20 }}\n\
+         }}\n\
+         table inet rustypods {{\n\
+         \x20 chain rawpre {{\n\
+         \x20   type filter hook prerouting priority raw; policy accept;\n\
+         \x20   # Pod-injected dst 127/8 (route_localnet + CVE-2020-8558).\n\
+         \x20   # Replies to host→pod localhost DNAT arrive with dst = the\n\
+         \x20   # veth .1 and are de-NATed after this hook, so they miss it.\n\
+         {raw_drop}\
+         \x20 }}\n\
+         \x20 chain frompod {{\n\
+         \x20   type filter hook input priority -10; policy accept;\n\
+         \x20   iifname \"ve-*\" ct state established,related accept\n\
+         \x20   # Mesh DNS :53 and gossip :5305 on the host ULA.\n\
+         \x20   iifname \"ve-*\" ip6 daddr fd00::/8 udp dport 53 accept\n\
+         \x20   iifname \"ve-*\" ip6 daddr fd00::/8 udp dport 5305 accept\n\
+         {host_ok}\
+         \x20   iifname \"ve-*\" fib daddr type local drop\n\
+         \x20 }}\n\
          }}\n"
     );
     // Flush+replace atomically: declare each table (idempotent), delete
@@ -923,6 +965,7 @@ pub fn nat_script<'a>(
     format!(
         "add table ip rustypods\ndelete table ip rustypods\n\
          add table ip6 rustypods6\ndelete table ip6 rustypods6\n\
+         add table inet rustypods\ndelete table inet rustypods\n\
          {rules}"
     )
 }
@@ -1092,6 +1135,7 @@ mod tests {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
         }
     }
 
@@ -1176,6 +1220,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(forward_chain_current(&current));
+    }
+
+    #[test]
+    fn pods_cannot_reach_host_loopback_unless_opt_in() {
+        let db = pod_meta("db", 2, &["5432:5432"]);
+        let s = nat_script([&db].into_iter(), &running(&["db"]));
+        assert!(s.contains("iifname \"ve-*\" ip daddr 127.0.0.0/8 drop"));
+        assert!(s.contains("iifname \"ve-*\" fib daddr type local drop"));
+        assert!(s.contains("udp dport 53 accept"));
+        let raw = s.find("chain rawpre").unwrap();
+        let frompod = s.find("chain frompod").unwrap();
+        assert!(raw < frompod);
+        let mut opted = db.clone();
+        opted.host_access = true;
+        let s = nat_script([&opted].into_iter(), &running(&["db"]));
+        assert!(s.contains("ip saddr != { 10.220.2.2 } ip daddr 127.0.0.0/8 drop"));
+        assert!(s.contains("ip saddr 10.220.2.2 accept"));
+        assert!(s.contains("ip6 saddr fd22:220:2::2 accept"));
     }
 
     fn address_helpers() {

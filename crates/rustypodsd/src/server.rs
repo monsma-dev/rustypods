@@ -2143,6 +2143,7 @@ impl PodControl for Svc {
             healthcheck: hc,
             env: req.env.clone(),
             volumes: req.volumes.clone(),
+            host_access: false,
         };
         let mut st = self.st.lock().await;
         if let Err(e) = validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress)) {
@@ -2668,6 +2669,7 @@ impl PodControl for Svc {
                         healthcheck: Default::default(),
                         env: sp.env.clone(),
                         volumes: sp.volumes.clone(),
+                        host_access: sp.host_access,
                     };
                     let mut st = self.st.lock().await;
                     if st.pods.contains_key(&pname) {
@@ -3744,6 +3746,7 @@ impl PodControl for Svc {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
         };
         // Copy the dataplane binary + LEAF pair into the rootfs via
         // symlink-safe helpers. The CA key NEVER leaves the host.
@@ -5055,6 +5058,7 @@ mod tests {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
         }
     }
 

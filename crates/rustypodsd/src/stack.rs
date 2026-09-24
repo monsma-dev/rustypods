@@ -67,6 +67,9 @@ pub struct StackPod {
     /// Named-volume mounts "name:/pod/path[:ro]".
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Let this member open connections to host-local addresses.
+    #[serde(default)]
+    pub host_access: bool,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.
