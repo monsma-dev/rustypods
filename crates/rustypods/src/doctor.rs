@@ -313,6 +313,39 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             "{s} present"
         );
     }
+    let fwd6 = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding")
+        .ok()
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    if fwd6 {
+        let mut stuck = Vec::new();
+        if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name == "lo" || name.starts_with("ve-") || name.starts_with("rp-mesh") {
+                    continue;
+                }
+                let p = format!("/proc/sys/net/ipv6/conf/{name}/accept_ra");
+                if std::fs::read_to_string(&p).ok().as_deref().map(str::trim) == Some("1") {
+                    stuck.push(name);
+                }
+            }
+        }
+        if stuck.is_empty() {
+            chk!(
+                Level::Pass,
+                "ipv6-ra",
+                "forwarding=1 and no non-pod iface is stuck at accept_ra=1"
+            );
+        } else {
+            chk!(
+                Level::Warn,
+                "ipv6-ra",
+                "forwarding=1 with accept_ra=1 on {} — the kernel ignores router advertisements there (set accept_ra=2). NetworkManager hosts learn RAs in userspace.",
+                stuck.join(", ")
+            );
+        }
+    }
 
     // ── WARN / info checks ─────────────────────────────────────────────
     let target = if Path::new("/var/lib/rustypods").exists() {

@@ -140,7 +140,10 @@ rustypodsd does it itself:
   in the trusted zone for egress; the DNAT match is what limits who
   can open a published port.
 - Required sysctls: `net.ipv4.ip_forward=1`,
-  `net.ipv6.conf.all.forwarding=1`, and per-veth IPv4 `route_localnet=1` —
+  `net.ipv6.conf.all.forwarding=1` (after setting `accept_ra=2` on every
+  non-pod iface that was at `accept_ra=1`, otherwise the kernel drops
+  router advertisements and the IPv6 default route disappears — SLAAC
+  / kernel-RA hosts, not NetworkManager), and per-veth IPv4 `route_localnet=1` —
   without the latter, localhost→pod replies are dropped as martians.
   `route_localnet` also lets a pod inject dst 127/8 toward the host
   (CVE-2020-8558). The `inet rustypods` table drops that in raw

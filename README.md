@@ -193,7 +193,11 @@ We do **not** use nspawn's `--port`: it depends on the host side of the veth
 being managed by systemd-networkd (its `80-container-ve.network` provides the
 DHCP+nft glue), which NetworkManager/Netplan desktops don't run. Required
 sysctls (`ip_forward`, `route_localnet` on the veth) are enabled
-automatically. `route_localnet` is required for localhost→pod replies;
+automatically. Before IPv6 forwarding is turned on, interfaces still at
+`accept_ra=1` are set to `2` so kernel router advertisements keep
+working; NetworkManager hosts already learn RAs in userspace. `doctor`
+warns if a non-pod interface is left at `accept_ra=1` while forwarding
+is on. These sysctls are not restored on teardown. `route_localnet` is required for localhost→pod replies;
 the daemon compensates by dropping pod packets aimed at `127.0.0.0/8`
 and by refusing new connections from a pod to host-local addresses.
 Set `host_access = true` in the pod conf (or stack.toml) for a pod

@@ -640,12 +640,63 @@ pub fn ensure_ip_forward() -> Result<()> {
     let fwd = "/proc/sys/net/ipv4/ip_forward";
     if std::fs::read_to_string(fwd).ok().as_deref() != Some("1\n") {
         std::fs::write(fwd, "1").context("enable net.ipv4.ip_forward")?;
+        tracing::warn!(
+            "set net.ipv4.ip_forward=1 (not restored on teardown — disable it yourself if nothing else needs it)"
+        );
     }
+    // forwarding=1 makes the kernel ignore RAs on interfaces with
+    // accept_ra=1, which drops the IPv6 default route on SLAAC hosts.
+    // accept_ra=2 means "accept even when forwarding". Do this BEFORE
+    // enabling forwarding. NetworkManager-managed hosts learn RAs in
+    // userspace and are unaffected.
+    preserve_accept_ra();
     let fwd6 = "/proc/sys/net/ipv6/conf/all/forwarding";
     if std::fs::read_to_string(fwd6).ok().as_deref() != Some("1\n") {
         std::fs::write(fwd6, "1").context("enable net.ipv6.conf.all.forwarding")?;
+        tracing::warn!(
+            "set net.ipv6.conf.all.forwarding=1 (not restored on teardown)"
+        );
     }
     Ok(())
+}
+
+/// Interfaces that are not pod veths, stack peers, or the mesh TUN.
+pub fn non_pod_ifaces() -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/sys/class/net") else {
+        return names;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == "lo"
+            || name.starts_with(POD_VETH_PREFIX)
+            || name.starts_with("vp-")
+            || name.starts_with("rp-mesh")
+        {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    names
+}
+
+fn preserve_accept_ra() {
+    for name in non_pod_ifaces() {
+        let path = format!("/proc/sys/net/ipv6/conf/{name}/accept_ra");
+        let Ok(cur) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if cur.trim() == "1" {
+            match std::fs::write(&path, "2") {
+                Ok(()) => tracing::warn!(
+                    "set net.ipv6.conf.{name}.accept_ra=2 before enabling IPv6 forwarding \
+                     (was 1; kernel would ignore router advertisements)"
+                ),
+                Err(e) => tracing::warn!("accept_ra {name}: {e}"),
+            }
+        }
+    }
 }
 
 /// Mesh forwarding accepts (Wave I): pod↔tun traffic carries ULA
