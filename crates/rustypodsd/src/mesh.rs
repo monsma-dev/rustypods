@@ -941,8 +941,8 @@ impl Mesh {
     async fn answer_query(&self, pkt: &[u8]) -> Option<Vec<u8>> {
         let (qname, qtype) = dns_query_name(pkt)?;
         match self.resolve(&qname).await {
-            Some(addr) if qtype == 28 => Some(dns_answer_aaaa(pkt, addr)),
-            Some(_) => Some(dns_nodata(pkt)),
+            Some(addr) if qtype == 28 => dns_answer_aaaa(pkt, addr),
+            Some(_) => dns_nodata(pkt),
             None => self.dns_forward(pkt).await,
         }
     }
@@ -964,30 +964,49 @@ impl Mesh {
 
 /// Extract (single-label name, qtype) from a DNS query. Recognizes a
 /// bare `db`, `db.rp`, `db.pods` or `db.local` — the zone suffixes a
-/// pod's `search` line or a typed FQDN produces.
+/// pod's `search` line or a typed FQDN produces. Every index is
+/// bounds-checked: a truncated question (missing qclass, cut-off
+/// label) returns None instead of panicking the DNS task.
 fn dns_query_name(pkt: &[u8]) -> Option<(String, u16)> {
     if pkt.len() < 12 || pkt[2] & 0x80 != 0 {
         return None; // not a query
     }
+    // One question only — qd=0 has nothing to answer, qd>1 is not
+    // something the mesh resolver owns.
+    let qd = u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]);
+    if qd != 1 {
+        return None;
+    }
     let mut qname = String::new();
     let mut i = 12;
+    let mut labels = 0usize;
     loop {
         let len = *pkt.get(i)? as usize;
         if len == 0 {
             break;
         }
-        if len & 0xc0 != 0 {
-            return None; // compression in a question — refuse
+        // Compression pointer or an over-long label — refuse rather
+        // than walk off the buffer (a 0xC0 length used to be added
+        // unchecked and the following slice panicked).
+        if len & 0xc0 != 0 || len > 63 {
+            return None;
         }
-        i += 1;
-        let label = std::str::from_utf8(pkt.get(i..i + len)?).ok()?;
+        i = i.checked_add(1)?;
+        let label = std::str::from_utf8(pkt.get(i..i.checked_add(len)?)?).ok()?;
         if !qname.is_empty() {
             qname.push('.');
         }
         qname.push_str(&label.to_lowercase());
-        i += len;
+        i = i.checked_add(len)?;
+        labels += 1;
+        if labels > 128 {
+            return None;
+        }
     }
-    let qtype = u16::from_be_bytes([*pkt.get(i + 1)?, *pkt.get(i + 2)?]);
+    // qtype AND qclass — an 18-byte `db` query has the type but not
+    // the class; answering it used to panic in dns_response_base.
+    let qtype = u16::from_be_bytes([*pkt.get(i.checked_add(1)?)?, *pkt.get(i.checked_add(2)?)?]);
+    let _qclass = u16::from_be_bytes([*pkt.get(i.checked_add(3)?)?, *pkt.get(i.checked_add(4)?)?]);
     for zone in [".rp", ".pods", ".local", ".rustypods"] {
         if let Some(stripped) = qname.strip_suffix(zone) {
             qname = stripped.to_string();
@@ -1000,18 +1019,52 @@ fn dns_query_name(pkt: &[u8]) -> Option<(String, u16)> {
     Some((qname, qtype))
 }
 
-/// Flip the query header into a response (QR|RA, rcode NOERROR), keep
-/// the question section, and truncate any prior answers.
+/// Walk one uncompressed DNS name starting at `i`. Returns the index
+/// just past the root label. Compression pointers and labels >63 are
+/// rejected — the builders only echo a question they fully own.
+fn dns_skip_name(pkt: &[u8], mut i: usize) -> Option<usize> {
+    let mut labels = 0usize;
+    loop {
+        let len = *pkt.get(i)? as usize;
+        if len == 0 {
+            return i.checked_add(1);
+        }
+        if len & 0xc0 != 0 || len > 63 {
+            return None;
+        }
+        i = i.checked_add(1)?.checked_add(len)?;
+        if pkt.get(i).is_none() {
+            return None;
+        }
+        labels += 1;
+        if labels > 128 {
+            return None;
+        }
+    }
+}
+
+/// Flip the query header into a response (QR|AA|RA, rcode NOERROR),
+/// keep the single question, and drop any prior answers. None when
+/// the packet is truncated, compressed, or not exactly one question —
+/// callers must not slice past `pkt.len()`.
 fn dns_response_base(pkt: &[u8]) -> Option<Vec<u8>> {
+    if pkt.get(..12).is_none() {
+        return None;
+    }
     let qd = u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]) as usize;
+    if qd != 1 {
+        return None;
+    }
     let mut i = 12;
     for _ in 0..qd {
-        while *pkt.get(i)? != 0 {
-            i += 1 + *pkt.get(i)? as usize;
+        i = dns_skip_name(pkt, i)?;
+        // qtype + qclass
+        if pkt.get(i..i.checked_add(4)?)?.len() != 4 {
+            return None;
         }
-        i += 5; // root label + qtype + qclass
+        i += 4;
     }
-    let mut out = pkt[..i].to_vec();
+    let mut out = pkt.get(..i)?.to_vec();
     out[2] |= 0x84; // QR + AA
     out[3] = 0x80; // RA
     out[6..8].copy_from_slice(&[0, 0]); // ancount
@@ -1021,15 +1074,13 @@ fn dns_response_base(pkt: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// NOERROR with zero answers — correct for `A podname` on a v6 mesh.
-fn dns_nodata(pkt: &[u8]) -> Vec<u8> {
-    dns_response_base(pkt).unwrap_or_else(|| pkt.to_vec())
+fn dns_nodata(pkt: &[u8]) -> Option<Vec<u8>> {
+    dns_response_base(pkt)
 }
 
 /// AAAA answer for a resolved mesh name: name compressed to 0xC00C.
-fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Vec<u8> {
-    let Some(mut out) = dns_response_base(pkt) else {
-        return pkt.to_vec();
-    };
+fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Option<Vec<u8>> {
+    let mut out = dns_response_base(pkt)?;
     out[6..8].copy_from_slice(&[0, 1]); // ancount = 1
     out.extend_from_slice(&[0xc0, 0x0c]); // name → question
     out.extend_from_slice(&28u16.to_be_bytes()); // AAAA
@@ -1037,7 +1088,7 @@ fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Vec<u8> {
     out.extend_from_slice(&5u32.to_be_bytes()); // TTL 5s
     out.extend_from_slice(&16u16.to_be_bytes()); // rdlength
     out.extend_from_slice(&addr.octets());
-    out
+    Some(out)
 }
 
 /// Registry values must stay inside the announcer's own /48 — never
@@ -1193,7 +1244,7 @@ mod tests {
     fn dns_aaaa_answer_roundtrips() {
         let q = dns_query("db", 28);
         let addr = Ipv6Addr::new(0xfd41, 0x85b6, 0xa9dd, 4, 0, 0, 0, 2);
-        let ans = dns_answer_aaaa(&q, addr);
+        let ans = dns_answer_aaaa(&q, addr).unwrap();
         // Header: QR set, ancount=1.
         assert_eq!(ans[2] & 0x80, 0x80);
         assert_eq!(&ans[6..8], &[0, 1]);
@@ -1207,10 +1258,76 @@ mod tests {
 
     #[test]
     fn dns_nodata_has_zero_answers() {
-        let ans = dns_nodata(&dns_query("db", 1));
+        let ans = dns_nodata(&dns_query("db", 1)).unwrap();
         assert_eq!(ans[2] & 0x80, 0x80); // still a valid response
         assert_eq!(&ans[6..8], &[0, 0]); // ancount = 0 → NODATA
         assert_eq!(ans[3] & 0x0f, 0); // rcode NOERROR, not NXDOMAIN
+    }
+
+    /// The 18-byte `db` query that killed the DNS task: header + label
+    /// + root + qtype, qclass truncated. Builders must return None.
+    #[test]
+    fn dns_truncated_question_does_not_panic() {
+        let mut q = dns_query("db", 28);
+        assert!(q.len() > 18);
+        q.truncate(18);
+        assert_eq!(dns_query_name(&q), None);
+        assert_eq!(dns_response_base(&q), None);
+        assert_eq!(dns_nodata(&q), None);
+        assert_eq!(dns_answer_aaaa(&q, Ipv6Addr::LOCALHOST), None);
+
+        assert_eq!(dns_query_name(&[0u8; 11]), None); // truncated header
+        assert_eq!(dns_response_base(&[0u8; 11]), None);
+
+        let mut qd0 = dns_query("db", 28);
+        qd0[4] = 0;
+        qd0[5] = 0;
+        assert_eq!(dns_query_name(&qd0), None);
+        assert_eq!(dns_response_base(&qd0), None);
+
+        let mut qd2 = dns_query("db", 28);
+        qd2[5] = 2;
+        assert_eq!(dns_query_name(&qd2), None);
+        assert_eq!(dns_response_base(&qd2), None);
+
+        // Compression pointer where a label length should be.
+        let mut comp = dns_query("db", 28);
+        comp[12] = 0xc0;
+        comp[13] = 0x0c;
+        assert_eq!(dns_query_name(&comp), None);
+        assert_eq!(dns_response_base(&comp), None);
+
+        // Label length 64 (illegal) and a length that would walk past
+        // the buffer if added unchecked.
+        let mut big = vec![0u8; 20];
+        big[5] = 1; // qdcount
+        big[12] = 64;
+        assert_eq!(dns_query_name(&big), None);
+        assert_eq!(dns_answer_aaaa(&big, Ipv6Addr::LOCALHOST), None);
+        big[12] = 200;
+        assert_eq!(dns_response_base(&big), None);
+    }
+
+    /// Every parser/builder must survive arbitrary input. xorshift so
+    /// the sequence is deterministic and dependency-free.
+    #[test]
+    fn dns_random_bytes_never_panic() {
+        let mut state = 0xA5A5_1234u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for _ in 0..4_000 {
+            let len = (next() % 80) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let _ = dns_query_name(&buf);
+            let _ = dns_response_base(&buf);
+            let _ = dns_nodata(&buf);
+            let _ = dns_answer_aaaa(&buf, Ipv6Addr::LOCALHOST);
+            let _ = dns_skip_name(&buf, (next() as usize) % (len.max(1)));
+        }
     }
 
     #[test]
