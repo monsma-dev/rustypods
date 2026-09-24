@@ -176,6 +176,24 @@ pub struct IngressSpec {
 /// A missing `private_users` key must mean ON: serde's default(false)
 /// would silently drop userns isolation on a hand-edited conf. Explicit
 /// `private_users = false` (stack members, desktop pods) still parses.
+pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 8;
+
+fn default_stop_timeout() -> u64 {
+    DEFAULT_STOP_TIMEOUT_SECS
+}
+
+/// Poweroff grace for a conf value. 0 means the historical 8s default.
+pub fn stop_grace(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(if secs == 0 {
+        DEFAULT_STOP_TIMEOUT_SECS
+    } else {
+        secs
+    })
+}
+
+/// A missing `private_users` key must mean ON: serde's default(false)
+/// would silently drop userns isolation on a hand-edited conf. Explicit
+/// `private_users = false` (stack members, desktop pods) still parses.
 fn default_true() -> bool {
     true
 }
@@ -222,6 +240,10 @@ pub struct PodMeta {
     /// (unless-stopped). Absent in older confs → false.
     #[serde(default)]
     pub stopped_by_user: bool,
+    /// How long `stop` waits after SIGRTMIN+3 before TerminateMachine.
+    /// 0 and older confs use [`DEFAULT_STOP_TIMEOUT_SECS`] (8s).
+    #[serde(default = "default_stop_timeout")]
+    pub stop_timeout_secs: u64,
     /// Btrfs qgroup cap on the pod rootfs; 0 = none.
     /// Serialized as `storage_max = "20G"`.
     #[serde(default, with = "bytes_field")]
@@ -639,10 +661,7 @@ pub fn load(data_dir: &Path) -> Result<State> {
             if let Some(other) = claimed.get(&i.host) {
                 drop_pods.push((
                     m.name.clone(),
-                    format!(
-                        "ingress host '{}' is also claimed by pod {other}",
-                        i.host
-                    ),
+                    format!("ingress host '{}' is also claimed by pod {other}", i.host),
                 ));
                 break;
             }
@@ -858,6 +877,7 @@ fn migrate_json(data_dir: &Path) {
             // started is volatile; running state comes from machined live.
             started: false,
             stopped_by_user: false,
+            stop_timeout_secs: 0,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![],
@@ -1032,6 +1052,7 @@ mod tests {
                 private_users: true,
                 started: false,
                 stopped_by_user: false,
+                stop_timeout_secs: 0,
                 storage_max_bytes: 0,
                 ports: vec![],
                 ingress: vec![],
@@ -1095,6 +1116,7 @@ mod tests {
             cmd: vec![],
             started: false,
             stopped_by_user: false,
+            stop_timeout_secs: 0,
             ingress: vec![],
             ingress_gateway: false,
             restart: String::new(),
@@ -1132,6 +1154,9 @@ mod tests {
         save_pod(&dir, &pod).unwrap();
         let st = load(&dir).unwrap();
         assert!(st.pods["legacy"].stopped_by_user);
+        assert_eq!(st.pods["old"].stop_timeout_secs, DEFAULT_STOP_TIMEOUT_SECS);
+        assert_eq!(stop_grace(0).as_secs(), 8);
+        assert_eq!(stop_grace(30).as_secs(), 30);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1145,6 +1170,7 @@ mod tests {
             private_users: true,
             started: false,
             stopped_by_user: false,
+            stop_timeout_secs: 0,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![IngressSpec {
@@ -1247,7 +1273,10 @@ mod tests {
         save_pod(&dir, &bad).unwrap();
         let st = load(&dir).unwrap();
         assert!(st.pods.contains_key("rustypods-ingress"));
-        assert!(!st.pods.contains_key("evil"), "wrong-name gateway is quarantined");
+        assert!(
+            !st.pods.contains_key("evil"),
+            "wrong-name gateway is quarantined"
+        );
         std::fs::remove_file(dir.join("conf/pods/evil.conf")).unwrap();
 
         // Reserved name without the flag → quarantine, daemon still loads.

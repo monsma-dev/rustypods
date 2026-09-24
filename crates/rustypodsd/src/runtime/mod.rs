@@ -59,7 +59,7 @@ pub trait RuntimeEngine: Send + Sync {
     /// Returns the leader pid (init inside the pod).
     async fn start(&self, spec: &StartSpec, limits: &LimitsSpec) -> Result<u32>;
     /// Clean shutdown (SIGRTMIN+3 → terminate fallback for nspawn).
-    async fn stop(&self, pod: &str) -> Result<()>;
+    async fn stop(&self, pod: &str, grace: std::time::Duration) -> Result<()>;
     /// Leader pid while running, None otherwise. A pod registered with
     /// machined but still booting reports Some(0) — running, but without a
     /// usable pid yet (nsenter callers must refuse 0).

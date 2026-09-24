@@ -64,6 +64,9 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
 
 - `KillMachine(name, "leader", SIGRTMIN+3)` = `machinectl poweroff`
   (SIGRTMIN=34 on glibc → signo 37; verified on systemd 257).
+  The wait before `TerminateMachine` is the pod's `stop_timeout`
+  (conf + `create`/`config --stop-timeout`, default 8s). The hard-kill
+  wait after that stays ~4s.
 - `TerminateMachine(name)` = `machinectl terminate` (hard kill).
 - `Machine.leader`/`.unit` properties give the leader pid + authoritative
   scope name — never format `machine-<name>.scope` yourself.
@@ -177,6 +180,8 @@ rustypodsd does it itself:
 
 - Per-second `supervise_once` tick over pods with a restart policy, a
   configured probe, or `ingress_gateway` (managed ⇒ always "always").
+  Pods are supervised concurrently (cap 8); the tick awaits them, so
+  each pod has at most one in-flight action.
 - Death-watch keys on `PodMeta.stopped_by_user` (persisted in the pod
   conf, serde default false) plus an in-memory `stop_intent` mirror for
   the tick that races the conf write. `PodMeta.started` means "was ever

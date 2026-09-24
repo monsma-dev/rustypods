@@ -98,6 +98,8 @@ struct PodHealth {
 /// Hard cap on a single SHM segment — the file lives on /dev/shm (tmpfs),
 /// so an unbounded set_len is a RAM DoS.
 const SHM_MAX_BYTES: u64 = 4 << 30;
+/// How many pods the supervisor may probe or restart at once.
+const SUPERVISE_PARALLEL: usize = 8;
 
 /// Atomically swap two directory entries on the same mount.
 /// `RENAME_EXCHANGE` is the only way a crash cannot observe "neither
@@ -769,6 +771,18 @@ impl Svc {
         let (s, a, b) = (self.storage.clone(), src.to_path_buf(), dst.to_path_buf());
         Self::blocking(move || s.clone_rootfs(&a, &b)).await
     }
+    /// Stop using the pod's configured grace (0 → historical 8s).
+    async fn stop_engine(&self, name: &str) -> Result<(), Status> {
+        let secs = {
+            let st = self.st.lock().await;
+            st.pods.get(name).map(|m| m.stop_timeout_secs).unwrap_or(0)
+        };
+        self.engine
+            .stop(name, state::stop_grace(secs))
+            .await
+            .map_err(int)
+    }
+
     async fn st_delete(&self, path: &Path) -> Result<(), Status> {
         let (s, p) = (self.storage.clone(), path.to_path_buf());
         Self::blocking(move || s.delete_rootfs(&p)).await
@@ -1523,9 +1537,28 @@ impl Svc {
                 .collect()
         };
         let now = std::time::Instant::now();
-        for m in &pods {
-            if let Err(e) = self.supervise_pod(m, now).await {
-                tracing::warn!("supervise {}: {e:#}", m.name);
+        // One slow start (ingress wait, D-Bus) must not stall death-watch
+        // for every other pod. The semaphore caps parallelism; this
+        // function is awaited by the tick, so a pod has at most one
+        // in-flight action.
+        let sem = Arc::new(tokio::sync::Semaphore::new(SUPERVISE_PARALLEL));
+        let mut joins = Vec::with_capacity(pods.len());
+        for m in pods {
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let svc = self.clone();
+            joins.push(tokio::spawn(async move {
+                let _permit = permit;
+                if let Err(e) = svc.supervise_pod(&m, now).await {
+                    tracing::warn!("supervise {}: {e:#}", m.name);
+                }
+            }));
+        }
+        for join in joins {
+            if let Err(e) = join.await {
+                tracing::error!("supervise task panicked: {e}");
             }
         }
     }
@@ -1977,7 +2010,7 @@ impl Svc {
             self.stop_intent.lock().await.insert(name.to_string());
             self.persist_stop_intent(name, true).await?;
         }
-        self.engine.stop(name).await.map_err(int)?;
+        self.stop_engine(name).await?;
         agent::stop_listener(&self.listeners, &self.metrics, name).await;
         let st = self.st.lock().await;
         let Some(m) = st.pods.get(name) else {
@@ -2290,6 +2323,11 @@ impl PodControl for Svc {
             proto::validate_argv(&req.cmd).map_err(bad)?;
         }
         proto::validate_restart(&req.restart).map_err(bad)?;
+        if req.stop_timeout_secs > 600 {
+            return Err(Status::invalid_argument(
+                "stop_timeout_secs must be 0 (default 8s) or 1..=600",
+            ));
+        }
         let hc = req
             .healthcheck
             .as_ref()
@@ -2333,6 +2371,7 @@ impl PodControl for Svc {
             healthcheck: hc,
             env: req.env.clone(),
             volumes: req.volumes.clone(),
+            stop_timeout_secs: req.stop_timeout_secs,
         };
         let mut st = self.st.lock().await;
         if let Err(e) = validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress)) {
@@ -2428,6 +2467,7 @@ impl PodControl for Svc {
             created_unix: state::now_unix(),
             started: false,
             stopped_by_user: false,
+            stop_timeout_secs: 0,
             // Fresh identity: net_index is reallocated on first start so two
             // clones can run side by side. Ports are kept — running BOTH
             // clones with identical host ports is a user-visible conflict.
@@ -2545,7 +2585,7 @@ impl PodControl for Svc {
                 }
             )));
         };
-        self.engine.stop(&pod).await.map_err(int)?; // rollback discards live state
+        self.stop_engine(&pod).await?; // rollback discards live state
         agent::stop_listener(&self.listeners, &self.metrics, &pod).await;
         let rootfs = self.pod_rootfs(&pod);
         let snap_path = std::path::Path::new(&snap.path);
@@ -2882,6 +2922,7 @@ impl PodControl for Svc {
                         private_users: false,
                         started: false,
                         stopped_by_user: false,
+                        stop_timeout_secs: 0,
                         storage_max_bytes: sp.storage_max_bytes,
                         ports: sp.ports.clone(),
                         ingress: ingress_from_proto(&member_ingress[&pname]),
@@ -3003,7 +3044,7 @@ impl PodControl for Svc {
             _guards.push(self.pod_op(n).await);
         }
         for pname in &members {
-            self.engine.stop(pname).await.map_err(int)?;
+            self.stop_engine(pname).await?;
             if self.engine.registered(pname).await.map_err(int)? {
                 return Err(Status::failed_precondition(format!(
                     "pod {pname} is still registered with machined — refusing to destroy stack"
@@ -3307,7 +3348,7 @@ impl PodControl for Svc {
             Ok(pid) => Some(pid),
             Err(e) => {
                 agent::stop_listener(&self.listeners, &self.metrics, &name).await;
-                let _ = self.engine.stop(&name).await;
+                let _ = self.stop_engine(&name).await;
                 return Err(int(e));
             }
         };
@@ -3340,7 +3381,7 @@ impl PodControl for Svc {
         if needs_network && meta.stack.is_empty() {
             if let Err(e) = net::configure_veth(&name, meta.net_index, leader.unwrap_or(0)).await {
                 agent::stop_listener(&self.listeners, &self.metrics, &name).await;
-                let _ = self.engine.stop(&name).await;
+                let _ = self.stop_engine(&name).await;
                 return Err(int(e));
             }
             // Mesh identity is part of "started" too — a pod that can't
@@ -3351,7 +3392,7 @@ impl PodControl for Svc {
                     net::configure_mesh_addr(meta.net_index, leader.unwrap_or(0), m.prefix).await
                 {
                     agent::stop_listener(&self.listeners, &self.metrics, &name).await;
-                    let _ = self.engine.stop(&name).await;
+                    let _ = self.stop_engine(&name).await;
                     return Err(int(e));
                 }
             }
@@ -3362,7 +3403,7 @@ impl PodControl for Svc {
         if meta.ingress_gateway {
             if let Err(e) = self.wait_ingress_ready().await {
                 agent::stop_listener(&self.listeners, &self.metrics, &name).await;
-                let _ = self.engine.stop(&name).await;
+                let _ = self.stop_engine(&name).await;
                 return Err(e);
             }
         }
@@ -3373,7 +3414,7 @@ impl PodControl for Svc {
                     // NAT is what makes ingress reachable — a failed
                     // rebuild means a "running" pod that's dark. Unwind.
                     agent::stop_listener(&self.listeners, &self.metrics, &name).await;
-                    let _ = self.engine.stop(&name).await;
+                    let _ = self.stop_engine(&name).await;
                     let _ = self.sync_nat().await;
                     return Err(e);
                 }
@@ -3389,7 +3430,7 @@ impl PodControl for Svc {
         if meta.ingress_gateway || !meta.ingress.is_empty() {
             if let Err(e) = self.sync_ingress(None, true).await {
                 agent::stop_listener(&self.listeners, &self.metrics, &name).await;
-                let _ = self.engine.stop(&name).await;
+                let _ = self.stop_engine(&name).await;
                 if needs_network {
                     let _ = self.sync_nat().await;
                 }
@@ -3485,7 +3526,7 @@ impl PodControl for Svc {
                 ));
             }
         }
-        self.engine.stop(&name).await.map_err(int)?;
+        self.stop_engine(&name).await?;
         // Never delete the rootfs of a pod machined still knows about —
         // a failed/busy bus must not look like "pod is gone".
         if self.engine.registered(&name).await.map_err(int)? {
@@ -3676,6 +3717,14 @@ impl PodControl for Svc {
             // Absent = keep the current boot flag.
             if let Some(a) = req.autostart {
                 m.autostart = a;
+            }
+            if let Some(t) = req.stop_timeout_secs {
+                if t > 600 {
+                    return Err(Status::invalid_argument(
+                        "stop_timeout_secs must be 0 (default 8s) or 1..=600",
+                    ));
+                }
+                m.stop_timeout_secs = t;
             }
             // Restart policy + probe: applied by the supervisor's next
             // tick — no pod restart needed.
@@ -3893,6 +3942,7 @@ impl PodControl for Svc {
             private_users: true,
             started: prev.map(|m| m.started).unwrap_or(false),
             stopped_by_user: prev.map(|m| m.stopped_by_user).unwrap_or(false),
+            stop_timeout_secs: prev.map(|m| m.stop_timeout_secs).unwrap_or(0),
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![],
@@ -5264,6 +5314,7 @@ mod tests {
             private_users: true,
             started: false,
             stopped_by_user: false,
+            stop_timeout_secs: 0,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: hosts

@@ -85,6 +85,9 @@ enum Cmd {
         /// Boot this pod automatically whenever the daemon starts.
         #[arg(long)]
         autostart: bool,
+        /// Seconds to wait for a clean poweroff before hard-kill (default 8).
+        #[arg(long)]
+        stop_timeout: Option<u64>,
         /// Ingress rule <host>.rustypods.localhost:<pod-port>; repeatable.
         /// Implies private networking (--network-veth).
         #[arg(long)]
@@ -239,6 +242,9 @@ enum Cmd {
         /// Boot with the daemon: --autostart on|off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         autostart: Option<bool>,
+        /// Seconds to wait for a clean poweroff before hard-kill.
+        #[arg(long)]
+        stop_timeout: Option<u64>,
         /// Ingress rule <host>.rustypods.localhost:<pod-port>; repeatable.
         /// Replaces the whole list — the pod must be stopped.
         #[arg(long, conflicts_with = "clear_ingress")]
@@ -1477,6 +1483,7 @@ async fn main() -> Result<()> {
             env,
             env_file,
             volume,
+            stop_timeout,
         } => {
             let storage_max_bytes = storage_max
                 .as_deref()
@@ -1519,6 +1526,7 @@ async fn main() -> Result<()> {
                     healthcheck,
                     env,
                     volumes: volume,
+                    stop_timeout_secs: stop_timeout.unwrap_or(0),
                 })
                 .await?
                 .into_inner();
@@ -1833,6 +1841,7 @@ async fn main() -> Result<()> {
             clear_env,
             volume,
             clear_volumes,
+            stop_timeout,
         } => {
             // Missing flags = keep current values → fetch them first.
             let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
@@ -1936,6 +1945,7 @@ async fn main() -> Result<()> {
                     healthcheck,
                     env,
                     volumes,
+                    stop_timeout_secs: stop_timeout,
                 })
                 .await?
                 .into_inner();

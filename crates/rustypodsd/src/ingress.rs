@@ -123,6 +123,7 @@ mod tests {
             private_users: true,
             started: false,
             stopped_by_user: false,
+            stop_timeout_secs: 0,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: rules

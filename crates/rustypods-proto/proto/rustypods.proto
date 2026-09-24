@@ -370,6 +370,8 @@ message CreatePodRequest {
   // Named volumes "name:/pod/path[:ro]" — auto-created on first use,
   // survive pod destroy.
   repeated string volumes = 14;
+  // Seconds to wait for a clean poweroff before hard-kill. 0 = 8s.
+  uint64 stop_timeout_secs = 15;
 }
 
 message ClonePodRequest {
@@ -486,6 +488,8 @@ message UpdatePodConfigRequest {
   // Absent = keep; present (even empty) = replace volume mounts.
   // Takes effect on the next pod start.
   optional VolumeList volumes = 14;
+  // Absent = keep. 0 = the 8s default. Seconds before hard-kill on stop.
+  optional uint64 stop_timeout_secs = 15;
 }
 
 message StartPodRequest {

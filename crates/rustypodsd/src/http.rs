@@ -174,6 +174,7 @@ async fn create_pod(
             healthcheck: b.healthcheck,
             env: b.env,
             volumes: b.volumes,
+            stop_timeout_secs: 0,
         }))
         .await
         .map_err(api_err)?
@@ -249,6 +250,7 @@ async fn update_pod(
             healthcheck: b.healthcheck,
             env: b.env.map(|entries| EnvList { entries }),
             volumes: b.volumes.map(|specs| VolumeList { specs }),
+            stop_timeout_secs: None,
         }))
         .await
         .map_err(api_err)?
