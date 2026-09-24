@@ -44,6 +44,26 @@ const STDIN_DUP_FD: i32 = 9;
 /// exit chunk would never ship. Bound the drain: grace 2s, send exit anyway.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Name prefix for payload env keys that must not sit in the host
+/// nsenter's environ; the in-pod wrapper restores the real name.
+const ESCAPED_ENV_PREFIX: &str = "RUSTYPODS_ENV_";
+
+/// Keys the host's dynamic loader or glibc act on at nsenter startup
+/// (nsenter runs as root on the host fs before it setns()es).
+fn loader_sensitive(key: &str) -> bool {
+    const PREFIXES: &[&str] = &["LD_", "MALLOC_", "GLIBC_"];
+    const EXACT: &[&str] = &[
+        "GCONV_PATH",
+        "LOCPATH",
+        "NLSPATH",
+        "HOSTALIASES",
+        "RES_OPTIONS",
+        "LOCALDOMAIN",
+        "TZDIR",
+    ];
+    PREFIXES.iter().any(|p| key.starts_with(p)) || EXACT.contains(&key)
+}
+
 /// pre_exec step: stash the real stdin on a high fd that survives nsenter's
 /// fd-0 clobber (dup2 clears CLOEXEC, so it propagates through the
 /// nsenter→[setpriv→]sh exec chain).
@@ -483,6 +503,7 @@ pub fn exec_plan(
         a.push(format!("--bounding-set=-all,+{}", NSPAWN_DEFAULT_CAPS.join(",+")).into());
         a.push("--".into());
     }
+    let mut escaped: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = vec![
         ("HOME".into(), t.home.clone()),
         ("USER".into(), t.name.clone()),
@@ -526,8 +547,24 @@ pub fn exec_plan(
             env.push((key.into(), "C.UTF-8".into()));
             continue;
         }
+        if loader_sensitive(key) {
+            // The environ first reaches the HOST nsenter (root, before
+            // setns): ld.so would honor LD_PRELOAD/GLIBC_TUNABLES/… from
+            // a host path. Carry it under an inert name and export it
+            // from the in-pod shell instead.
+            env.push((format!("{ESCAPED_ENV_PREFIX}{key}"), value.into()));
+            escaped.push(key.to_string());
+            continue;
+        }
         env.push((key.into(), value.into()));
     }
+    // Keys are validated [A-Za-z_][A-Za-z0-9_]* above — safe to splice.
+    let reexport: String = escaped
+        .iter()
+        .map(|k| {
+            format!("export {k}=\"${ESCAPED_ENV_PREFIX}{k}\"; unset {ESCAPED_ENV_PREFIX}{k}; ")
+        })
+        .collect();
     // workdir rides in the environment, not the sh -c string — no quoting
     // edge cases on spaces/single quotes in the path.
     if !start.workdir.is_empty() {
@@ -543,7 +580,7 @@ pub fn exec_plan(
         a.push("/bin/sh".into());
         a.push("-c".into());
         a.push(
-            format!("exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; cd \"${{RUSTYPODS_WORKDIR:-$HOME}}\" && exec \"$0\" \"$@\"")
+            format!("exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; {reexport}cd \"${{RUSTYPODS_WORKDIR:-$HOME}}\" && exec \"$0\" \"$@\"")
                 .into(),
         );
         a.push(t.shell.clone().into());
@@ -553,7 +590,7 @@ pub fn exec_plan(
         a.push("-c".into());
         a.push(
             format!(
-                "exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; \
+                "exec 0<&{STDIN_DUP_FD} {STDIN_DUP_FD}<&-; {reexport}\
                  if [ -n \"$RUSTYPODS_WORKDIR\" ]; then cd \"$RUSTYPODS_WORKDIR\" || exit 1; fi; \
                  exec \"$0\" \"$@\""
             )
@@ -1332,6 +1369,34 @@ mod tests {
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.iter().all(|(_, v)| v.is_some()));
         assert!(envs.iter().any(|(k, _)| *k == "HOME"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loader-sensitive keys never reach the host nsenter's environ under
+    /// their real name; the in-pod wrapper re-exports them.
+    #[test]
+    fn loader_env_is_escaped_past_host_nsenter() {
+        let dir = fake_rootfs("ldenv", true);
+        for argv in [&["true"][..], &[][..]] {
+            let mut s = start("nick", argv);
+            s.env = vec![
+                "LD_PRELOAD=/tmp/x.so".into(),
+                "GLIBC_TUNABLES=glibc.malloc.check=3".into(),
+                "GCONV_PATH=/tmp".into(),
+                "FOO=bar".into(),
+            ];
+            let p = exec_plan(42, &dir, &s, false).unwrap();
+            for k in ["LD_PRELOAD", "GLIBC_TUNABLES", "GCONV_PATH"] {
+                assert_eq!(env_of(&p, k), None, "{k} on host environ");
+                assert!(env_of(&p, &format!("RUSTYPODS_ENV_{k}")).is_some());
+                assert!(strs(&p).iter().any(|x| x.contains(&format!(
+                    "export {k}=\"$RUSTYPODS_ENV_{k}\"; unset RUSTYPODS_ENV_{k};"
+                ))));
+            }
+            assert_eq!(env_of(&p, "LD_PRELOAD"), None);
+            assert_eq!(env_of(&p, "RUSTYPODS_ENV_LD_PRELOAD"), Some("/tmp/x.so"));
+            assert_eq!(env_of(&p, "FOO"), Some("bar"));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
