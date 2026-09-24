@@ -401,13 +401,47 @@ impl Mesh {
             }
         }));
         // Mesh-DNS tasks: registry gossip + pod-facing DNS responder.
-        // All subscribe to shutdown_tx and land in `tasks` so
-        // shutdown() can wait for a real teardown.
+        // Each runs under a supervisor (a panic would otherwise die on
+        // a dropped JoinHandle and take DNS or gossip down for good).
+        // shutdown() awaits these handles; the inner tasks exit when
+        // the watch channel flips.
         let mut tasks = mesh.tasks.lock().await;
-        tasks.push(tokio::spawn(mesh.clone().gossip_rx()));
-        tasks.push(tokio::spawn(mesh.clone().announcer()));
-        tasks.push(tokio::spawn(mesh.clone().dns_server()));
-        tasks.push(tokio::spawn(mesh.clone().dns_tcp_server()));
+        tasks.push(supervise_loop(
+            "gossip",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().gossip_rx())
+            },
+        ));
+        tasks.push(supervise_loop(
+            "announcer",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().announcer())
+            },
+        ));
+        tasks.push(supervise_loop(
+            "dns",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().dns_server())
+            },
+        ));
+        tasks.push(supervise_loop(
+            "dns-tcp",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().dns_tcp_server())
+            },
+        ));
         drop(tasks);
         Ok(mesh)
     }
@@ -1187,6 +1221,33 @@ fn valid_dns_label(n: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Restart `spawn` until it returns normally or `shutdown` is set.
+/// A panic sleeps `backoff` (doubled each time, capped at 30s) and
+/// tries again — the same idea as the pump supervisor, so a DNS or
+/// gossip panic does not stay dead until the daemon restarts.
+fn supervise_loop(
+    name: &'static str,
+    shutdown: watch::Receiver<bool>,
+    mut backoff: Duration,
+    spawn: impl Fn() -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            match spawn().await {
+                Ok(()) => break,
+                Err(e) => {
+                    tracing::error!("mesh {name} panicked: {e}; restarting in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    })
+}
+
 /// Build one boringtun session for a peer conf.
 fn build_peer(secret: &StaticSecret, pc: &MeshPeerConf, index: u32) -> Result<(Peer, SocketAddr)> {
     let pk = parse_pubkey(&pc.pubkey)?;
@@ -1398,6 +1459,37 @@ mod tests {
         assert_eq!(DNS_UDP_INFLIGHT, 64);
         assert!(DNS_TCP_MAX_CONNS > 0 && DNS_TCP_MAX_CONNS <= DNS_UDP_INFLIGHT);
         assert_eq!(DNS_TCP_IDLE, Duration::from_secs(5));
+    }
+
+    /// A panicked background task is restarted; a clean return ends the
+    /// supervisor. Shutdown set before the next spawn also ends it.
+    #[tokio::test]
+    async fn supervisor_restarts_then_stops() {
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runs2 = runs.clone();
+        let (_tx, rx) = watch::channel(false);
+        let h = supervise_loop("test", rx, Duration::from_millis(20), move || {
+            let runs = runs2.clone();
+            tokio::spawn(async move {
+                if runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    panic!("mesh task boom");
+                }
+            })
+        });
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("supervisor hung")
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let (_tx2, rx2) = watch::channel(true);
+        let h = supervise_loop("test-stop", rx2, Duration::from_secs(30), || {
+            tokio::spawn(async { panic!("should not run") })
+        });
+        tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("shutdown did not stop supervisor")
+            .unwrap();
     }
 
     #[test]
