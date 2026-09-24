@@ -25,9 +25,8 @@ struct Cli {
     socket: PathBuf,
 
     /// Manage a remote daemon over SSH: `rustypods --remote user@host ps`.
-    /// Spawns `ssh <dest> socat - UNIX-CONNECT:<socket>` as the transport —
-    /// no extra ports, full SSH auth/encryption. Requires socat (or nc-openbsd
-    /// with -U) on the remote host.
+    /// Spawns `ssh <dest> rustypods stdio-bridge` (falls back to socat) as
+    /// the transport — no extra ports, full SSH auth/encryption.
     #[arg(long, global = true)]
     remote: Option<String>,
 
@@ -363,6 +362,13 @@ enum Cmd {
     Volume {
         #[command(subcommand)]
         sub: VolumeCmd,
+    },
+    /// Copy stdin/stdout onto the daemon Unix socket. Hidden: `--remote`
+    /// runs this over ssh so the far side does not need socat.
+    #[command(hide = true)]
+    StdioBridge {
+        #[arg(long)]
+        socket: PathBuf,
     },
     /// Multi-host mesh: userspace WireGuard (BoringTun) giving every pod
     /// a ULA address reachable from pods on peer hosts — L3, no NAT.
@@ -1203,6 +1209,27 @@ fn collect_env(env_file: Option<&PathBuf>, env: Vec<String>) -> Result<Vec<Strin
     Ok(out)
 }
 
+/// Bidirectional copy between stdio and the daemon socket. Blocking is
+/// fine: this process does nothing else. Shutdown(Write) on stdin EOF
+/// so the daemon sees the client go away.
+fn stdio_bridge(socket: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    let mut writer = std::os::unix::net::UnixStream::connect(socket)
+        .with_context(|| format!("connect {}", socket.display()))?;
+    let mut reader = writer.try_clone()?;
+    let stdout_thread = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::stdout());
+    });
+    let _ = std::io::copy(&mut std::io::stdin(), &mut writer);
+    let _ = writer.shutdown(std::net::Shutdown::Write);
+    let _ = writer.flush();
+    let _ = stdout_thread.join();
+    Ok(())
+}
+
+/// Pull, export/load, apply, create, and start can outlast the 30s default.
+const LONG_RPC: std::time::Duration = std::time::Duration::from_secs(3600);
+
 async fn print_versions(cli: &Cli) -> Result<()> {
     println!("rustypods {}", env!("CARGO_PKG_VERSION"));
     match connect(cli.socket.clone(), cli.remote.clone()).await {
@@ -1227,6 +1254,10 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     };
     match cmd {
+        Cmd::StdioBridge { socket } => {
+            stdio_bridge(&socket)?;
+            return Ok(());
+        }
         Cmd::Doctor => {
             if cli.remote.is_some() {
                 anyhow::bail!(
@@ -1437,18 +1468,15 @@ async fn main() -> Result<()> {
         Cmd::Pull { reference, name } => {
             println!("pulling {reference} (this can take a while)...");
             // Pulls routinely outlast the default 30s call bound.
-            let img = rustypods_client::connect_timeout(
-                cli.socket.clone(),
-                cli.remote.clone(),
-                std::time::Duration::from_secs(600),
-            )
-            .await?
-            .pull_image(PullImageRequest {
-                reference,
-                name: name.unwrap_or_default(),
-            })
-            .await?
-            .into_inner();
+            let img =
+                rustypods_client::connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
+                    .await?
+                    .pull_image(PullImageRequest {
+                        reference,
+                        name: name.unwrap_or_default(),
+                    })
+                    .await?
+                    .into_inner();
             println!("image {} → {}", img.name, img.path);
             if !img.entrypoint.is_empty() || !img.cmd.is_empty() {
                 println!(
@@ -1473,19 +1501,16 @@ async fn main() -> Result<()> {
                 None => current_username()?,
             };
             println!("exporting: {from_distrobox} → {name} (this can take a while)...");
-            let img = rustypods_client::connect_timeout(
-                cli.socket.clone(),
-                cli.remote.clone(),
-                std::time::Duration::from_secs(600),
-            )
-            .await?
-            .import_image(ImportImageRequest {
-                name: name.clone(),
-                distrobox: from_distrobox,
-                import_user: user,
-            })
-            .await?
-            .into_inner();
+            let img =
+                rustypods_client::connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
+                    .await?
+                    .import_image(ImportImageRequest {
+                        name: name.clone(),
+                        distrobox: from_distrobox,
+                        import_user: user,
+                    })
+                    .await?
+                    .into_inner();
             println!("image {} → {}", img.name, img.path);
         }
         Cmd::Rmi { name } => {
@@ -1541,7 +1566,7 @@ async fn main() -> Result<()> {
             for spec in &volume {
                 rustypods_proto::parse_volume_spec(spec)?;
             }
-            let p = connect(cli.socket.clone(), cli.remote.clone())
+            let p = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
                 .await?
                 .create_pod(CreatePodRequest {
                     name,
@@ -1579,7 +1604,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            let p = connect(cli.socket.clone(), cli.remote.clone())
+            let p = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
                 .await?
                 .start_pod(StartPodRequest {
                     name: name.clone(),
@@ -1690,7 +1715,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Export { pod, output } => {
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let mut c = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?;
             let mut stream = c
                 .export_pod(PodRef { name: pod.clone() })
                 .await?
@@ -1719,12 +1744,7 @@ async fn main() -> Result<()> {
         Cmd::Load { file, name } => {
             // The unary reply only lands after the full upload — the
             // default 30s call timeout would cut big archives mid-send.
-            let mut c = connect_timeout(
-                cli.socket.clone(),
-                cli.remote.clone(),
-                std::time::Duration::from_secs(3600),
-            )
-            .await?;
+            let mut c = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?;
             use rustypods_proto::rpc::import_chunk::Kind;
             // Open before the RPC so a missing file errors locally.
             let mut input: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if file == "-" {
@@ -1790,7 +1810,7 @@ async fn main() -> Result<()> {
         Cmd::Apply { file } => {
             let toml =
                 std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
-            let r = connect(cli.socket.clone(), cli.remote.clone())
+            let r = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
                 .await?
                 .apply_stack(ApplyStackRequest { toml })
                 .await?
@@ -1809,7 +1829,11 @@ async fn main() -> Result<()> {
         }
         Cmd::Stack { sub } => {
             let start = matches!(sub, StackCmd::Start { .. });
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let mut c = if start {
+                connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?
+            } else {
+                connect(cli.socket.clone(), cli.remote.clone()).await?
+            };
             match sub {
                 StackCmd::Destroy { name } => {
                     c.destroy_stack(PodRef { name: name.clone() }).await?;

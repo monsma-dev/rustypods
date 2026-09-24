@@ -36,7 +36,11 @@ fn warn_version_mismatch(daemon_version: &str, remote: bool) {
     if versions_compatible(ours, daemon_version) {
         return;
     }
-    let where_ = if remote { "remote daemon" } else { "local daemon" };
+    let where_ = if remote {
+        "remote daemon"
+    } else {
+        "local daemon"
+    };
     eprintln!(
         "warning: this CLI is {ours} but the {where_} is {daemon_version} (major.minor differ) — upgrade both before relying on this session"
     );
@@ -98,6 +102,17 @@ impl tokio::io::AsyncWrite for Conn {
     }
 }
 
+/// Remote shell snippet: prefer the hidden `stdio-bridge` subcommand so
+/// the far side needs no socat, and fall back to socat for older installs.
+pub fn remote_bridge_script(sock: &Path) -> String {
+    let q = shell_quote(&sock.display().to_string());
+    format!("rustypods stdio-bridge --socket {q} || socat - UNIX-CONNECT:{q}")
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn ssh_pipe(dest: &str, sock: &Path) -> std::io::Result<Conn> {
     // A dest starting with '-' would be read by ssh as an option.
     if dest.starts_with('-') {
@@ -117,9 +132,9 @@ fn ssh_pipe(dest: &str, sock: &Path) -> std::io::Result<Conn> {
             "-o",
             "ConnectTimeout=8",
             dest,
-            "socat",
-            "-",
-            &format!("UNIX-CONNECT:{}", sock.display()),
+            "sh",
+            "-c",
+            &remote_bridge_script(sock),
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -145,7 +160,9 @@ pub async fn connect_timeout(
 ) -> Result<PodControlClient<Channel>> {
     let is_remote = remote.is_some();
     let err_hint = match &remote {
-        Some(d) => format!("connecting to rustypodsd via {d} — ssh up? socat installed remotely?"),
+        Some(d) => format!(
+            "connecting to rustypodsd via {d} — ssh up? remote needs `rustypods` (stdio-bridge) or socat"
+        ),
         None => {
             "connecting to rustypodsd — is it running? (sudo systemctl start rustypodsd)".into()
         }
@@ -198,5 +215,14 @@ mod tests {
         assert!(!versions_compatible("0.2.0", "0.1.0"));
         assert!(!versions_compatible("1.0.0", "0.1.0"));
         assert!(!versions_compatible("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn remote_bridge_quotes_socket_and_falls_back_to_socat() {
+        let s = remote_bridge_script(Path::new("/run/rustypods/daemon.sock"));
+        assert!(s.contains("rustypods stdio-bridge --socket '/run/rustypods/daemon.sock'"));
+        assert!(s.contains("|| socat - UNIX-CONNECT:"));
+        let q = remote_bridge_script(Path::new("/tmp/it's.sock"));
+        assert!(q.contains("'\\''"));
     }
 }

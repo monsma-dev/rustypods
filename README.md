@@ -20,7 +20,7 @@ dataplane: /dev/shm/rustypods/<pod>/  ──bind──>  /run/rustypods/shm/  (m
 channel:   /var/lib/rustypods/run/<pod>/agent.sock ──bind──> /run/rustypods/run/
 network:   pods with --port get a private netns: ve-<pod> (10.220.<idx>.1/30) ↔ host0 (10.220.<idx>.2/30)
 stacks:    all members share ONE named netns (rustypods-<stack>) — 127.0.0.1 is shared, K8s-pod style
-remote:    rustypods --remote user@host … — gRPC over `ssh … socat - UNIX-CONNECT:` (no extra ports)
+remote:    rustypods --remote user@host … — gRPC over `ssh … rustypods stdio-bridge` (socat fallback)
 ```
 
 - `crates/rustypods-proto` — gRPC contract + shared helpers
@@ -132,7 +132,7 @@ rustypods commit dev "pre-upgrade"        # instant rootfs snapshot — the time
 rustypods snapshots dev
 rustypods rollback dev                    # or: --to <id>; swaps rootfs, pod ends stopped
 rustypods destroy dev                     # also removes its snapshots
-rustypods --remote user@server ps         # manage a remote daemon over SSH (needs socat there)
+rustypods --remote user@server ps         # SSH; remote rustypods stdio-bridge, or socat if the CLI is old
 ```
 
 Handy flags: `start --ephemeral` (throwaway run, `-x`) and
