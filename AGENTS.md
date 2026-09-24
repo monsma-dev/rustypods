@@ -454,6 +454,8 @@ Ingress CAs created from here on are `pathLen=0` and name-constrained to
 removes it from the host trust store. The leaf renews with under 30 days
 left; the daemon copies the new pair into the gateway rootfs and restarts
 the pod, and the gateway also reloads the files when their mtime changes.
+The gateway control socket is opened `O_PATH|O_NOFOLLOW` and must be a
+socket owned by the run-directory uid — a pod-planted symlink is refused.
 
 ## REST API surface (Wave G)
 

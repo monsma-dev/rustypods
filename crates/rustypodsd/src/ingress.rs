@@ -3,6 +3,7 @@
 //! the push/status helpers speak tonic over the managed Unix socket.
 
 use std::collections::BTreeSet;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -59,18 +60,62 @@ pub fn build_snapshot(
 
 /// Connect to the gateway control UDS: 1s connect, 2s per-request bound —
 /// a hung dataplane must not stall the daemon's pod-lock caller forever.
+/// Open the gateway control socket without following a symlink. The path
+/// lives in the pod's run directory, which pod-root can rewrite. A symlink
+/// there would make the root daemon connect to an arbitrary host socket.
+/// The inode is opened `O_PATH|O_NOFOLLOW` and must be a socket owned by
+/// the same uid as the run directory (root, or the userns mapped root).
+pub fn open_control_socket(sock: &Path) -> Result<std::os::fd::OwnedFd> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    let parent = sock
+        .parent()
+        .context("ingress control socket has no parent")?;
+    let dir =
+        std::fs::symlink_metadata(parent).with_context(|| format!("stat {}", parent.display()))?;
+    if !dir.file_type().is_dir() {
+        bail!("{} is not a directory", parent.display());
+    }
+    let expect_uid = dir.uid();
+    let fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(sock)
+        .with_context(|| format!("open {}", sock.display()))?;
+    let md = fd.metadata().context("fstat ingress control socket")?;
+    if md.file_type().is_symlink() || !md.file_type().is_socket() {
+        bail!("{} is not a unix socket", sock.display());
+    }
+    if md.uid() != expect_uid {
+        bail!(
+            "{} is owned by uid {}, expected {} (run dir owner)",
+            sock.display(),
+            md.uid(),
+            expect_uid
+        );
+    }
+    Ok(fd.into())
+}
+
 async fn control_client(data_dir: &Path) -> Result<IngressControlClient<Channel>> {
     let sock = proto::ingress_socket(data_dir);
+    let fd = open_control_socket(&sock)?;
     let ch = Endpoint::try_from("http://[::]:0")?
         .connect_timeout(std::time::Duration::from_secs(1))
         .timeout(std::time::Duration::from_secs(2))
         .connect_with_connector(service_fn(move |_: http::Uri| {
-            let p = sock.clone();
+            let fd = fd.try_clone().map_err(|e| {
+                std::io::Error::new(e.kind(), format!("clone control socket fd: {e}"))
+            });
             async move {
-                UnixStream::connect(&p)
+                let fd = fd?;
+                // /proc/self/fd/N names the inode we already opened with
+                // O_NOFOLLOW, so a later swap of the path cannot redirect us.
+                let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
+                let stream = UnixStream::connect(&proc)
                     .await
-                    .map(hyper_util::rt::TokioIo::new)
-                    .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", p.display())))
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("connect {proc}: {e}")))?;
+                drop(fd);
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
             }
         }))
         .await
@@ -194,5 +239,26 @@ mod tests {
     fn snapshot_rejects_ingress_without_index() {
         let bad = meta("bad", 0, &[("x.rustypods.localhost", 80)]);
         assert!(build_snapshot(vec![&bad], &running(&["bad"]), None, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn control_socket_rejects_a_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "rp-sock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("ingress.sock");
+        let _listener = tokio::net::UnixListener::bind(&real).unwrap();
+        assert!(open_control_socket(&real).is_ok());
+        let link = dir.join("via-link.sock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_control_socket(&link).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
