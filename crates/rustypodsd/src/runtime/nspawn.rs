@@ -70,10 +70,16 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
     // Env values must not appear on argv: /proc/<pid>/cmdline is
     // world-readable. `--setenv=NAME` (no value) copies NAME from
     // nspawn's own environment (systemd 257). spawn() puts the values
-    // there; /proc/<pid>/environ is mode 0400.
+    // there; /proc/<pid>/environ is mode 0400. Keys that would steer the
+    // host-root nspawn process itself stay on argv (see host_env_unsafe).
     for kv in &spec.env {
         let key = kv.split('=').next().unwrap_or(kv);
-        if !key.is_empty() {
+        if key.is_empty() {
+            continue;
+        }
+        if host_env_unsafe(key) {
+            a.push(format!("--setenv={kv}").into());
+        } else {
             a.push(format!("--setenv={key}").into());
         }
     }
@@ -85,6 +91,42 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
         a.extend(payload.iter().map(OsString::from));
     }
     a
+}
+
+/// Pod env keys that must never enter the environment of the host-root
+/// nspawn process: loader/glibc knobs (LD_PRELOAD, GLIBC_TUNABLES, …) are
+/// code execution as root, SYSTEMD_* toggles nspawn itself (e.g.
+/// SYSTEMD_SECCOMP=0), DBUS_* redirects its machined registration, and PATH
+/// changes which binaries it spawns. Pod env can come from an imported
+/// archive, so it is untrusted input here.
+fn host_env_unsafe(key: &str) -> bool {
+    const PREFIXES: &[&str] = &["LD_", "SYSTEMD_", "DBUS_", "MALLOC_", "GLIBC_"];
+    const EXACT: &[&str] = &[
+        "PATH",
+        "GCONV_PATH",
+        "LOCPATH",
+        "NLSPATH",
+        "HOSTALIASES",
+        "RES_OPTIONS",
+        "LOCALDOMAIN",
+        "TZDIR",
+        "NOTIFY_SOCKET",
+        "LISTEN_PID",
+        "LISTEN_FDS",
+        "LISTEN_FDNAMES",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
+        "XDG_DATA_DIRS",
+    ];
+    PREFIXES.iter().any(|p| key.starts_with(p)) || EXACT.contains(&key)
+}
+
+/// The pod env entries that go into nspawn's own environment.
+fn host_env(env: &[String]) -> impl Iterator<Item = (&str, &str)> {
+    env.iter()
+        .filter_map(|kv| kv.split_once('='))
+        .filter(|(k, _)| !k.is_empty() && !host_env_unsafe(k))
 }
 
 /// Spawn nspawn with console output appended to `log`. A detached reaper task
@@ -101,12 +143,8 @@ async fn spawn(argv: &[OsString], log: &Path, env: &[String]) -> Result<u32> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(f))
         .stderr(std::process::Stdio::from(err));
-    for kv in env {
-        if let Some((k, v)) = kv.split_once('=') {
-            if !k.is_empty() {
-                cmd.env(k, v);
-            }
-        }
+    for (k, v) in host_env(env) {
+        cmd.env(k, v);
     }
     let mut child = cmd
         .spawn()
@@ -275,16 +313,25 @@ mod tests {
     fn argv_payload_is_non_boot() {
         let mut s = spec(false, true); // userns still applies in non-boot mode
         s.payload = Some(vec!["/bin/sh".into(), "-l".into()]);
-        s.env = vec!["PATH=/usr/bin".into(), "HOME=/root".into()];
+        s.env = vec![
+            "PATH=/usr/bin".into(),
+            "HOME=/root".into(),
+            "LD_PRELOAD=/evil.so".into(),
+            "SYSTEMD_SECCOMP=0".into(),
+        ];
         s.chdir = "/app".into();
         let a = argv(&s);
         assert!(!a.contains(&"--boot".to_string()), "payload ⇒ no --boot");
         assert!(a.contains(&"--private-users=pick".to_string()));
-        assert!(a.contains(&"--setenv=PATH".to_string()));
+        // Ordinary values travel via nspawn's environ, not argv.
         assert!(a.contains(&"--setenv=HOME".to_string()));
-        assert!(!a
-            .iter()
-            .any(|s| s.contains("=/usr/bin") || s.contains("=/root")));
+        assert!(!a.iter().any(|s| s.contains("=/root")));
+        // Keys that would steer host-root nspawn stay on argv.
+        assert!(a.contains(&"--setenv=PATH=/usr/bin".to_string()));
+        assert!(a.contains(&"--setenv=LD_PRELOAD=/evil.so".to_string()));
+        assert!(a.contains(&"--setenv=SYSTEMD_SECCOMP=0".to_string()));
+        let host: Vec<_> = host_env(&s.env).collect();
+        assert_eq!(host, vec![("HOME", "/root")]);
         assert!(a.contains(&"--chdir=/app".to_string()));
         // Payload comes last, after a "--" separator.
         let tail: Vec<&str> = a[a.len() - 3..].iter().map(|s| s.as_str()).collect();

@@ -599,6 +599,7 @@ impl Svc {
             &self.cfg.resolv_dir(),
             &format!("{name}.conf"),
             content.as_bytes(),
+            0o644,
         )
         .map_err(int)?;
         ensure_resolv_target(rootfs).map_err(int)?;
@@ -4511,8 +4512,15 @@ fn split_log_tail(buf: &[u8], n: usize, mut truncated: bool) -> LogTail {
 
 /// Write `bytes` into a daemon-owned directory via an `O_NOFOLLOW|O_EXCL`
 /// temp file and `rename`. `rename` replaces a symlink at the destination;
-/// it does not follow it. The directory itself is mode 0700.
-fn write_daemon_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf> {
+/// it does not follow it. The directory itself is mode 0700; `mode` is the
+/// file's own mode, which is what a pod sees through a file bind mount
+/// (a userns pod can't read a 0600 root-owned file).
+fn write_daemon_file(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<std::path::PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
@@ -4525,10 +4533,12 @@ fn write_daemon_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<std::path::
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .custom_flags(libc::O_NOFOLLOW | libc::O_EXCL)
             .open(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;
+        // The open mode is filtered by the daemon's umask.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         f.write_all(bytes)?;
         f.sync_all().ok();
     }
@@ -4536,10 +4546,6 @@ fn write_daemon_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<std::path::
     Ok(dest)
 }
 
-/// Create `etc/resolv.conf` inside the rootfs when it is missing, without
-/// following a symlink at `etc` or at the leaf. An existing regular file is
-/// left alone (the bind mounts over it). A leaf symlink is unlinked and
-/// replaced with an empty regular file.
 /// Mask vendor tmpfiles snippets that would operate on host paths bound
 /// into a pod running without a user namespace. A symlink to `/dev/null`
 /// in `/etc/tmpfiles.d/` disables the same-named file under
@@ -4559,6 +4565,10 @@ fn mask_host_tmpfiles(rootfs: &Path, binds: &[proto::BindSpec]) -> Result<()> {
     Ok(())
 }
 
+/// Create `etc/resolv.conf` inside the rootfs when it is missing, without
+/// following a symlink at `etc` or at the leaf. An existing regular file is
+/// left alone (the bind mounts over it). A leaf symlink is unlinked and
+/// replaced with an empty regular file.
 fn ensure_resolv_target(rootfs: &Path) -> Result<()> {
     crate::rootfs::mkdir_in_rootfs(rootfs, "etc")?;
     let target = crate::rootfs::safe_join(rootfs, "etc/resolv.conf")?;
@@ -5260,7 +5270,7 @@ mod tests {
         let owned = dir.join("owned");
         std::fs::create_dir_all(&owned).unwrap();
         std::os::unix::fs::symlink(&victim, owned.join("p.conf")).unwrap();
-        write_daemon_file(&owned, "p.conf", b"nameserver fd00::1\n").unwrap();
+        write_daemon_file(&owned, "p.conf", b"nameserver fd00::1\n", 0o644).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"safe");
         assert_eq!(
             std::fs::read(owned.join("p.conf")).unwrap(),
@@ -5268,6 +5278,8 @@ mod tests {
         );
         let meta = std::fs::symlink_metadata(owned.join("p.conf")).unwrap();
         assert!(meta.file_type().is_file());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
