@@ -192,8 +192,8 @@ impl RuntimeEngine for SystemdNspawn {
             .context("registered but no leader pid")
     }
 
-    async fn stop(&self, pod: &str) -> Result<()> {
-        dbus::stop(&self.dbus, pod).await
+    async fn stop(&self, pod: &str, grace: std::time::Duration) -> Result<()> {
+        dbus::stop(&self.dbus, pod, grace).await
     }
 
     async fn running_pid(&self, pod: &str) -> Option<u32> {

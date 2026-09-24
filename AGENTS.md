@@ -73,6 +73,9 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
 
 - `KillMachine(name, "leader", SIGRTMIN+3)` = `machinectl poweroff`
   (SIGRTMIN=34 on glibc → signo 37; verified on systemd 257).
+  The wait before `TerminateMachine` is the pod's `stop_timeout`
+  (conf + `create`/`config --stop-timeout`, default 8s). The hard-kill
+  wait after that stays ~4s.
 - `TerminateMachine(name)` = `machinectl terminate` (hard kill).
 - `Machine.leader`/`.unit` properties give the leader pid + authoritative
   scope name — never format `machine-<name>.scope` yourself.
@@ -241,10 +244,30 @@ through truncation.
 
 - Per-second `supervise_once` tick over pods with a restart policy, a
   configured probe, or `ingress_gateway` (managed ⇒ always "always").
-- Death-watch keys on the in-memory `stop_intent` set — `PodMeta.started`
-  means "was ever started" (drives Created/Stopped display), NOT "should
-  be running". stop_pod records intent before engine.stop; start_pod
-  clears it; a daemon restart loses intent (Docker-"always"-like).
+  Pods are supervised concurrently (cap 8); the tick awaits them, so
+  each pod has at most one in-flight action.
+- SIGTERM and SIGINT stop the accept loop and wait up to 30s for
+  in-flight mutating RPCs (start/stop/create/destroy/clone/commit/
+  rollback/apply/config). Those handlers run on a detached task so a
+  client disconnect does not cancel the critical section.
+- The gRPC server, HTTP server, and supervisor exiting or panicking
+  exits the process non-zero (systemd restarts it; pods survive).
+  Ingress reconcile and snapshot GC log and restart with backoff.
+- Death-watch keys on `PodMeta.stopped_by_user` (persisted in the pod
+  conf, serde default false) plus an in-memory `stop_intent` mirror for
+  the tick that races the conf write. `PodMeta.started` means "was ever
+  started" (drives Created/Stopped display), NOT "should be running".
+  A user stop sets the flag before engine.stop; start clears it before
+  the engine runs. Supervisor restarts and autostart both leave a
+  user-stopped pod down across daemon restart/upgrade/reboot
+  (unless-stopped). A crash with the flag clear still restarts.
+  Supervisor-driven halts do not set the flag. Confs written before
+  this field existed load as not user-stopped, so the first restart
+  after upgrade still brings those pods back once.
+- A pod conf that fails to parse, or that breaks the ingress-host or
+  gateway invariant, is quarantined (logged, omitted from serving, name
+  and net_index reserved) instead of aborting startup or freeing its
+  /30. `rustypods ping` lists quarantined confs.
 - Exec probes reuse `exec_argv` — the payload ends with an
   `exec 0<&200` stdin-restore wrapper that ONLY works with
   `pre_exec(exec::preserve_stdin)` on the spawn (util-linux ≤2.42

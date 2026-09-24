@@ -89,17 +89,21 @@ pub async fn spawn_listener(
         };
         // Reachable by untrusted in-pod code: cap concurrency. No
         // `timeout` — it's per-request in tonic and would kill the
-        // long-lived StreamMetrics stream.
-        let _ = Server::builder()
+        // long-lived StreamMetrics stream. A panic used to die on a
+        // dropped JoinHandle; surface it. Clean shutdown (rx) returns Ok.
+        let serve = Server::builder()
             .concurrency_limit_per_connection(8)
             .max_concurrent_streams(8)
             .add_service(AgentServer::new(svc))
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
                 let _ = rx.await;
-            })
-            .await;
+            });
+        match tokio::spawn(serve).await {
+            Ok(Ok(())) => tracing::info!("agent listener {pod_name} stopped"),
+            Ok(Err(e)) => tracing::error!("agent listener {pod_name}: {e}"),
+            Err(e) => tracing::error!("agent listener {pod_name} panicked: {e}"),
+        }
         let _ = std::fs::remove_file(&sock_path);
-        tracing::info!("agent listener {pod_name} stopped");
     });
     Ok(())
 }
