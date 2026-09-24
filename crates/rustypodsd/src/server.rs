@@ -131,10 +131,16 @@ impl Inflight {
 
     async fn drained(&self) {
         loop {
+            // Register before checking: notify_waiters() only wakes
+            // already-registered waiters, so a guard dropping between the
+            // check and the await would otherwise be missed.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.n.load(Ordering::SeqCst) == 0 {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -5973,6 +5979,24 @@ mod tests {
         assert!(supervisor_idle(true, false, true));
         // Crash or daemon restart with no user stop: death-watch may restart.
         assert!(!supervisor_idle(true, false, false));
+    }
+
+    #[tokio::test]
+    async fn inflight_drain_wakes_on_last_guard() {
+        let inflight = super::Inflight::new();
+        let guards: Vec<_> = (0..16).map(|_| inflight.enter()).collect();
+        let waiter = {
+            let inflight = std::sync::Arc::clone(&inflight);
+            tokio::spawn(async move { inflight.drained().await })
+        };
+        for g in guards {
+            tokio::task::yield_now().await;
+            drop(g);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("drain must finish once the last guard drops")
+            .unwrap();
     }
 
     #[test]
