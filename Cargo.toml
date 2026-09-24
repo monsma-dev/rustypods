@@ -12,18 +12,36 @@ members = [
 # and would slow every workspace build/test. It has its own lockfile.
 exclude = ["gui"]
 
+# A panicking background task must take the daemon down so systemd
+# restarts it (`Restart=on-failure`). Pods are nspawn children that
+# reparent to PID 1, so they survive that restart. `catch_unwind` /
+# `JoinError::is_panic` are not used anywhere, so abort does not hide
+# a recovery path. overflow-checks stay on in release: a wrapping
+# length in the archive/nft paths is worse than a restart. thin LTO +
+# one codegen unit is worth the extra compile for a long-lived root
+# daemon. `strip = "debuginfo"` drops DWARF (large) and keeps the
+# symbol table so a journal backtrace still names functions.
+[profile.release]
+panic = "abort"
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Nick"]
+# Oldest toolchain this tree is known to build on. 1.98 is the dev-pod
+# rustc (1.98.1); older minors were not tested.
+rust-version = "1.98"
 
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-thiserror = "2"
 # fs: rustypods (CLI) uses tokio::fs directly — without it the crate only
 # compiles when feature-unified with rustypodsd in a workspace build.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "io-std", "fs", "sync", "time", "signal"] }
@@ -41,24 +59,35 @@ http = "1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1", "server-auto", "service"] }
 http-body-util = "0.1"
-arc-swap = "=1.9.2"
-axum-server = { version = "=0.8.0", features = ["tls-rustls-no-provider"] }
+arc-swap = "1.9.2"
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 # Direct rustls dep so we pick the crypto provider — ring, not aws-lc.
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
-socket2 = "=0.5.10"
+# Caret, not `=`: Cargo.lock still pins the resolved version, and a
+# later `cargo update` can take a rustls security fix.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+# 0.6 matches hyper-util/tokio. The old `=0.5.10` pin duplicated socket2.
+socket2 = "0.6"
 libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-axum = "=0.8.9"
+axum = "0.8.9"
 # no-provider + rustypodsd's ring install_default() keeps aws-lc-rs out
 # of the whole tree — same provider choice as the ingress dataplane.
-oci-client = { version = "=0.18.0", default-features = false, features = ["rustls-tls-no-provider"] }
-tar = "=0.4.46"
-flate2 = "=1.1.10"
-zstd = "=0.13.3"
-boringtun = "=0.7.1"
+oci-client = { version = "0.18.0", default-features = false, features = ["rustls-tls-no-provider"] }
+tar = "0.4.46"
+flate2 = "1.1.10"
+zstd = "0.13.3"
+boringtun = "0.7.1"
+rcgen = "0.14.8"
+time = "0.3.55"
 rand_core = "0.6"
 sha2 = "0.10"
 base64 = "0.22"
 
-rustypods-proto = { path = "crates/rustypods-proto" }
-rustypods-client = { path = "crates/rustypods-client" }
+rustypods-proto = { version = "0.1.0", path = "crates/rustypods-proto" }
+rustypods-client = { version = "0.1.0", path = "crates/rustypods-client" }
+
+# Only lints the tree already passes under `clippy -D warnings`.
+# Stricter clippy groups (unwrap_used, indexing_slicing, …) are not
+# enabled — see AGENTS.md for the hit counts and why.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

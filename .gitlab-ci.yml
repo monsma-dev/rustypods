@@ -1,0 +1,15 @@
+# No git remote yet. This runs scripts/check.sh once a GitLab remote exists.
+# Advisory tools are optional in the script; install them so the job fails
+# on a known CVE instead of skipping.
+stages:
+  - check
+
+rust:
+  stage: check
+  image: rust:1.98
+  variables:
+    CARGO_BUILD_JOBS: "2"
+  script:
+    - rustup component add rustfmt clippy
+    - cargo install --locked cargo-audit cargo-deny
+    - bash scripts/check.sh

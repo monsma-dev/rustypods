@@ -12,6 +12,9 @@ rustypods exec dev -w ~/Projects/rustypods -- bash -lc \
   'set -o pipefail && \
    RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build && cargo test'
 # or: bash scripts/build.sh  (release build + tests)
+# gate used locally and by .gitlab-ci.yml (fmt, clippy -D warnings,
+# tests, then cargo audit / cargo deny when those tools are installed):
+#   bash scripts/check.sh
 ```
 
 `shell` aliases: `exec`; `-w/--workdir` sets the in-container cwd
@@ -24,6 +27,27 @@ is broken (bootstrap problem), fall back to the podman distrobox `arch`:
 `podman exec -u nick -w /home/nick/Projects/rustypods arch bash -lc …`.
 
 `protoc` is vendored via `protoc-bin-vendored` — no system protobuf needed.
+
+Workspace lints (`[workspace.lints]`, inherited by every member) deny
+only what already passes `cargo clippy --workspace --all-targets -- -D warnings`:
+`unsafe_op_in_unsafe_fn`. `rustypods-proto`, `rustypods-client`,
+`rustypods-agent`, and `rustypods-ingress` also `forbid(unsafe_code)`.
+The daemon and CLI still need `unsafe` (libc, pty, ioctl) — do not
+forbid it there.
+
+Do not enable these until the hits are gone (one `cargo clippy
+--all-targets` pass, lib + tests both counted):
+
+| lint | hits | note |
+| --- | ---: | --- |
+| `clippy::unwrap_used` | 355 | mostly `Result::unwrap` |
+| `clippy::let_underscore_must_use` | 171 | |
+| `clippy::indexing_slicing` | 107 | 56 index + 51 slice |
+| `clippy::expect_used` | 11 | |
+| `clippy::wildcard_imports` | 4 | CLI/GUI/daemon proto globs |
+| `clippy::panic` | 2 | |
+| `rust_2018_idioms` | 1 | `elided_lifetimes_in_paths` in `dbus.rs`; not enabled so this branch does not edit daemon source |
+| `clippy::todo`, `clippy::dbg_macro` | 0 | safe to enable later |
 
 NOTE: always `set -o pipefail` when piping cargo output — a bare
 `cargo build | tail` masks build failures (tail's exit code wins).

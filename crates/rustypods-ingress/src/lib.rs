@@ -1,4 +1,5 @@
 //! rustypods-ingress — the hostname router for `<host>.rustypods.localhost`.
+#![forbid(unsafe_code)]
 //!
 //! Two halves: `control` holds the route table and serves the daemon's
 //! snapshot pushes over a root-only UDS; `proxy` is the public HTTP(S)

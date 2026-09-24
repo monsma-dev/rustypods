@@ -1,5 +1,6 @@
 //! Shared API surface for RustyPods: generated gRPC code plus the few
 //! constants and validators both the daemon and the CLI need.
+#![forbid(unsafe_code)]
 
 use anyhow::Context as _;
 use std::path::PathBuf;

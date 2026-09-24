@@ -1,4 +1,5 @@
 //! rustypods-agent — in-pod telemetry. Samples the pod's own cgroup v2
+#![forbid(unsafe_code)]
 //! counters + PSI and pushes Metric messages to rustypodsd over the
 //! bind-mounted UDS at /run/rustypods/run/agent.sock. Reconnects forever:
 //! daemon restarts and pod boot races just retry.
