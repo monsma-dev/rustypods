@@ -12,6 +12,9 @@ rustypods exec dev -w ~/Projects/rustypods -- bash -lc \
   'set -o pipefail && \
    RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build && cargo test'
 # or: bash scripts/build.sh  (release build + tests)
+# gate used locally and by .gitlab-ci.yml (fmt, clippy -D warnings,
+# tests, then cargo audit / cargo deny when those tools are installed):
+#   bash scripts/check.sh
 ```
 
 `shell` aliases: `exec`; `-w/--workdir` sets the in-container cwd
