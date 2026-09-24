@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
@@ -394,48 +395,73 @@ pub fn exec_argv(
     Ok(a)
 }
 
+/// Client-supplied winsize dimensions are u32 on the wire; the kernel's
+/// are u16. Saturate instead of wrapping.
+fn clamp_dim(v: u32) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
 fn set_winsize(fd: std::os::fd::RawFd, rows: u32, cols: u32) {
     if rows == 0 || cols == 0 {
         return;
     }
     let ws = libc::winsize {
-        ws_row: rows as u16,
-        ws_col: cols as u16,
+        ws_row: clamp_dim(rows),
+        ws_col: clamp_dim(cols),
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    // SAFETY: TIOCSWINSZ reads a struct winsize from the pointer we pass;
+    // `ws` lives for the call. A bad fd only yields an error we ignore.
     unsafe {
         libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
     }
 }
 
 /// openpty(3) via libc: master+slave as OwnedFd, optional initial winsize.
-fn openpty(rows: u16, cols: u16) -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+/// ptsname_r (not ptsname's static buffer) so concurrent tty execs on the
+/// multi-threaded runtime can't open each other's slave; the master is
+/// owned from the first line so no error path leaks it.
+fn openpty(rows: u32, cols: u32) -> Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd;
-    unsafe {
-        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
-        if m < 0 {
-            return Err(std::io::Error::last_os_error()).context("posix_openpt");
-        }
-        if libc::grantpt(m) != 0 || libc::unlockpt(m) != 0 {
-            return Err(std::io::Error::last_os_error()).context("grantpt/unlockpt");
-        }
-        if rows > 0 && cols > 0 {
-            set_winsize(m, rows as u32, cols as u32);
-        }
-        let name = libc::ptsname(m);
-        if name.is_null() {
-            return Err(std::io::Error::last_os_error()).context("ptsname");
-        }
-        let s = libc::open(name, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
-        if s < 0 {
-            return Err(std::io::Error::last_os_error()).context("open pts slave");
-        }
-        Ok((
-            std::os::fd::OwnedFd::from_raw_fd(m),
-            std::os::fd::OwnedFd::from_raw_fd(s),
-        ))
+    // SAFETY: posix_openpt returns a fresh fd (or -1, checked before we
+    // take ownership); nothing else refers to it.
+    let m = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if m < 0 {
+        return Err(std::io::Error::last_os_error()).context("posix_openpt");
     }
+    let master = unsafe { OwnedFd::from_raw_fd(m) };
+    // SAFETY: grantpt/unlockpt only operate on the valid master fd.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0
+        || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("grantpt/unlockpt");
+    }
+    set_winsize(master.as_raw_fd(), rows, cols);
+    let mut name = [0 as libc::c_char; 64];
+    // SAFETY: ptsname_r writes at most `name.len()` bytes into `name` and
+    // NUL-terminates on success (returns 0; a positive errno otherwise).
+    let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    if rc != 0 {
+        let e = if rc > 0 {
+            std::io::Error::from_raw_os_error(rc)
+        } else {
+            std::io::Error::last_os_error()
+        };
+        return Err(e).context("ptsname_r");
+    }
+    // SAFETY: `name` is a NUL-terminated path from ptsname_r.
+    let s = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if s < 0 {
+        return Err(std::io::Error::last_os_error()).context("open pts slave");
+    }
+    // SAFETY: `s` is a fresh fd we own exclusively.
+    Ok((master, unsafe { OwnedFd::from_raw_fd(s) }))
 }
 
 /// Wire up an exec session. `inbound` is the client stream positioned *after*
@@ -464,7 +490,7 @@ async fn run_tty<S>(argv: &[OsString], start: &ExecStart, mut inbound: S, tx: Tx
 where
     S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
 {
-    let (master, slave) = openpty(start.rows as u16, start.cols as u16)?;
+    let (master, slave) = openpty(start.rows, start.cols)?;
     let slave_in = slave.try_clone().context("slave clone")?;
     let slave_err = slave.try_clone().context("slave clone")?;
 
@@ -525,7 +551,6 @@ where
     // else the remote shell lingers as a zombie on the open pty.
     let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        use std::os::unix::io::AsRawFd;
         let mut f = master_file;
         while let Some(Ok(c)) = inbound.next().await {
             match c.kind {
@@ -846,5 +871,41 @@ mod tests {
         let v: Vec<String> = a.iter().map(|o| o.to_string_lossy().into_owned()).collect();
         assert!(v.iter().any(|x| x == "LC_ALL=xx_YY.UTF-8"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn winsize_dims_saturate() {
+        assert_eq!(clamp_dim(0), 0);
+        assert_eq!(clamp_dim(24), 24);
+        assert_eq!(clamp_dim(65535), 65535);
+        assert_eq!(clamp_dim(65536), u16::MAX);
+        assert_eq!(clamp_dim(u32::MAX), u16::MAX);
+    }
+
+    /// Two ptys opened back to back get distinct slaves (ptsname_r, no
+    /// shared static buffer) and the winsize lands on the slave.
+    #[test]
+    fn openpty_distinct_slaves() {
+        let (m1, s1) = openpty(24, 80).unwrap();
+        let (m2, s2) = openpty(0, 0).unwrap();
+        let ino = |fd: &OwnedFd| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::File::from(fd.try_clone().unwrap())
+                .metadata()
+                .unwrap()
+                .ino()
+        };
+        assert_ne!(ino(&s1), ino(&s2));
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCGWINSZ fills the winsize we point at.
+        let rc = unsafe { libc::ioctl(s1.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+        assert_eq!(rc, 0);
+        assert_eq!((ws.ws_row, ws.ws_col), (24, 80));
+        drop((m1, m2, s1, s2));
     }
 }
