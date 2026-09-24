@@ -282,9 +282,18 @@ BoringTun (no kernel module), giving every pod a ULA address reachable
 from pods on other hosts. L3, end-to-end encrypted, no NAT.
 
 - Identity = addressing: each daemon derives its /48 as
-  `fd<40 bits of sha256(pubkey)>` (RFC 4193 L-bit set). A peer's prefix
-  is verified BY its pubkey — config can't claim foreign space, and
-  prefix derivation needs zero coordination.
+  `fd` + 40 bits of sha256(pubkey). The first byte is `0xfd` (RFC 4193
+  fc00::/7 with L already 1). Two bits of the Global ID are then
+  forced (`&= 0x3f; |= 0x40`). That is NOT the L bit — changing the
+  mask would move every existing host's /48, so the derivation stays.
+  A peer's prefix is verified BY its pubkey — config can't claim
+  foreign space, and prefix derivation needs zero coordination.
+- Key rotation is manual and mesh-wide: `mesh deinit` on every host
+  (or, if conf/mesh.conf is corrupt, fix or `rm` it — `mesh init` and
+  daemon startup refuse to mint a replacement key), then `mesh init`
+  and `mesh add-peer` again with the new pubkeys. There is no
+  in-band rekey. A corrupt conf leaves the mesh down; `mesh status`
+  prints the parse error in `conf_error`.
 - Pod mesh addr = `fd<host>:<net_idx>::2` — a second /128 on host0 next
   to the intra-host fd22:220:<idx>::2. Pods need NO extra route (v6
   default already via host); longest-prefix src selection picks the
@@ -319,7 +328,10 @@ from pods on other hosts. L3, end-to-end encrypted, no NAT.
   `guard.try_io` directly on the select arm's own guard. The pump runs
   under a supervisor task (a panic would otherwise die silently on a
   dropped JoinHandle); liveness counters pump_ticks/udp_pkts/tun_pkts
-  are in-memory atomics surfaced via MeshStatus — no file dumps.
+  and tun_drops (EAGAIN on the nonblocking TUN write) are in-memory
+  atomics surfaced via MeshStatus — no file dumps. Gossip, the
+  announcer, and both DNS tasks have the same supervisor shape
+  (restart with capped backoff, shutdown awaits them).
 - `mesh deinit` (`DELETE /v1/mesh`) is the full teardown: watch-channel
   cancels the pump, the supervisor JoinHandle is awaited (3s bound),
   `ip tuntap del` removes rp-mesh0 (its routes die with it), pod /128s
@@ -375,7 +387,12 @@ rides inside the encrypted tunnel.
   Upstream is re-read per query (net::upstream_resolver prefers
   /run/systemd/resolve/resolv.conf over the 127.0.0.53 stub) — a
   cached resolver goes stale when the host roams networks. canon_ep
-  again — the upstream is usually a v4 stub.
+  again — the upstream is usually a v4 stub. UDP queries are spawned
+  behind a 64-permit semaphore so one 3s upstream wait cannot stall
+  every pod; TCP accepts are capped (32), each read idles out at 5s,
+  and the length prefix is capped at 4096. Malformed questions return
+  no answer — builders never slice past the packet (an 18-byte `db`
+  query used to panic the DNS task).
 - Pod wiring: at start, networked standalone pods get
   run/resolv.conf (`nameserver fd<host>::1` + real upstream fallback
   + `search rp pods`) ro-bound over /etc/resolv.conf; the target is
