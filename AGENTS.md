@@ -446,6 +446,15 @@ rides inside the encrypted tunnel.
   endpoint→key map entry — a stale mapping would misattribute future
   datagrams arriving from the old address.
 
+## Ingress CA and gateway
+
+Ingress CAs created from here on are `pathLen=0` and name-constrained to
+`rustypods.localhost`. Older unconstrained CAs are kept and warned about
+(`doctor`, daemon log). `ingress rotate-ca` replaces one; `ingress uninstall-ca`
+removes it from the host trust store. The leaf renews with under 30 days
+left; the daemon copies the new pair into the gateway rootfs and restarts
+the pod, and the gateway also reloads the files when their mtime changes.
+
 ## REST API surface (Wave G)
 
 Tokens persist in `<socket-dir>/http-token` (read-write) and

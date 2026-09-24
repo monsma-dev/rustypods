@@ -694,6 +694,88 @@ impl Svc {
             .unwrap_or(false)
     }
 
+    /// Renew a near-expiry leaf and, when the bytes change, put them in
+    /// the gateway rootfs. A running gateway is restarted so it loads the
+    /// new pair (the process reads the files at start; a newer binary
+    /// also polls them).
+    async fn maintain_ingress_pki(&self) -> Result<(), Status> {
+        let crt = self.cfg.data_dir.join("pki").join("ca.crt");
+        if !crt.exists() {
+            return Ok(());
+        }
+        let data = self.cfg.data_dir.clone();
+        let before = self.cfg.data_dir.join("pki").join("tls.crt");
+        let old = std::fs::read(&before).ok();
+        let paths = Self::blocking(move || pki::ensure(&data)).await?;
+        pki::warn_if_unconstrained(&paths);
+        let new = std::fs::read(&paths.tls_crt).ok();
+        if old.is_some() && old != new {
+            self.install_gateway_leaf(true).await?;
+        }
+        Ok(())
+    }
+
+    /// Copy the current leaf into the gateway rootfs. `restart` stops a
+    /// running gateway around the copy so the process cannot keep the old
+    /// cert, then starts it again.
+    async fn install_gateway_leaf(&self, restart: bool) -> Result<(), Status> {
+        let configured = {
+            let st = self.st.lock().await;
+            st.pods
+                .get(proto::INGRESS_POD)
+                .is_some_and(|m| m.ingress_gateway)
+        };
+        if !configured {
+            return Ok(());
+        }
+        let rootfs = self.pod_rootfs(proto::INGRESS_POD);
+        if !rootfs.exists() {
+            return Ok(());
+        }
+        let running = self.engine.running_pid(proto::INGRESS_POD).await.is_some();
+        if restart && running {
+            PodControl::stop_pod(
+                self,
+                Request::new(PodRef {
+                    name: proto::INGRESS_POD.into(),
+                }),
+            )
+            .await?;
+        }
+        let crt = std::fs::read(self.cfg.data_dir.join("pki").join("tls.crt")).map_err(int)?;
+        let key = std::fs::read(self.cfg.data_dir.join("pki").join("tls.key")).map_err(int)?;
+        Self::blocking(move || {
+            crate::rootfs::mkdir_in_rootfs(&rootfs, "etc/rustypods-ingress")?;
+            crate::rootfs::write_in_rootfs(
+                &rootfs,
+                "etc/rustypods-ingress/tls.crt",
+                &crt,
+                Some(0o644),
+            )?;
+            crate::rootfs::write_in_rootfs(
+                &rootfs,
+                "etc/rustypods-ingress/tls.key",
+                &key,
+                Some(0o600),
+            )?;
+            Ok(())
+        })
+        .await?;
+        if restart && running {
+            PodControl::start_pod(
+                self,
+                Request::new(StartPodRequest {
+                    name: proto::INGRESS_POD.into(),
+                    limits: None,
+                    ephemeral: false,
+                    private_users: None,
+                }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Body of `update_pod_config`. Does not take `pod_op` — the caller
     /// holds it, so a REST read-modify-write can merge under the same lock.
     pub(crate) async fn apply_pod_config(
@@ -3618,7 +3700,6 @@ impl PodControl for Svc {
         self.apply_pod_config(req).await.map(Response::new)
     }
 
-
     /// `rustypods reload`: reread the conf from disk (hand edits) + apply.
     async fn reload_pod_config(&self, req: Request<PodRef>) -> Result<Response<Pod>, Status> {
         let name = proto::validate_name(&req.into_inner().name)
@@ -3959,6 +4040,30 @@ impl PodControl for Svc {
                 .join("ca.crt")
                 .display()
                 .to_string(),
+        }))
+    }
+
+    async fn uninstall_ingress_ca(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<IngressCaResult>, Status> {
+        let dest = Self::blocking(pki::uninstall_host_trust).await?;
+        Ok(Response::new(IngressCaResult {
+            ca_cert_path: dest.display().to_string(),
+            detail: "removed from the host trust store".into(),
+        }))
+    }
+
+    async fn rotate_ingress_ca(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<IngressCaResult>, Status> {
+        let data = self.cfg.data_dir.clone();
+        let paths = Self::blocking(move || pki::rotate(&data)).await?;
+        self.install_gateway_leaf(true).await?;
+        Ok(Response::new(IngressCaResult {
+            ca_cert_path: paths.ca_crt.display().to_string(),
+            detail: "replaced the CA; re-import it into browsers and the host trust store".into(),
         }))
     }
 
@@ -5206,6 +5311,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 };
                 if !configured || !gw_running {
                     continue;
+                }
+                if let Err(e) = svc.maintain_ingress_pki().await {
+                    tracing::warn!("ingress pki: {e}");
                 }
                 match svc.sync_ingress(None, false).await {
                     Ok(()) => {

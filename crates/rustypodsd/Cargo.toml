@@ -36,5 +36,5 @@ boringtun.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
 base64.workspace = true
-rcgen = "=0.14.8"
+rcgen = { version = "=0.14.8", features = ["x509-parser"] }
 time = "0.3.55"

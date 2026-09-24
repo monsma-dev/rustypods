@@ -228,7 +228,15 @@ rustypods ingress status
 `--install-ca` writes the generated CA (`/var/lib/rustypods/pki/ca.crt`)
 into the host's system trust store (`update-ca-certificates` /
 `update-ca-trust`) — it **mutates system trust**; skip it and import the
-CA into your browser/store yourself if you prefer. The public proxy
+CA into your browser/store yourself if you prefer. New CAs are
+path-length constrained (`pathLen=0`) and name-constrained to
+`rustypods.localhost`. An older unconstrained CA is left in place (replacing
+it would drop existing trust) and `rustypods doctor` warns.
+`rustypods ingress rotate-ca` mints a new constrained CA — re-import it.
+`rustypods ingress uninstall-ca` removes the CA from the host trust store.
+The leaf is renewed automatically when fewer than 30 days remain; a running
+gateway is restarted so it loads the new pair, and the gateway also reloads
+the files when they change. The public proxy
 caps request bodies (`RUSTYPODS_INGRESS_MAX_BODY`, default 32 MiB),
 waits `RUSTYPODS_INGRESS_UPSTREAM_TIMEOUT_SECS` (default 30) for upstream
 response headers, drops a silent WebSocket after

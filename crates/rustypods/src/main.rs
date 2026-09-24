@@ -419,6 +419,13 @@ enum IngressCmd {
     /// Show gateway state: configured/running, dataplane liveness,
     /// applied snapshot generation and route count, CA path.
     Status,
+    /// Remove the RustyPods CA from the host trust store. The inverse of
+    /// `init --install-ca`. Does not delete the on-disk CA.
+    UninstallCa,
+    /// Replace the local CA and leaf. Browsers and trust stores that
+    /// imported the old CA must import the new one. Use this to retire an
+    /// older CA that had no name constraints.
+    RotateCa,
 }
 
 #[derive(Subcommand)]
@@ -1368,6 +1375,24 @@ async fn main() -> Result<()> {
                 println!("generation:    {}", s.generation);
                 println!("routes:        {}", s.route_count);
                 println!("ca:            {}", s.ca_cert_path);
+            }
+            IngressCmd::UninstallCa => {
+                let r = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .uninstall_ingress_ca(Empty {})
+                    .await?
+                    .into_inner();
+                println!("removed: {}", r.ca_cert_path);
+                println!("{}", r.detail);
+            }
+            IngressCmd::RotateCa => {
+                let r = connect(cli.socket.clone(), cli.remote.clone())
+                    .await?
+                    .rotate_ingress_ca(Empty {})
+                    .await?
+                    .into_inner();
+                println!("ca: {}", r.ca_cert_path);
+                println!("{}", r.detail);
             }
         },
         Cmd::Ping => {

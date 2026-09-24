@@ -463,6 +463,32 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         }
     }
 
+    let ca = Path::new("/var/lib/rustypods/pki/ca.crt");
+    match std::fs::read_to_string(ca) {
+        Ok(pem) => {
+            if ca_pem_unconstrained(&pem) {
+                chk!(
+                    Level::Warn,
+                    "ingress-ca",
+                    "{} has no path-length or DNS name constraint — `rustypods ingress rotate-ca`, then re-import the CA",
+                    ca.display()
+                );
+            } else {
+                chk!(
+                    Level::Pass,
+                    "ingress-ca",
+                    "{} is path- and name-constrained",
+                    ca.display()
+                );
+            }
+        }
+        Err(_) => chk!(
+            Level::Pass,
+            "ingress-ca",
+            "no local CA yet (created by `rustypods ingress init`)"
+        ),
+    }
+
     let ver =
         cmd_stdout("systemd", &["--version"]).or_else(|_| cmd_stdout("systemctl", &["--version"]));
     match ver {
@@ -509,6 +535,23 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         bail!("doctor found {fails} required check(s) failing");
     }
     Ok(())
+}
+
+/// Same signal the daemon logs: a CA without the name-constraint OID
+/// (2.5.29.30) or without a pathLen INTEGER in BasicConstraints.
+fn ca_pem_unconstrained(pem: &str) -> bool {
+    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let Ok(der) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64.trim())
+    else {
+        return false;
+    };
+    let name_ok = der.windows(3).any(|w| w == [0x55, 0x1d, 0x1e]);
+    let oid = [0x55u8, 0x1d, 0x13];
+    let path_ok = der.windows(3).position(|w| w == oid).is_some_and(|at| {
+        let window = &der[at..der.len().min(at + 24)];
+        window.windows(3).any(|w| w[0] == 0x02 && w[1] == 0x01)
+    });
+    !name_ok || !path_ok
 }
 
 /// `Ok(None)` when the configured pod /16 does not collide with a host
@@ -620,5 +663,23 @@ mod tests {
         assert_eq!(find_executable_in("no-tool", &path), None);
         assert_eq!(find_executable_in("missing-tool", &path), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ca_pem_flags_missing_name_or_path_constraint() {
+        use base64::Engine;
+        let pem = |der: &[u8]| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+            format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n")
+        };
+        // 2.5.29.30 name constraints, 2.5.29.19 basic constraints, pathLen INTEGER.
+        let both = pem(&[0x55, 0x1d, 0x1e, 0x55, 0x1d, 0x13, 0x02, 0x01, 0x00]);
+        assert!(!ca_pem_unconstrained(&both));
+        assert!(ca_pem_unconstrained(&pem(&[
+            0x55, 0x1d, 0x13, 0x02, 0x01, 0x00
+        ])));
+        assert!(ca_pem_unconstrained(&pem(&[
+            0x55, 0x1d, 0x1e, 0x55, 0x1d, 0x13
+        ])));
     }
 }
