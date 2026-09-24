@@ -117,8 +117,11 @@ rustypodsd does it itself:
 
 - Pods with ports or ingress rules → `--network-veth` (private netns, no
   host-net parity).
-- Dual-stack pair per pod: host `ve-<name>` = 10.220.<idx>.1 plus
-  fd22:220:<idx>::1; pod `host0` = .2 / ::2. `net_index` is persisted.
+- Dual-stack pair per pod: host `ve-<name>` = <v4>.<idx>.1 plus
+  <v6>:<idx>::1; pod `host0` = .2 / ::2. Defaults `10.220.0.0/16` and
+  `fd22:220::/32` (max 255). Override with `RUSTYPODS_POD_NET4` /
+  `RUSTYPODS_POD_NET6` (must be `x.y.0.0/16` and `x:y::/32`). `doctor`
+  warns when the v4 pool overlaps a host route. `net_index` is persisted.
 - The daemon configures both veth ends through the leader's netns before
   start returns, so bare OCI payloads need no in-image `ip` or networkd.
   Boot images also get a matching dual-stack networkd file as persistence.

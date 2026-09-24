@@ -347,6 +347,16 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         }
     }
 
+    match pod_pool_overlap() {
+        Ok(None) => chk!(
+            Level::Pass,
+            "pod-net",
+            "address pool does not overlap a host route"
+        ),
+        Ok(Some(detail)) => chk!(Level::Warn, "pod-net", "{detail}"),
+        Err(e) => chk!(Level::Warn, "pod-net", "{e:#}"),
+    }
+
     // ── WARN / info checks ─────────────────────────────────────────────
     let target = if Path::new("/var/lib/rustypods").exists() {
         Path::new("/var/lib/rustypods")
@@ -499,6 +509,59 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         bail!("doctor found {fails} required check(s) failing");
     }
     Ok(())
+}
+
+/// `Ok(None)` when the configured pod /16 does not collide with a host
+/// route. Default routes and routes that sit entirely inside the pool
+/// (the daemon's own /30s) are ignored.
+fn pod_pool_overlap() -> Result<Option<String>> {
+    let spec = std::env::var("RUSTYPODS_POD_NET4").unwrap_or_else(|_| "10.220.0.0/16".into());
+    let (addr, prefix) = spec
+        .split_once('/')
+        .context("RUSTYPODS_POD_NET4 must look like 10.220.0.0/16")?;
+    if prefix != "16" {
+        bail!("RUSTYPODS_POD_NET4 must be a /16");
+    }
+    let pool: std::net::Ipv4Addr = addr.parse().context("RUSTYPODS_POD_NET4 address")?;
+    let text = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    for line in text.lines().skip(1) {
+        let mut c = line.split_whitespace();
+        let iface = c.next().unwrap_or("");
+        let dest_hex = c.next().unwrap_or("");
+        let _gw = c.next();
+        let dest = match u32::from_str_radix(dest_hex, 16) {
+            Ok(v) => u32::from_le(v),
+            Err(_) => continue,
+        };
+        // Flags, RefCnt, Use, Metric, then Mask.
+        let mask_hex = c.nth(4).unwrap_or("");
+        let mask = match u32::from_str_radix(mask_hex, 16) {
+            Ok(v) => u32::from_le(v),
+            Err(_) => continue,
+        };
+        let plen = mask.count_ones();
+        if plen == 0 || plen > 32 {
+            continue;
+        }
+        if !v4_overlaps(u32::from(pool), 16, dest, plen) {
+            continue;
+        }
+        if plen >= 16 {
+            continue;
+        }
+        return Ok(Some(format!(
+            "RUSTYPODS_POD_NET4 {spec} overlaps {iface} route {}/{} — pick another /16",
+            std::net::Ipv4Addr::from(dest),
+            plen
+        )));
+    }
+    Ok(None)
+}
+
+fn v4_overlaps(a: u32, a_len: u32, b: u32, b_len: u32) -> bool {
+    let n = a_len.min(b_len);
+    let m = if n == 0 { 0 } else { u32::MAX << (32 - n) };
+    (a & m) == (b & m)
 }
 
 #[cfg(test)]

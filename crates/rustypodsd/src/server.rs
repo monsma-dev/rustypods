@@ -4685,6 +4685,7 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
+    net::load_pool().context("pod address pool")?;
     for d in [
         cfg.images_dir(),
         cfg.pods_dir(),

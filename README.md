@@ -175,9 +175,12 @@ just because the pod exists. The CLI prints a one-line notice when it
 creates an implicit loopback publish.
 
 Any pod with `--port` gets a private network namespace (`--network-veth`):
-host side `ve-<pod>` gets `10.220.<idx>.1/30`, the pod's `host0` gets a static
-`10.220.<idx>.2/30` (written into the rootfs before boot; index is stable per
-pod). The daemon manages its own `ip rustypods` nftables table:
+host side `ve-<pod>` gets `<pool>.<idx>.1/30`, the pod's `host0` gets a static
+`<pool>.<idx>.2/30` (written into the rootfs before boot; index is stable per
+pod). The pool defaults to `10.220.0.0/16` and `fd22:220::/32` (255 pods).
+Override it with `RUSTYPODS_POD_NET4` and `RUSTYPODS_POD_NET6` on the
+daemon if those ranges collide with a VPN; `doctor` warns when the v4
+pool overlaps an existing host route. The daemon manages its own `ip rustypods` nftables table:
 
 - DNAT matches `ip daddr <hostIp>`. Loopback publishes are **output-hook
   only** (a prerouting rule cannot see them and must not exist).

@@ -17,7 +17,80 @@ use std::time::Duration;
 
 use crate::state::PodMeta;
 
-const POOL_BASE: [u8; 3] = [10, 220, 0];
+/// IPv4 /16 and IPv6 /32 the daemon carves per-pod /30s and /64s out of.
+/// Defaults match the historical constants. Override with
+/// `RUSTYPODS_POD_NET4=10.220.0.0/16` and `RUSTYPODS_POD_NET6=fd22:220::/32`.
+#[derive(Clone, Debug)]
+pub struct PodPool {
+    pub v4: Ipv4Addr,
+    pub v6_hi: u16,
+    pub v6_mid: u16,
+}
+
+impl PodPool {
+    pub fn v4_cidr(&self) -> String {
+        format!("{}/16", self.v4)
+    }
+    pub fn v6_cidr(&self) -> String {
+        format!("{:x}:{:x}::/32", self.v6_hi, self.v6_mid)
+    }
+}
+
+pub fn parse_pod_pool(v4: &str, v6: &str) -> Result<PodPool> {
+    let (addr, prefix) = v4.split_once('/').context("RUSTYPODS_POD_NET4 must be a.b.0.0/16")?;
+    if prefix != "16" {
+        bail!("RUSTYPODS_POD_NET4 must be a /16, got {v4}");
+    }
+    let ip: Ipv4Addr = addr.parse().context("RUSTYPODS_POD_NET4 address")?;
+    let o = ip.octets();
+    if o[2] != 0 || o[3] != 0 {
+        bail!("RUSTYPODS_POD_NET4 must be x.y.0.0/16 (the third octet is the pod index)");
+    }
+    let (addr6, prefix6) = v6
+        .split_once('/')
+        .context("RUSTYPODS_POD_NET6 must be x:y::/32")?;
+    if prefix6 != "32" {
+        bail!("RUSTYPODS_POD_NET6 must be a /32, got {v6}");
+    }
+    let ip6: Ipv6Addr = addr6.parse().context("RUSTYPODS_POD_NET6 address")?;
+    let s = ip6.segments();
+    if s[2..].iter().any(|x| *x != 0) {
+        bail!("RUSTYPODS_POD_NET6 must be x:y::/32 (the third hextet is the pod index)");
+    }
+    Ok(PodPool {
+        v4: ip,
+        v6_hi: s[0],
+        v6_mid: s[1],
+    })
+}
+
+/// Fail the daemon on a bad pool instead of carving addresses out of
+/// the wrong range. Tests use [`pool`], which falls back to the defaults.
+pub fn load_pool() -> Result<&'static PodPool> {
+    if let Some(p) = POD_POOL.get() {
+        return Ok(p);
+    }
+    let p = pool_from_env()?;
+    let _ = POD_POOL.set(p);
+    Ok(POD_POOL.get().expect("pool just set"))
+}
+
+fn pool_from_env() -> Result<PodPool> {
+    let v4 = std::env::var("RUSTYPODS_POD_NET4").unwrap_or_else(|_| "10.220.0.0/16".into());
+    let v6 = std::env::var("RUSTYPODS_POD_NET6").unwrap_or_else(|_| "fd22:220::/32".into());
+    parse_pod_pool(&v4, &v6)
+}
+
+static POD_POOL: std::sync::OnceLock<PodPool> = std::sync::OnceLock::new();
+
+pub fn pool() -> &'static PodPool {
+    POD_POOL.get_or_init(|| {
+        pool_from_env().unwrap_or_else(|e| {
+            tracing::warn!("{e:#} — using 10.220.0.0/16 and fd22:220::/32");
+            parse_pod_pool("10.220.0.0/16", "fd22:220::/32").expect("default pool")
+        })
+    })
+}
 
 /// Host iface for a pod's veth pair (nspawn truncates to IFNAMSIZ-1 chars).
 pub fn veth_name(pod: &str) -> String {
@@ -25,19 +98,23 @@ pub fn veth_name(pod: &str) -> String {
 }
 
 pub fn host_ip(idx: u32) -> Ipv4Addr {
-    Ipv4Addr::new(POOL_BASE[0], POOL_BASE[1], idx as u8, 1)
+    let o = pool().v4.octets();
+    Ipv4Addr::new(o[0], o[1], idx as u8, 1)
 }
 pub fn pod_ip(idx: u32) -> Ipv4Addr {
-    Ipv4Addr::new(POOL_BASE[0], POOL_BASE[1], idx as u8, 2)
+    let o = pool().v4.octets();
+    Ipv4Addr::new(o[0], o[1], idx as u8, 2)
 }
-/// Same per-pod pairing in IPv6 ULA space: fd22:0220:<idx>::1 (host) and
-/// ::2 (pod) on a /64. `idx as u16` keeps the pool aligned with the v4
-/// 1..=255 indexes.
+/// Same per-pod pairing in the configured IPv6 /32: x:y:<idx>::1 (host)
+/// and ::2 (pod) on a /64. `idx as u16` keeps the pool aligned with the
+/// v4 1..=255 indexes.
 pub fn host_ip6(idx: u32) -> Ipv6Addr {
-    Ipv6Addr::new(0xfd22, 0x0220, idx as u16, 0, 0, 0, 0, 1)
+    let p = pool();
+    Ipv6Addr::new(p.v6_hi, p.v6_mid, idx as u16, 0, 0, 0, 0, 1)
 }
 pub fn pod_ip6(idx: u32) -> Ipv6Addr {
-    Ipv6Addr::new(0xfd22, 0x0220, idx as u16, 0, 0, 0, 0, 2)
+    let p = pool();
+    Ipv6Addr::new(p.v6_hi, p.v6_mid, idx as u16, 0, 0, 0, 0, 2)
 }
 /// Lowest free index in 1..=255 across all pods.
 pub fn alloc_index(pods: &BTreeMap<String, PodMeta>) -> u32 {
@@ -1013,6 +1090,8 @@ pub fn nat_script<'a>(
     for ip in &host_access_v6 {
         host_ok.push_str(&format!("    ip6 saddr {ip} accept\n"));
     }
+    let v4cidr = pool().v4_cidr();
+    let v6cidr = pool().v6_cidr();
     let rules = format!(
         "table ip rustypods {{\n\
          \x20 chain prerouting {{\n\
@@ -1028,9 +1107,9 @@ pub fn nat_script<'a>(
          \x20   type nat hook postrouting priority srcnat; policy accept;\n\
          \x20   # host-originated traffic to pods must be SNAT'd to the veth ip\n\
          \x20   # (a pod would answer 127.0.0.1 on its OWN loopback otherwise)\n\
-         \x20   fib saddr type local ip daddr 10.220.0.0/16 masquerade\n\
+         \x20   fib saddr type local ip daddr {v4cidr} masquerade\n\
          \x20   # pod egress onto the real network\n\
-         \x20   ip saddr 10.220.0.0/16 oifname != \"ve-*\" masquerade\n\
+         \x20   ip saddr {v4cidr} oifname != \"ve-*\" masquerade\n\
          \x20 }}\n\
          }}\n\
          table ip6 rustypods6 {{\n\
@@ -1045,7 +1124,7 @@ pub fn nat_script<'a>(
          \x20 chain postrouting {{\n\
          \x20   type nat hook postrouting priority srcnat; policy accept;\n\
          \x20   # ULA pod egress onto the real network\n\
-         \x20   ip6 saddr fd22:220::/32 oifname != \"ve-*\" masquerade\n\
+         \x20   ip6 saddr {v6cidr} oifname != \"ve-*\" masquerade\n\
          \x20 }}\n\
          }}\n\
          table inet rustypods {{\n\
@@ -1345,6 +1424,15 @@ mod tests {
         assert!(s.contains("ip saddr != { 10.220.2.2 } ip daddr 127.0.0.0/8 drop"));
         assert!(s.contains("ip saddr 10.220.2.2 accept"));
         assert!(s.contains("ip6 saddr fd22:220:2::2 accept"));
+    }
+
+    #[test]
+    fn pool_rejects_bad_prefixes() {
+        assert!(parse_pod_pool("10.220.0.0/16", "fd22:220::/32").is_ok());
+        assert!(parse_pod_pool("10.220.1.0/16", "fd22:220::/32").is_err());
+        assert!(parse_pod_pool("10.220.0.0/24", "fd22:220::/32").is_err());
+        assert!(parse_pod_pool("10.220.0.0/16", "fd22:220:1::/32").is_err());
+        assert!(parse_pod_pool("10.220.0.0/16", "fd22:220::/48").is_err());
     }
 
     fn address_helpers() {
