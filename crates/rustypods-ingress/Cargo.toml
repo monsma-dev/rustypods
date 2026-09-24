@@ -2,6 +2,7 @@
 name = "rustypods-ingress"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 description = "RustyPods ingress — hostname L7 reverse proxy (route control over UDS)"
 

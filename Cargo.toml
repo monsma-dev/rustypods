@@ -85,8 +85,8 @@ rand_core = "0.6"
 sha2 = "0.10"
 base64 = "0.22"
 
-rustypods-proto = { path = "crates/rustypods-proto" }
-rustypods-client = { path = "crates/rustypods-client" }
+rustypods-proto = { version = "0.1.0", path = "crates/rustypods-proto" }
+rustypods-client = { version = "0.1.0", path = "crates/rustypods-client" }
 
 # Only lints the tree already passes under `clippy -D warnings`.
 # Stricter clippy groups (unwrap_used, indexing_slicing, …) are not

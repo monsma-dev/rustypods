@@ -2,6 +2,7 @@
 name = "rustypods-agent"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 description = "RustyPods in-pod agent — telemetry stub (phase 2: metrics stream)"
 

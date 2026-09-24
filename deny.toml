@@ -1,0 +1,52 @@
+# cargo-deny policy. `cargo deny check advisories bans licenses sources`.
+# Advisories that cannot be fixed inside this branch are listed under
+# [advisories].ignore only after they are recorded in the commit message
+# or AGENTS.md — do not ignore a reachable CVE to make the check green.
+
+[advisories]
+yanked = "deny"
+# boringtun 0.6 pulls ring 0.16.20 and curve25519-dalek 4.0.0-rc.3.
+# Fixed on the mesh branch by upgrading boringtun to 0.7.1. This branch
+# does not float that pin. cargo-audit ignores the same IDs in
+# .cargo/audit.toml so a new advisory still fails the scan.
+ignore = [
+    "RUSTSEC-2024-0344",
+    "RUSTSEC-2025-0009",
+    "RUSTSEC-2025-0010",
+]
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+
+# ring 0.16 publishes no SPDX field. The LICENSE file is the usual
+# MIT AND ISC AND OpenSSL combination; hash is what cargo-deny computed.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "simplest-path"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
