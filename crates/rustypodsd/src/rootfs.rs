@@ -11,9 +11,11 @@
 //!
 //! Residual TOCTOU: check-then-use is racy against a writer mutating the
 //! rootfs between our check and the syscall (openat2/RESOLVE_BENEATH would
-//! close that, at the cost of raw syscall plumbing). The threat model is
-//! static image content — links are planted at pull/import time, when
-//! nothing inside the rootfs runs — so the lstat walk is sufficient.
+//! close that, at the cost of raw syscall plumbing). Rootfs content is not
+//! static: a pod mutates its tree between runs (and, without a userns, as
+//! host root while it is up). The lstat walk plus O_NOFOLLOW on the leaf
+//! is what every daemon write has to go through; a planted symlink must
+//! fail the write, never redirect it onto the host.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;

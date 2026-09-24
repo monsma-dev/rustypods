@@ -53,6 +53,11 @@ impl Config {
     pub fn conf_dir(&self) -> PathBuf {
         rustypods_proto::conf_dir(&self.data_dir)
     }
+    /// Daemon-owned resolv.conf files bound read-only into pods. Never
+    /// mounted as a directory the pod can write.
+    pub fn resolv_dir(&self) -> PathBuf {
+        self.data_dir.join("resolv")
+    }
 }
 
 pub fn euid() -> u32 {

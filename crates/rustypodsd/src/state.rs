@@ -11,17 +11,61 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustypods_proto::{fmt_bytes, parse_bytes};
 
+/// On-disk conf schema this binary writes. Older files omit `format` and
+/// load as 1. A newer `format` is loaded but never rewritten: serde would
+/// drop unknown fields on save.
+pub const CONF_FORMAT: u32 = 1;
+
+fn default_format() -> u32 {
+    CONF_FORMAT
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(into = "LimitsToml")]
 pub struct LimitsSpec {
     pub memory_high_bytes: u64,
     pub memory_max_bytes: u64,
     pub cpu_quota_percent: u32,
+    /// systemd TasksMax on the pod scope. 0 = unset (existing pods).
+    /// New pods created by the daemon get [`DEFAULT_TASKS_MAX`].
+    pub tasks_max: u64,
 }
+
+/// Applied to every newly created pod unless the request already set one.
+pub const DEFAULT_TASKS_MAX: u64 = 4096;
 
 impl LimitsSpec {
     pub fn is_empty(&self) -> bool {
-        self.memory_high_bytes == 0 && self.memory_max_bytes == 0 && self.cpu_quota_percent == 0
+        self.memory_high_bytes == 0
+            && self.memory_max_bytes == 0
+            && self.cpu_quota_percent == 0
+            && self.tasks_max == 0
+    }
+
+    /// Fill defaults for a pod that does not exist on disk yet. Explicit
+    /// non-zero limits win. MemoryMax and CPUQuota are applied only when
+    /// `RUSTYPODS_DEFAULT_MEMORY_MAX` / `RUSTYPODS_DEFAULT_CPU` are set
+    /// (typically via `/etc/rustypods/daemon.env`). TasksMax is always set.
+    pub fn with_create_defaults(mut self) -> Self {
+        if self.tasks_max == 0 {
+            self.tasks_max = DEFAULT_TASKS_MAX;
+        }
+        if self.memory_max_bytes == 0 {
+            if let Ok(s) = std::env::var("RUSTYPODS_DEFAULT_MEMORY_MAX") {
+                if let Ok(b) = parse_bytes(s.trim()) {
+                    self.memory_max_bytes = b;
+                }
+            }
+        }
+        if self.cpu_quota_percent == 0 {
+            if let Ok(s) = std::env::var("RUSTYPODS_DEFAULT_CPU") {
+                let t = s.trim().trim_end_matches('%');
+                if let Ok(n) = t.parse::<u32>() {
+                    self.cpu_quota_percent = n;
+                }
+            }
+        }
+        self
     }
 }
 
@@ -32,6 +76,7 @@ struct LimitsToml {
     memory_high: String,
     memory_max: String,
     cpu_quota_percent: u32,
+    tasks_max: u64,
 }
 
 impl From<LimitsSpec> for LimitsToml {
@@ -48,6 +93,7 @@ impl From<LimitsSpec> for LimitsToml {
                 fmt_bytes(l.memory_max_bytes)
             },
             cpu_quota_percent: l.cpu_quota_percent,
+            tasks_max: l.tasks_max,
         }
     }
 }
@@ -65,6 +111,8 @@ struct LimitsTomlIn {
     memory_max_bytes: Option<u64>,
     #[serde(default)]
     cpu_quota_percent: Option<u32>,
+    #[serde(default)]
+    tasks_max: Option<u64>,
 }
 
 fn val_to_bytes(v: &toml::Value, key: &str) -> std::result::Result<u64, String> {
@@ -140,12 +188,15 @@ impl<'de> Deserialize<'de> for LimitsSpec {
             memory_high_bytes: conv(raw.memory_high, raw.memory_high_bytes, "memory_high")?,
             memory_max_bytes: conv(raw.memory_max, raw.memory_max_bytes, "memory_max")?,
             cpu_quota_percent: raw.cpu_quota_percent.unwrap_or(0),
+            tasks_max: raw.tasks_max.unwrap_or(0),
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {
+    #[serde(default = "default_format")]
+    pub format: u32,
     pub name: String,
     /// Human-readable origin, e.g. "distrobox:arch" or "oci:busybox:latest".
     pub source: String,
@@ -204,6 +255,8 @@ pub struct HealthSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
+    #[serde(default = "default_format")]
+    pub format: u32,
     pub name: String,
     pub image: String,
     pub created_unix: u64,
@@ -281,6 +334,8 @@ pub struct PodMeta {
 /// registry survives daemon restarts even when the fs doesn't.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMeta {
+    #[serde(default = "default_format")]
+    pub format: u32,
     pub name: String,
     pub created_unix: u64,
 }
@@ -290,6 +345,25 @@ pub struct State {
     pub images: BTreeMap<String, ImageMeta>,
     pub pods: BTreeMap<String, PodMeta>,
     pub volumes: BTreeMap<String, VolumeMeta>,
+}
+
+/// Conf directories are 0700. The CLI and GUI talk to the daemon over
+/// gRPC; nothing non-root reads these files directly. Pod confs contain
+/// env, mesh.conf contains the WireGuard private key.
+pub fn secure_conf_dirs(data_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = [
+        rustypods_proto::conf_dir(data_dir),
+        pods_conf_dir(data_dir),
+        images_conf_dir(data_dir),
+        volumes_conf_dir(data_dir),
+    ];
+    for d in dirs {
+        std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", d.display()))?;
+    }
+    Ok(())
 }
 
 pub fn pods_conf_dir(data_dir: &Path) -> PathBuf {
@@ -306,13 +380,21 @@ fn image_conf(data_dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Atomic-ish write: tmp file + fsync + rename (+ dir sync so the rename
-/// itself survives a crash).
+/// itself survives a crash). The temp file is created mode 0600 — confs
+/// hold pod env — so a crash window is not world-readable either. Mode is
+/// set at open time, not via a later chmod.
 fn write_conf(path: &Path, body: &str) -> Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("conf.tmp");
     {
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(body.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
         f.sync_all()
@@ -337,22 +419,46 @@ fn volume_conf(data_dir: &Path, name: &str) -> std::path::PathBuf {
 }
 
 pub fn save_volume(data_dir: &Path, m: &VolumeMeta) -> Result<()> {
-    std::fs::create_dir_all(volumes_conf_dir(data_dir))?;
-    write_conf(&volume_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
+    secure_conf_dirs(data_dir)?;
+    let path = volume_conf(data_dir, &m.name);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
-pub fn remove_volume(data_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(volume_conf(data_dir, name));
+pub fn remove_volume(data_dir: &Path, name: &str) -> Result<()> {
+    remove_conf(&volume_conf(data_dir, name))
 }
 
 pub fn save_pod(data_dir: &Path, m: &PodMeta) -> Result<()> {
-    std::fs::create_dir_all(pods_conf_dir(data_dir))?;
-    write_conf(&pod_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
+    secure_conf_dirs(data_dir)?;
+    let path = pod_conf(data_dir, &m.name);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
 /// Multi-host mesh config (Wave I): the host's WG identity + static
 /// peers. One TOML file — not per-entity confs — because it's a single
 /// daemon-scoped object, not a registry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MeshConf {
+    #[serde(default = "default_format")]
+    pub format: u32,
     /// base64 x25519 private key; "" = mesh not initialized.
     #[serde(default)]
     pub private_key: String,
@@ -390,15 +496,20 @@ pub fn load_mesh(data_dir: &Path) -> Option<MeshConf> {
 }
 
 pub fn save_mesh(data_dir: &Path, m: &MeshConf) -> Result<()> {
-    std::fs::create_dir_all(rustypods_proto::conf_dir(data_dir))?;
-    // 0600 — the file holds the host's WG private key.
-    write_conf(&mesh_conf_path(data_dir), &toml::to_string_pretty(m)?)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        mesh_conf_path(data_dir),
-        std::fs::Permissions::from_mode(0o600),
-    )?;
-    Ok(())
+    secure_conf_dirs(data_dir)?;
+    // 0600 comes from write_conf — the file holds the host's WG private key.
+    let path = mesh_conf_path(data_dir);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
 
 /// `mesh deinit` — drop the persisted identity+peers so a daemon
@@ -412,14 +523,63 @@ pub fn remove_mesh(data_dir: &Path) -> Result<()> {
 }
 
 pub fn save_image(data_dir: &Path, m: &ImageMeta) -> Result<()> {
-    std::fs::create_dir_all(images_conf_dir(data_dir))?;
-    write_conf(&image_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
+    secure_conf_dirs(data_dir)?;
+    let path = image_conf(data_dir, &m.name);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
-pub fn remove_pod(data_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(pod_conf(data_dir, name));
+
+fn canonical_format(format: u32) -> Result<u32> {
+    if format > CONF_FORMAT {
+        anyhow::bail!(
+            "conf format {format} is newer than supported {CONF_FORMAT}; refusing to overwrite"
+        );
+    }
+    Ok(if format == 0 { CONF_FORMAT } else { format })
 }
-pub fn remove_image(data_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(image_conf(data_dir, name));
+
+/// A conf written by a newer daemon stays on disk untouched.
+fn refuse_newer_conf(path: &Path) -> Result<()> {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(v) = toml::from_str::<toml::Value>(&s) else {
+        return Ok(());
+    };
+    let fmt = v.get("format").and_then(|x| x.as_integer()).unwrap_or(1);
+    if fmt > CONF_FORMAT as i64 {
+        anyhow::bail!(
+            "{} format {fmt} is newer than supported {CONF_FORMAT}; refusing to overwrite (loaded read-only)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+pub fn remove_pod(data_dir: &Path, name: &str) -> Result<()> {
+    remove_conf(&pod_conf(data_dir, name))
+}
+pub fn remove_image(data_dir: &Path, name: &str) -> Result<()> {
+    remove_conf(&image_conf(data_dir, name))
+}
+
+fn remove_conf(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            tracing::error!("failed to remove {}: {e}", path.display());
+            Err(e).with_context(|| format!("remove {}", path.display()))
+        }
+    }
 }
 
 /// Conf sanity beyond TOML parsing — applied at boot (scan) and on
@@ -517,18 +677,22 @@ fn scan<T: for<'de> Deserialize<'de>>(
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        match std::fs::read_to_string(&p)
-            .ok()
-            .and_then(|s| toml::from_str::<T>(&s).ok())
-        {
-            Some(m) => {
+        let text = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("conf {} skipped (read error: {e})", p.display());
+                continue;
+            }
+        };
+        match toml::from_str::<T>(&text) {
+            Ok(m) => {
                 if let Err(e) = check(&m, &stem) {
                     tracing::warn!("conf {} skipped ({e:#})", p.display());
                     continue;
                 }
                 out.insert(name_of(&m).to_string(), m);
             }
-            None => tracing::warn!("conf {} skipped (parse error)", p.display()),
+            Err(e) => tracing::warn!("conf {} skipped (parse error: {e})", p.display()),
         }
     }
 }
@@ -690,6 +854,7 @@ fn migrate_json(data_dir: &Path) {
             continue;
         }
         let m = ImageMeta {
+            format: CONF_FORMAT,
             name: i.name.clone(),
             source: i.source.clone(),
             created_unix: i.created_unix,
@@ -708,6 +873,7 @@ fn migrate_json(data_dir: &Path) {
             continue;
         }
         let m = PodMeta {
+            format: CONF_FORMAT,
             name: p.name.clone(),
             image: p.image.clone(),
             created_unix: p.created_unix,
@@ -715,6 +881,7 @@ fn migrate_json(data_dir: &Path) {
                 memory_high_bytes: p.limits.memory_high_bytes,
                 memory_max_bytes: p.limits.memory_max_bytes,
                 cpu_quota_percent: p.limits.cpu_quota_percent,
+                tasks_max: 0,
             },
             ephemeral: p.ephemeral,
             private_users: p.private_users,
@@ -758,13 +925,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rustypods-vol-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let v = VolumeMeta {
+            format: CONF_FORMAT,
             name: "pgdata".into(),
             created_unix: 42,
         };
         save_volume(&dir, &v).unwrap();
         let st = load(&dir).unwrap();
         assert_eq!(st.volumes["pgdata"].created_unix, 42);
-        remove_volume(&dir, "pgdata");
+        remove_volume(&dir, "pgdata").unwrap();
         let st = load(&dir).unwrap();
         assert!(st.volumes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -777,6 +945,7 @@ mod tests {
         // A minimal legacy conf (pre-Wave-E) must load with env/volumes
         // defaulting to empty.
         let pod = PodMeta {
+            format: CONF_FORMAT,
             name: "legacy".into(),
             image: "img".into(),
             created_unix: 0,
@@ -808,6 +977,7 @@ mod tests {
         // Bad env / bad volume specs in a hand-edited conf are rejected
         // by the boot-time scan too.
         let bad = PodMeta {
+            format: CONF_FORMAT,
             env: vec!["NOEQ".into()],
             ..pod.clone()
         };
@@ -832,6 +1002,7 @@ mod tests {
 
     fn meta(name: &str, host: &str) -> PodMeta {
         PodMeta {
+            format: CONF_FORMAT,
             name: name.into(),
             image: "img".into(),
             created_unix: 0,
@@ -955,6 +1126,7 @@ mod tests {
         // Absent file → None (mesh never initialized).
         assert!(load_mesh(&dir).is_none());
         let conf = MeshConf {
+            format: CONF_FORMAT,
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             listen_port: 51820,
             peers: vec![MeshPeerConf {
@@ -977,6 +1149,63 @@ mod tests {
         // Empty key = uninitialized even if the file exists.
         save_mesh(&dir, &MeshConf::default()).unwrap();
         assert!(load_mesh(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_defaults_explicit_override_and_newer_format_is_readonly() {
+        std::env::set_var("RUSTYPODS_DEFAULT_MEMORY_MAX", "64M");
+        std::env::set_var("RUSTYPODS_DEFAULT_CPU", "50%");
+        let d = LimitsSpec::default().with_create_defaults();
+        assert_eq!(d.tasks_max, DEFAULT_TASKS_MAX);
+        assert_eq!(d.memory_max_bytes, 64 << 20);
+        assert_eq!(d.cpu_quota_percent, 50);
+        let custom = LimitsSpec {
+            memory_max_bytes: 1,
+            cpu_quota_percent: 10,
+            tasks_max: 3,
+            ..LimitsSpec::default()
+        }
+        .with_create_defaults();
+        assert_eq!(custom.memory_max_bytes, 1);
+        assert_eq!(custom.cpu_quota_percent, 10);
+        assert_eq!(custom.tasks_max, 3);
+        std::env::remove_var("RUSTYPODS_DEFAULT_MEMORY_MAX");
+        std::env::remove_var("RUSTYPODS_DEFAULT_CPU");
+        let bare = LimitsSpec::default().with_create_defaults();
+        assert_eq!(bare.tasks_max, DEFAULT_TASKS_MAX);
+        assert_eq!(bare.memory_max_bytes, 0);
+        assert_eq!(bare.cpu_quota_percent, 0);
+
+        let dir = std::env::temp_dir().join(format!("rp-fmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(pods_conf_dir(&dir)).unwrap();
+        std::fs::write(
+            pod_conf(&dir, "old"),
+            "name = \"old\"\nimage = \"img\"\ncreated_unix = 1\n",
+        )
+        .unwrap();
+        let st = load(&dir).unwrap();
+        assert_eq!(st.pods["old"].format, CONF_FORMAT);
+        assert_eq!(st.pods["old"].limits.tasks_max, 0);
+        std::fs::write(
+            pod_conf(&dir, "new"),
+            "format = 9\nname = \"new\"\nimage = \"img\"\ncreated_unix = 1\nextra_future = true\n",
+        )
+        .unwrap();
+        let st = load(&dir).unwrap();
+        assert_eq!(st.pods["new"].format, 9);
+        let err = save_pod(&dir, &st.pods["new"]).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:#}");
+        let raw = std::fs::read_to_string(pod_conf(&dir, "new")).unwrap();
+        assert!(raw.contains("extra_future"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(pods_conf_dir(&dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

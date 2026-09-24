@@ -115,6 +115,7 @@ mod tests {
 
     fn meta(name: &str, net_index: u32, rules: &[(&str, u16)]) -> PodMeta {
         PodMeta {
+            format: 1,
             name: name.into(),
             image: "img".into(),
             created_unix: 0,

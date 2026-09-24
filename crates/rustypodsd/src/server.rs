@@ -264,6 +264,7 @@ fn limits_from(l: Option<Limits>) -> LimitsSpec {
         memory_high_bytes: l.memory_high_bytes,
         memory_max_bytes: l.memory_max_bytes,
         cpu_quota_percent: l.cpu_quota_percent,
+        tasks_max: 0,
     })
     .unwrap_or_default()
 }
@@ -568,14 +569,20 @@ impl Svc {
         m.set_local_names(names).await;
     }
 
-    /// Mesh-DNS (Wave K): write run/resolv.conf pointing the pod at the
+    /// Mesh-DNS (Wave K): write a resolv.conf pointing the pod at the
     /// host's mesh addr (fd<host>::1:53) with the real upstream as
-    /// fallback, and return the ro bind over /etc/resolv.conf. Missing
-    /// targets get created so --bind never fails on a bare OCI rootfs.
+    /// fallback, and return the ro bind over /etc/resolv.conf.
+    ///
+    /// The file lives in a daemon-owned directory that is never bind-mounted
+    /// into a pod. The per-pod run dir is chowned to the pod and is therefore
+    /// attacker-controlled between runs — `fs::write` there would follow a
+    /// planted symlink. The rootfs target is created through the rootfs
+    /// helpers so a symlink at `etc` or `etc/resolv.conf` cannot redirect
+    /// the create onto the host.
     fn mesh_resolv_bind(
         &self,
         rootfs: &Path,
-        run_dir: &Path,
+        name: &str,
         host_addr: std::net::Ipv6Addr,
     ) -> Result<proto::BindSpec, Status> {
         let mut content = format!("nameserver {host_addr}\n");
@@ -588,15 +595,13 @@ impl Svc {
             }
         }
         content += "search rp pods\n";
-        let file = run_dir.join("resolv.conf");
-        std::fs::write(&file, content).map_err(int)?;
-        let target = rootfs.join("etc/resolv.conf");
-        if !target.exists() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(int)?;
-            }
-            std::fs::write(&target, "").map_err(int)?;
-        }
+        let file = write_daemon_file(
+            &self.cfg.resolv_dir(),
+            &format!("{name}.conf"),
+            content.as_bytes(),
+        )
+        .map_err(int)?;
+        ensure_resolv_target(rootfs).map_err(int)?;
         Ok(proto::BindSpec {
             host: file.display().to_string(),
             pod: "/etc/resolv.conf".into(),
@@ -737,6 +742,7 @@ impl Svc {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).map_err(int)?;
         }
         let v = VolumeMeta {
+            format: 1,
             name,
             created_unix: state::now_unix(),
         };
@@ -822,8 +828,10 @@ impl Svc {
 
     /// Last `lines` log lines — journal for boot pods (same
     /// `journalctl -M` probe as stream_logs), the nspawn console log
-    /// otherwise. Returned newest-last, one String per line.
-    pub(crate) async fn pod_log_tail(&self, name: &str, lines: u32) -> Result<Vec<String>, Status> {
+    /// otherwise. Returned newest-last. The body is capped at
+    /// [`LOG_TAIL_MAX`] so a multi-gigabyte line cannot OOM the daemon;
+    /// `truncated` is set when the cap or a per-line cap fired.
+    pub(crate) async fn pod_log_tail(&self, name: &str, lines: u32) -> Result<LogTail, Status> {
         if !self.pod_exists(name).await {
             return Err(Status::not_found(format!("pod {name} not found")));
         }
@@ -831,8 +839,8 @@ impl Svc {
             let st = self.st.lock().await;
             st.pods.get(name).map(|m| is_payload_pod(&st, m)) == Some(false)
         };
-        let n = lines.to_string();
-        let spawned = if boot_pod {
+        let n = lines.max(1);
+        if boot_pod {
             let has_journal = tokio::process::Command::new("journalctl")
                 .args(["-M", name, "-n", "1", "--no-pager"])
                 .stdin(Stdio::null())
@@ -842,43 +850,28 @@ impl Svc {
                 .await
                 .map(|s| s.success())
                 .unwrap_or(false);
-            has_journal.then(|| {
-                tokio::process::Command::new("journalctl")
-                    .args(["-M", name, "-n", &n, "-o", "cat", "--no-pager"])
+            if has_journal {
+                let mut child = tokio::process::Command::new("journalctl")
+                    .args(["-M", name, "-n", &n.to_string(), "-o", "cat", "--no-pager"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
-                    .output()
-            })
-        } else {
-            None
-        };
-        let out = match spawned {
-            Some(f) => f.await.map_err(int)?,
-            None => {
-                let log_path = self.cfg.logs_dir().join(format!("{name}.log"));
-                match tokio::process::Command::new("tail")
-                    .arg("-n")
-                    .arg(&n)
-                    .arg(&log_path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(int)?;
+                let (buf, cut) = read_capped_stdout(&mut child, LOG_TAIL_MAX)
                     .await
-                {
-                    Ok(o) if o.status.success() => o,
-                    // A pod that never started has no console log — an
-                    // empty tail is more useful than a 500.
-                    Ok(_) => return Ok(Vec::new()),
-                    Err(e) => return Err(int(e)),
-                }
+                    .map_err(int)?;
+                return Ok(split_log_tail(&buf, n as usize, cut));
             }
-        };
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect())
+        }
+        let log_path = self.cfg.logs_dir().join(format!("{name}.log"));
+        match tokio::task::spawn_blocking(move || read_log_tail_file(&log_path, n as usize)).await {
+            Ok(Ok(t)) => Ok(t),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(LogTail::default()),
+            Ok(Err(e)) => Err(int(e)),
+            Err(e) => Err(int(e)),
+        }
     }
 
     /// Run a non-tty exec session to completion and capture its output —
@@ -1958,6 +1951,7 @@ impl PodControl for Svc {
         }
         sanitize_rootfs(&dest, &req.distrobox).map_err(int)?;
         let meta = ImageMeta {
+            format: 1,
             name: name.clone(),
             source: format!("distrobox:{}", req.distrobox),
             created_unix: state::now_unix(),
@@ -1997,6 +1991,7 @@ impl PodControl for Svc {
             }
         };
         let meta = ImageMeta {
+            format: 1,
             name: name.clone(),
             source: format!("oci:{}", req.reference),
             created_unix: state::now_unix(),
@@ -2056,7 +2051,7 @@ impl PodControl for Svc {
         self.st_delete(&self.cfg.images_dir().join(&name)).await?;
         let mut st = self.st.lock().await;
         st.images.remove(&name);
-        state::remove_image(&self.cfg.data_dir, &name);
+        state::remove_image(&self.cfg.data_dir, &name).map_err(int)?;
         Ok(Response::new(Empty {}))
     }
 
@@ -2119,10 +2114,11 @@ impl PodControl for Svc {
             return Err(e);
         }
         let meta = PodMeta {
+            format: 1,
             name: name.clone(),
             image,
             created_unix: state::now_unix(),
-            limits: limits_from(req.limits),
+            limits: limits_from(req.limits).with_create_defaults(),
             ephemeral: false,
             // userns on by default; desktop pods share the home dir and need
             // host-uid identity, so they opt out.
@@ -2234,6 +2230,7 @@ impl PodControl for Svc {
             return Err(e);
         }
         let meta = PodMeta {
+            format: 1,
             name: dest.clone(),
             created_unix: state::now_unix(),
             started: false,
@@ -2638,6 +2635,7 @@ impl PodControl for Svc {
                         return Err(e);
                     }
                     let m = PodMeta {
+                        format: 1,
                         name: pname.clone(),
                         image: sp.image.clone(),
                         created_unix: state::now_unix(),
@@ -2780,7 +2778,7 @@ impl PodControl for Svc {
             }
             agent::stop_listener(&self.listeners, &self.metrics, pname).await;
             self.st_delete(&self.pod_rootfs(pname)).await?;
-            state::remove_pod(&self.cfg.data_dir, pname);
+            state::remove_pod(&self.cfg.data_dir, pname).map_err(int)?;
             agent::cleanup_pod_dirs(
                 &proto::run_dir(&self.cfg.data_dir, pname),
                 &proto::shm_host_dir(pname),
@@ -3038,7 +3036,7 @@ impl PodControl for Svc {
         // only and can't resolve pod names.
         if needs_network && meta.stack.is_empty() {
             if let Some(m) = self.mesh() {
-                match self.mesh_resolv_bind(&rootfs, &run_dir, m.host_addr) {
+                match self.mesh_resolv_bind(&rootfs, &name, m.host_addr) {
                     Ok(b) => binds.push(b),
                     Err(e) => tracing::warn!("mesh resolv.conf for {name}: {e:#}"),
                 }
@@ -3054,6 +3052,12 @@ impl PodControl for Svc {
         )
         .await
         .map_err(int)?;
+        // No-userns pods run the image's systemd-tmpfiles as host root.
+        // An rw bind of /tmp (desktop) makes `q /tmp` and `D /tmp/.X11-unix`
+        // apply to the HOST. Mask the vendor snippets that own those paths.
+        if !meta.private_users {
+            mask_host_tmpfiles(&rootfs, &binds).map_err(int)?;
+        }
         let log = self.cfg.logs_dir().join(format!("{name}.log"));
         let spec = StartSpec {
             name: name.clone(),
@@ -3353,7 +3357,8 @@ impl PodControl for Svc {
             self.sync_ingress(Some(&name), true).await?;
         }
         self.st_delete(&self.pod_rootfs(&name)).await?;
-        state::remove_pod(&self.cfg.data_dir, &name);
+        state::remove_pod(&self.cfg.data_dir, &name).map_err(int)?;
+        crate::runtime::logs::remove_pod_logs(&self.cfg.logs_dir(), &name).map_err(int)?;
         agent::cleanup_pod_dirs(
             &proto::run_dir(&self.cfg.data_dir, &name),
             &proto::shm_host_dir(&name),
@@ -3718,6 +3723,7 @@ impl PodControl for Svc {
         // WHAT the gateway is; created_unix/net_index/started are
         // preserved across re-inits.
         let managed = |prev: Option<&PodMeta>| PodMeta {
+            format: 1,
             name: proto::INGRESS_POD.into(),
             image: image.clone(),
             created_unix: prev.map(|m| m.created_unix).unwrap_or_else(state::now_unix),
@@ -3725,6 +3731,7 @@ impl PodControl for Svc {
                 memory_high_bytes: 256 << 20,
                 memory_max_bytes: 512 << 20,
                 cpu_quota_percent: 100,
+                tasks_max: state::DEFAULT_TASKS_MAX,
             },
             ephemeral: false,
             private_users: true,
@@ -4109,13 +4116,20 @@ impl PodControl for Svc {
             if first.ts_unix_ms > 0 && tx.send(Ok(first)).await.is_err() {
                 return;
             }
+            // A quiet pod never pushes, so tx.send never fails. tx.closed()
+            // fires when the client drops logs/metrics follow.
             loop {
-                if rx.changed().await.is_err() {
-                    break;
-                }
-                let m = *rx.borrow_and_update();
-                if tx.send(Ok(m)).await.is_err() {
-                    break;
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let m = *rx.borrow_and_update();
+                        if tx.send(Ok(m)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -4194,27 +4208,37 @@ impl PodControl for Svc {
             };
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut line = Vec::with_capacity(4096);
+            // Quiet pods produce no lines, so send() never fails and an
+            // abandoned `logs -f` would keep tail/journalctl forever.
+            // tx.closed() is the disconnect signal; then kill and reap.
             loop {
-                match read_log_line(&mut reader, &mut line).await {
-                    Ok(true) => {
-                        if tx
-                            .send(Ok(LogLine {
-                                ts_unix_ms: now_unix_ms(),
-                                data: std::mem::take(&mut line),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            break; // client gone — kill_on_drop reaps the child
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    read = read_log_line(&mut reader, &mut line) => {
+                        match read {
+                            Ok(true) => {
+                                if tx
+                                    .send(Ok(LogLine {
+                                        ts_unix_ms: now_unix_ms(),
+                                        data: std::mem::take(&mut line),
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(false) => break,
+                            Err(e) => {
+                                let _ = tx.send(Err(int(e))).await;
+                                break;
+                            }
                         }
-                    }
-                    Ok(false) => break,
-                    Err(e) => {
-                        let _ = tx.send(Err(int(e))).await;
-                        break;
                     }
                 }
             }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -4296,7 +4320,7 @@ impl PodControl for Svc {
         if on_disk {
             self.st_delete(&dir).await?;
         }
-        state::remove_volume(&self.cfg.data_dir, &name);
+        state::remove_volume(&self.cfg.data_dir, &name).map_err(int)?;
         self.st.lock().await.volumes.remove(&name);
         Ok(Response::new(Empty {}))
     }
@@ -4327,6 +4351,17 @@ impl PodControl for Svc {
 /// marker, and the remainder up to the newline is discarded.
 const LOG_LINE_MAX: usize = 64 << 10;
 const TRUNCATED_MARK: &[u8] = b" [truncated]";
+/// Total bytes the REST/gRPC log tail will hold. A console log can contain
+/// one multi-gigabyte line with no newline; reading it via `tail` `.output()`
+/// would OOM the root daemon.
+const LOG_TAIL_MAX: usize = 1 << 20;
+
+/// Last lines of a pod log, plus whether a cap discarded bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LogTail {
+    pub lines: Vec<String>,
+    pub truncated: bool,
+}
 
 /// Read one line (the '\n' is consumed but not included) into `out`,
 /// capped at LOG_LINE_MAX. Returns Ok(false) only on clean EOF before any
@@ -4376,6 +4411,162 @@ async fn read_log_line<R: tokio::io::AsyncBufRead + Unpin>(
                 }
             }
         }
+    }
+}
+
+/// Read a child stdout until EOF or `cap` bytes. Over the cap, kill the
+/// child so a journal line with no newline cannot grow without bound.
+async fn read_capped_stdout(
+    child: &mut tokio::process::Child,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::AsyncReadExt;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child has no stdout"))?;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let n = stdout.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        let room = cap.saturating_sub(buf.len());
+        if n > room {
+            buf.extend_from_slice(&tmp[..room]);
+            truncated = true;
+            let _ = child.start_kill();
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    let _ = child.wait().await;
+    Ok((buf, truncated))
+}
+
+/// Last `n` lines of a console log, reading at most [`LOG_TAIL_MAX`] bytes
+/// from the end of the file. Never loads the whole file.
+fn read_log_tail_file(path: &std::path::Path, n: usize) -> std::io::Result<LogTail> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let cap = LOG_TAIL_MAX as u64;
+    let start = len.saturating_sub(cap);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.take(cap).read_to_end(&mut buf)?;
+    let mut cut = start > 0;
+    if cut {
+        // Drop the partial first line so we don't invent a head fragment,
+        // unless the window contains no newline at all (one giant line).
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            buf.drain(..=i);
+        }
+    }
+    if buf.len() >= LOG_TAIL_MAX {
+        cut = true;
+    }
+    Ok(split_log_tail(&buf, n, cut))
+}
+
+fn split_log_tail(buf: &[u8], n: usize, mut truncated: bool) -> LogTail {
+    if buf.is_empty() || n == 0 {
+        return LogTail {
+            lines: Vec::new(),
+            truncated,
+        };
+    }
+    let mut parts: Vec<&[u8]> = buf.split(|b| *b == b'\n').collect();
+    if buf.last() == Some(&b'\n') {
+        parts.pop();
+    }
+    let mut lines = Vec::with_capacity(parts.len());
+    for raw in parts {
+        let (slice, cut) = if raw.len() > LOG_LINE_MAX {
+            truncated = true;
+            (&raw[..LOG_LINE_MAX], true)
+        } else {
+            (raw, false)
+        };
+        let mut s = String::from_utf8_lossy(slice).into_owned();
+        if cut {
+            s.push_str(" [truncated]");
+        }
+        lines.push(s);
+    }
+    if lines.len() > n {
+        truncated = true;
+        lines = lines.split_off(lines.len() - n);
+    }
+    LogTail { lines, truncated }
+}
+
+/// Write `bytes` into a daemon-owned directory via an `O_NOFOLLOW|O_EXCL`
+/// temp file and `rename`. `rename` replaces a symlink at the destination;
+/// it does not follow it. The directory itself is mode 0700.
+fn write_daemon_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    let dest = dir.join(name);
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_EXCL)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(bytes)?;
+        f.sync_all().ok();
+    }
+    std::fs::rename(&tmp, &dest).with_context(|| format!("rename {}", dest.display()))?;
+    Ok(dest)
+}
+
+/// Create `etc/resolv.conf` inside the rootfs when it is missing, without
+/// following a symlink at `etc` or at the leaf. An existing regular file is
+/// left alone (the bind mounts over it). A leaf symlink is unlinked and
+/// replaced with an empty regular file.
+/// Mask vendor tmpfiles snippets that would operate on host paths bound
+/// into a pod running without a user namespace. A symlink to `/dev/null`
+/// in `/etc/tmpfiles.d/` disables the same-named file under
+/// `/usr/lib/tmpfiles.d/`.
+fn mask_host_tmpfiles(rootfs: &Path, binds: &[proto::BindSpec]) -> Result<()> {
+    if !binds.iter().any(|b| !b.ro) {
+        return Ok(());
+    }
+    crate::rootfs::mkdir_in_rootfs(rootfs, "etc/tmpfiles.d")?;
+    for name in ["tmp.conf", "x11.conf"] {
+        crate::rootfs::symlink_in_rootfs(
+            rootfs,
+            format!("etc/tmpfiles.d/{name}"),
+            Path::new("/dev/null"),
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_resolv_target(rootfs: &Path) -> Result<()> {
+    crate::rootfs::mkdir_in_rootfs(rootfs, "etc")?;
+    let target = crate::rootfs::safe_join(rootfs, "etc/resolv.conf")?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(md) if md.file_type().is_file() => Ok(()),
+        Ok(md) if md.file_type().is_symlink() => {
+            std::fs::remove_file(&target)?;
+            crate::rootfs::write_in_rootfs(rootfs, "etc/resolv.conf", b"", Some(0o644))
+        }
+        Ok(_) => bail!("{} is not a regular file", target.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::rootfs::write_in_rootfs(rootfs, "etc/resolv.conf", b"", Some(0o644))
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -4690,9 +4881,16 @@ pub async fn serve(cfg: Config) -> Result<()> {
         cfg.shm_dir(),
         state::pods_conf_dir(&cfg.data_dir),
         state::images_conf_dir(&cfg.data_dir),
+        cfg.resolv_dir(),
         proto::volumes_dir(&cfg.data_dir),
     ] {
         std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
+    }
+    state::secure_conf_dirs(&cfg.data_dir)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cfg.resolv_dir(), std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", cfg.resolv_dir().display()))?;
     }
     // SIGKILL'd pulls/imports leave .layer-*/.export-* blobs behind.
     oci::sweep_tmpfiles(&cfg.images_dir());
@@ -4756,6 +4954,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
     engine.init().await?;
 
     let st = Arc::new(Mutex::new(state::load(&cfg.data_dir)?));
+    {
+        let live: std::collections::BTreeSet<String> =
+            st.lock().await.pods.keys().cloned().collect();
+        crate::runtime::logs::sweep_orphan_logs(&cfg.logs_dir(), &live);
+    }
+    crate::runtime::logs::spawn_rotator(cfg.logs_dir());
     let metrics: MetricsMap = Default::default();
     let listeners: ListenerMap = Default::default();
     let svc = Svc {
@@ -5017,9 +5221,59 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn daemon_file_replaces_symlink_without_following() {
+        let dir = std::env::temp_dir().join(format!("rustypods-wdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, b"safe").unwrap();
+        let owned = dir.join("owned");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::os::unix::fs::symlink(&victim, owned.join("p.conf")).unwrap();
+        write_daemon_file(&owned, "p.conf", b"nameserver fd00::1\n").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"safe");
+        assert_eq!(
+            std::fs::read(owned.join("p.conf")).unwrap(),
+            b"nameserver fd00::1\n"
+        );
+        let meta = std::fs::symlink_metadata(owned.join("p.conf")).unwrap();
+        assert!(meta.file_type().is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_tail_caps_a_giant_line_and_keeps_the_tail() {
+        let t = split_log_tail(b"a\nb\nc\n", 2, false);
+        assert_eq!(t.lines, vec!["b".to_string(), "c".to_string()]);
+        assert!(t.truncated);
+        let giant = vec![b'x'; LOG_LINE_MAX + 50];
+        let t = split_log_tail(&giant, 10, false);
+        assert_eq!(t.lines.len(), 1);
+        assert!(t.lines[0].ends_with(" [truncated]"));
+        assert!(t.truncated);
+        assert!(t.lines[0].len() < giant.len());
+
+        let dir = std::env::temp_dir().join(format!("rustypods-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("p.log");
+        // Bigger than the response cap, no newline — must not read it all.
+        let mut f = std::fs::File::create(&p).unwrap();
+        std::io::Write::write_all(&mut f, &vec![b'z'; LOG_TAIL_MAX + 100]).unwrap();
+        drop(f);
+        let t = read_log_tail_file(&p, 5).unwrap();
+        assert!(t.truncated);
+        assert_eq!(t.lines.len(), 1);
+        assert!(t.lines[0].contains("[truncated]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::{
-        probe_addr, restart_policy, snapshot_expired, supervised, validate_ingress_conflicts,
-        validate_ingress_conflicts_excluding,
+        probe_addr, read_log_tail_file, restart_policy, snapshot_expired, split_log_tail,
+        supervised, validate_ingress_conflicts, validate_ingress_conflicts_excluding,
+        write_daemon_file, LOG_LINE_MAX, LOG_TAIL_MAX,
     };
     use crate::state::{IngressSpec, LimitsSpec, PodMeta, State};
     use rustypods_proto::rpc::IngressRule;
@@ -5027,6 +5281,7 @@ mod tests {
 
     fn meta_with_ingress(name: &str, hosts: &[&str]) -> PodMeta {
         PodMeta {
+            format: 1,
             name: name.into(),
             image: "img".into(),
             created_unix: 0,

@@ -67,9 +67,15 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
         // distros (NetworkManager, Netplan) don't run.
         a.push("--network-veth".into());
     }
-    // OCI env + working dir (only populated for payload images).
+    // Env values must not appear on argv: /proc/<pid>/cmdline is
+    // world-readable. `--setenv=NAME` (no value) copies NAME from
+    // nspawn's own environment (systemd 257). spawn() puts the values
+    // there; /proc/<pid>/environ is mode 0400.
     for kv in &spec.env {
-        a.push(format!("--setenv={kv}").into());
+        let key = kv.split('=').next().unwrap_or(kv);
+        if !key.is_empty() {
+            a.push(format!("--setenv={key}").into());
+        }
     }
     if spec.payload.is_some() && !spec.chdir.is_empty() {
         a.push(format!("--chdir={}", spec.chdir).into());
@@ -84,18 +90,25 @@ pub fn start_argv(spec: &StartSpec) -> Vec<OsString> {
 /// Spawn nspawn with console output appended to `log`. A detached reaper task
 /// waits on the child so it never zombies; nspawn keeps running if the daemon
 /// restarts (it reparents to PID 1 and machined still owns the registration).
-async fn spawn(argv: &[OsString], log: &Path) -> Result<u32> {
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .with_context(|| format!("log {}", log.display()))?;
+async fn spawn(argv: &[OsString], log: &Path, env: &[String]) -> Result<u32> {
+    // Cap before handing nspawn the O_APPEND fd. Rotation truncates that
+    // same inode later (see runtime::logs) while nspawn keeps writing.
+    super::logs::rotate_console_log(log, super::logs::log_max_bytes())?;
+    let f = super::logs::open_console_log(log)?;
     let err = f.try_clone()?;
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(f))
-        .stderr(std::process::Stdio::from(err))
+        .stderr(std::process::Stdio::from(err));
+    for kv in env {
+        if let Some((k, v)) = kv.split_once('=') {
+            if !k.is_empty() {
+                cmd.env(k, v);
+            }
+        }
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", argv[0].to_string_lossy()))?;
     let pid = child.id().unwrap_or(0);
@@ -128,7 +141,7 @@ impl RuntimeEngine for SystemdNspawn {
 
     async fn start(&self, spec: &StartSpec, limits: &LimitsSpec) -> Result<u32> {
         let argv = start_argv(spec);
-        spawn(&argv, &spec.log).await?;
+        spawn(&argv, &spec.log, &spec.env).await?;
         dbus::wait_registered(&self.dbus, &spec.name, Duration::from_secs(15))
             .await
             .context(format!("boot failed — see {}", spec.log.display()))?;
@@ -267,7 +280,11 @@ mod tests {
         let a = argv(&s);
         assert!(!a.contains(&"--boot".to_string()), "payload ⇒ no --boot");
         assert!(a.contains(&"--private-users=pick".to_string()));
-        assert!(a.contains(&"--setenv=PATH=/usr/bin".to_string()));
+        assert!(a.contains(&"--setenv=PATH".to_string()));
+        assert!(a.contains(&"--setenv=HOME".to_string()));
+        assert!(!a
+            .iter()
+            .any(|s| s.contains("=/usr/bin") || s.contains("=/root")));
         assert!(a.contains(&"--chdir=/app".to_string()));
         // Payload comes last, after a "--" separator.
         let tail: Vec<&str> = a[a.len() - 3..].iter().map(|s| s.as_str()).collect();

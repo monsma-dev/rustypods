@@ -174,6 +174,9 @@ pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Re
             Value::from(u64::from(lim.cpu_quota_percent) * 10_000),
         ));
     }
+    if lim.tasks_max > 0 {
+        props.push(("TasksMax", Value::from(lim.tasks_max)));
+    }
     if props.is_empty() {
         return Ok(());
     }

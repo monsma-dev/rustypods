@@ -3,6 +3,7 @@
 //! keeps server.rs free of engine specifics so an OCI runtime (crun/youki)
 //! can slot in later for systems without systemd.
 
+pub mod logs;
 pub mod nspawn;
 
 use anyhow::Result;
@@ -41,7 +42,8 @@ pub struct StartSpec {
     /// OCI payload (entrypoint+cmd). Some → non-boot mode: the image has no
     /// systemd, nspawn execs this argv directly. None → --boot.
     pub payload: Option<Vec<String>>,
-    /// OCI env ("K=V") → nspawn --setenv.
+    /// OCI env ("K=V"). nspawn sees `--setenv=KEY` only; the value is
+    /// placed in the nspawn process environment (not argv).
     pub env: Vec<String>,
     /// OCI working dir → nspawn --chdir (non-boot only).
     pub chdir: String,

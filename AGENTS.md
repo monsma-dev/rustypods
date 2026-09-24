@@ -57,6 +57,15 @@ relogin). rw-binds under `/run` (and /etc, /usr, /boot, /proc, /sys, /dev,
 caution applies to any host dir another init system considers "theirs"
 (`/run`, `/var/lib`, `/etc`).
 
+Same class, `/tmp`: a desktop (no-userns) pod bind-mounts the host `/tmp`
+and then boots the image's systemd, which runs
+`systemd-tmpfiles --create --remove --boot`. Vendor `tmp.conf` (`q /tmp`)
+and `x11.conf` (`D /tmp/.X11-unix`) then age and delete files on the HOST.
+At start of a no-userns pod with any read-write host bind, the daemon
+masks those two snippets by symlinking `/etc/tmpfiles.d/tmp.conf` and
+`x11.conf` to `/dev/null` inside the rootfs (symlink-safe helpers). The
+image's other tmpfiles rules still run.
+
 ## machined/systemd via zbus (no subprocesses)
 
 The daemon talks machined+systemd through `dbus.rs` proxies on one shared
@@ -166,6 +175,17 @@ rustypodsd does it itself:
   unmapped gives instant RST and happy-eyeballs falls back to
   127.0.0.1. Don't re-add an ip6 output dnat for ::1.
 
+## Console logs
+
+nspawn's stdout/stderr is an `O_APPEND` fd on `logs/<pod>.log` (mode 0600).
+The daemon does not own that fd after spawn — nspawn keeps it across a
+daemon restart — so rotation is copytruncate (`runtime/logs.rs`): copy to
+`<pod>.log.1`, then `ftruncate` the live inode. Default cap is 10 MiB
+(`RUSTYPODS_LOG_MAX_BYTES`). A 30s task rotates every live log; `destroy`
+deletes both files; startup deletes logs whose pod conf is gone. A few
+lines written during the copy can be lost. `tail -F` follows the same inode
+through truncation.
+
 ## Storage quotas (btrfs qgroups)
 
 - `storage_max` in the pod conf → `btrfs quota enable <data_dir>` +
@@ -209,10 +229,14 @@ rustypodsd does it itself:
   config, stack apply, start, `volume ls` fs-reconciliation) — hand-
   edited confs can reference volumes that don't exist yet.
 - Pod env (`--env KEY=v`, `--env-file`, conf `env`, stack.toml `env`)
-  merges OVER the image's OCI env per key and goes to nspawn via
-  --setenv. It lands on PID 1's environ — exec'd processes do NOT
-  inherit it (nsenter doesn't carry env). Visible via
-  /proc/<pid>/environ: config, not a vault.
+  merges OVER the image's OCI env per key. nspawn is passed
+  `--setenv=KEY` with no value (systemd 257 inherits that name from
+  the nspawn process environment). Values are NOT on argv —
+  `/proc/<pid>/cmdline` is world-readable; `/proc/<pid>/environ` is
+  mode 0400. The value still lands on PID 1's environ — exec'd
+  processes do NOT inherit it (nsenter doesn't carry env). Config,
+  not a vault. Confs that store env are mode 0600 under 0700
+  `conf/` directories.
 - `--env-file` parsing: blank lines + `#` comments skipped, no shell
   expansion, `A=$HOME` stays literal; `--env` flags override file
   entries per key.
@@ -269,7 +293,8 @@ from pods on other hosts. L3, end-to-end encrypted, no NAT.
   `ip tuntap` so routes survive daemon restarts) + one UDP socket +
   one boringtun `Tunn` per peer. `fd<peer>::/48 dev rp-mesh0` steers
   outbound; `fd<local>:<idx>::2/128 dev ve-<pod>` delivers inbound.
-- `conf/mesh.conf` (0600 — holds the WG private key, base64) persists
+- `conf/mesh.conf` (0600 — holds the WG private key, base64; `conf/` is
+  0700) persists
   identity + static peers. Daemon restart re-derives the same /48.
 - The pump is one tokio task: TUN reads → dst /48 → peer Tunn → UDP;
   UDP datagrams → peer session (endpoint map, key-scan fallback for

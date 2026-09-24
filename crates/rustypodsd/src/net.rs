@@ -987,6 +987,7 @@ mod tests {
     fn gw_meta() -> PodMeta {
         use crate::state::LimitsSpec;
         PodMeta {
+            format: 1,
             name: "rustypods-ingress".into(),
             image: "img".into(),
             created_unix: 0,

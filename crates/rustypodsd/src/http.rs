@@ -297,7 +297,11 @@ async fn pod_logs(
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     let lines = q.lines.unwrap_or(200).min(5000);
     let out = s.pod_log_tail(&name, lines).await.map_err(api_err)?;
-    Ok(Json(serde_json::json!({ "name": name, "lines": out })))
+    Ok(Json(serde_json::json!({
+        "name": name,
+        "lines": out.lines,
+        "truncated": out.truncated,
+    })))
 }
 
 /// `GET /v1/pods/:name/stats` — live cgroup-v2 snapshot read straight
