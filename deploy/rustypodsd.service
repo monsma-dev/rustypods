@@ -2,6 +2,10 @@
 Description=RustyPods daemon — nspawn pod orchestrator
 After=systemd-machined.service
 Wants=systemd-machined.service
+# A crash loop (panic=abort release builds) must not spin forever.
+# These keys are [Unit]-only; under [Service] systemd ignores them.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 # The uid allowed to drive the daemon besides root; override via
@@ -22,11 +26,11 @@ KillMode=process
 # than a ~30s drain so systemd does not SIGKILL mid-shutdown.
 TimeoutStopSec=45
 RuntimeDirectory=rustypods
+# The REST tokens (http-token, http-token-ro) live here and must survive
+# daemon restarts; without this systemd wipes the dir on every stop.
+RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=2
-# A crash loop (panic=abort release builds) must not spin forever.
-StartLimitIntervalSec=120
-StartLimitBurst=5
 # nspawn + one exec per pod can hold a lot of fds (ptys, logs, sockets).
 LimitNOFILE=1048576
 

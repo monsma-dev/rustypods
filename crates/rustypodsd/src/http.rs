@@ -6,8 +6,9 @@
 //! `Authorization: Bearer <token>`. The read-write token lives in
 //! `<socket-dir>/http-token` and a second read-only token in
 //! `http-token-ro` (both mode 0400, owned by the allowed uid). They are
-//! created once and reused across restarts; `RUSTYPODS_HTTP_TOKEN_ROTATE=1`
-//! mints new ones. The read-only token may only call GET. Requests carrying
+//! created once and reused across restarts (the unit sets
+//! `RuntimeDirectoryPreserve=yes`; /run is tmpfs, so a reboot still mints
+//! new ones); `RUSTYPODS_HTTP_TOKEN_ROTATE=1` rotates on demand. The read-only token may only call GET. Requests carrying
 //! `Origin` or `Sec-Fetch-Site` are rejected — browsers have no business
 //! here. `/healthz` stays open and reports whether daemon state can be
 //! locked. The bind is loopback-only unless `RUSTYPODS_HTTP_INSECURE=1`;
