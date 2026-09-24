@@ -5,6 +5,7 @@ pub mod http;
 pub mod ingress;
 pub mod mesh;
 pub mod net;
+pub mod notify;
 pub mod oci;
 pub mod pki;
 pub mod rootfs;
@@ -32,6 +33,8 @@ pub struct Config {
     pub http_addr: String,
     /// Snapshot GC sweep interval.
     pub gc_interval_secs: u64,
+    /// systemd readiness channel; empty outside a `Type=notify` unit.
+    pub notify: notify::Notifier,
 }
 
 impl Config {

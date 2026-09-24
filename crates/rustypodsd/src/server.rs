@@ -5726,6 +5726,7 @@ impl Svc {
                 import_user: "test".into(),
                 http_addr: String::new(),
                 gc_interval_secs: 300,
+                notify: Default::default(),
             },
             st: Arc::new(Mutex::new(State::default())),
             metrics: Default::default(),
@@ -6202,6 +6203,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let inflight = Arc::clone(&svc.inflight);
     let incoming = ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
     tracing::info!("rustypodsd listening on {}", cfg.socket.display());
+    cfg.notify.ready();
     let mut shut_serve = shut_rx.clone();
     let grpc = Server::builder()
         // The socket admits uid 0 and the allowed uid — both can spawn
@@ -6233,6 +6235,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
             tracing::info!("stopping accept; draining in-flight operations");
         }
     }
+    cfg.notify.stopping();
     match tokio::time::timeout(Duration::from_secs(30), inflight.drained()).await {
         Ok(()) => tracing::info!("in-flight operations finished"),
         Err(_) => tracing::error!("drain timed out after 30s; exiting"),

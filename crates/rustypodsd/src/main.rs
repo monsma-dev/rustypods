@@ -56,8 +56,17 @@ enum DaemonCmd {
     TeardownNet,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Before the runtime spawns its worker threads (see Notifier docs).
+    let notify = rustypodsd::notify::Notifier::take_from_env();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?
+        .block_on(run(notify))
+}
+
+async fn run(notify: rustypodsd::notify::Notifier) -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -140,6 +149,7 @@ async fn main() -> Result<()> {
         import_user,
         http_addr: args.http_addr,
         gc_interval_secs: args.gc_interval_secs,
+        notify,
     })
     .await
 }

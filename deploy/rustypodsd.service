@@ -8,6 +8,9 @@ StartLimitIntervalSec=120
 StartLimitBurst=5
 
 [Service]
+# READY=1 is sent once the control socket accepts, so `systemctl restart`
+# returns only when the CLI can connect.
+Type=notify
 # The uid allowed to drive the daemon besides root; override via
 # /etc/rustypods/daemon.env (written by scripts/install-daemon.sh).
 Environment=RUSTYPODS_ALLOWED_UID=1000
