@@ -122,10 +122,23 @@ rustypodsd does it itself:
 - The daemon configures both veth ends through the leader's netns before
   start returns, so bare OCI payloads need no in-image `ip` or networkd.
   Boot images also get a matching dual-stack networkd file as persistence.
-- NAT = own `ip rustypods` nftables table, rebuilt from state on every
-  change: DNAT in prerouting+output, masquerade for pod egress, and
-  `fib saddr type local … masquerade` for host-originated traffic (without
-  it the pod answers 127.0.0.1 on ITS loopback).
+- Port spec is `[hostIp:]hostPort:podPort[/tcp|/udp]` (IPv4 literal, or
+  IPv6 in brackets). **No host IP means 127.0.0.1 only** — a deliberate
+  default so `-p 5432:5432` is not a public listener. `0.0.0.0:hp:pp`
+  is every IPv4 address (explicit). `::1` is rejected: it can never work.
+- NAT = own `ip rustypods` / `ip6 rustypods6` nftables tables, rebuilt
+  from state on every change. DNAT matches `ip daddr <hostIp>` (or
+  `fib daddr type local` for an explicit wildcard). A 127.0.0.1 publish
+  is **output-hook only**. Masquerade covers pod egress, and
+  `fib saddr type local … masquerade` covers host-originated traffic
+  (without it the pod answers 127.0.0.1 on ITS loopback).
+- Foreign FORWARD accepts (marker `rustypods-forward-v2`, top of the
+  chain, DOCKER-USER pattern) are `ct state established,related`,
+  `ct status dnat`, and `iifname "ve-*"` (pod egress and pod↔pod).
+  Never `ip daddr 10.220.0.0/16 accept` — that let any neighbour routing
+  the pod prefix hit unpublished ports. firewalld still gets the veth
+  in the trusted zone for egress; the DNAT match is what limits who
+  can open a published port.
 - Required sysctls: `net.ipv4.ip_forward=1`,
   `net.ipv6.conf.all.forwarding=1`, and per-veth IPv4 `route_localnet=1` —
   without the latter, localhost→pod replies are dropped as martians.

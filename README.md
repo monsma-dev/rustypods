@@ -161,18 +161,33 @@ limits are re-applied at every pod start.
 
 ```bash
 rustypods create web --image arch-base --port 18080:80 --port 53:53/udp
+# those two bind 127.0.0.1 only. To publish on every host address:
+rustypods create web --image arch-base --port 0.0.0.0:18080:80
+# or on one address: --port 192.0.2.10:18080:80
+# IPv6 host addresses go in brackets: --port [2001:db8::10]:18080:80
 ```
+
+**Default bind is loopback.** A spec without a host address
+(`[hostIp:]hostPort:podPort[/tcp|/udp]`) publishes on **127.0.0.1 only**.
+`0.0.0.0:host:pod` is the explicit "every IPv4 address" form. This is
+intentional: `-p 5432:5432` must not open Postgres on the public zone
+just because the pod exists. The CLI prints a one-line notice when it
+creates an implicit loopback publish.
 
 Any pod with `--port` gets a private network namespace (`--network-veth`):
 host side `ve-<pod>` gets `10.220.<idx>.1/30`, the pod's `host0` gets a static
 `10.220.<idx>.2/30` (written into the rootfs before boot; index is stable per
 pod). The daemon manages its own `ip rustypods` nftables table:
 
-- DNAT `host:port → pod:port` in prerouting + output (external *and*
-  localhost clients work)
+- DNAT matches `ip daddr <hostIp>`. Loopback publishes are **output-hook
+  only** (a prerouting rule cannot see them and must not exist).
+  `0.0.0.0` uses `fib daddr type local` in prerouting and output.
 - SNAT of host-originated traffic to the veth address (otherwise the pod
   would answer 127.0.0.1 on *its* loopback)
 - masquerade for pod egress
+- foreign FORWARD chains get marker accepts for DNATed flows, established
+  replies, and packets that arrive on `ve-*` — not a blanket accept of
+  the whole pod prefix, so an L2 neighbour cannot reach unpublished ports
 
 We do **not** use nspawn's `--port`: it depends on the host side of the veth
 being managed by systemd-networkd (its `80-container-ve.network` provides the
@@ -213,7 +228,7 @@ name = "demo"
 
 [pods.web]
 image = "arch-base"
-ports = ["8081:8080"]        # published on the shared stack IP
+ports = ["8081:8080"]        # 127.0.0.1 only; DNAT to the shared stack IP
 
 [pods.api]
 image = "arch-base"

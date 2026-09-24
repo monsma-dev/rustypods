@@ -740,20 +740,49 @@ pub(crate) fn ensure_mesh_input(wg_port: u16) {
     }
 }
 
-fn port_rule_ports(spec: &str) -> Option<(u16, u16, &'static str)> {
-    let (ports, proto) = match spec.split_once('/') {
-        Some((p, pr)) => (p, pr),
-        None => (spec, "tcp"),
-    };
-    let proto = match proto {
-        "tcp" => "tcp",
-        "udp" => "udp",
-        _ => return None,
-    };
-    let mut it = ports.split(':');
-    let host: u16 = it.next()?.parse().ok()?;
-    let pod: u16 = it.next().unwrap_or("").parse().unwrap_or(host);
-    Some((host, pod, proto))
+/// Host-veth name prefix. Standalone nspawn veths and stack uplinks both
+/// use it, so one wildcard covers pod egress and pod↔pod forwarding.
+pub const POD_VETH_PREFIX: &str = "ve-";
+
+/// Comment marker on the foreign FORWARD accepts. Bumped when the rule
+/// shape changes so a reconcile replaces the old blanket subnet accepts.
+pub const FORWARD_MARK: &str = "rustypods-forward-v2";
+const FORWARD_MARK_OLD: &str = "rustypods-forward";
+
+/// FORWARD accepts inserted at the top of foreign filter chains.
+///
+/// `ct status dnat` is published traffic only. `iifname "ve-*"` is pod
+/// egress and pod↔pod (both ends are our veths). Established covers
+/// replies. There is deliberately no `ip daddr <pool> accept` — that
+/// let any neighbour routing the pod prefix reach unpublished ports.
+pub fn forward_accept_lines() -> &'static [&'static str] {
+    &[
+        "ct state established,related accept",
+        "ct status dnat accept",
+        "iifname \"ve-*\" accept",
+    ]
+}
+
+fn listing_has_comment(listing: &str, mark: &str) -> bool {
+    // nft prints `comment "mark"`. The old mark is a prefix of the new
+    // one, so a bare substring test would treat v2 as the old generation.
+    listing.contains(&format!("\"{mark}\"")) || listing.split_whitespace().any(|w| w == mark)
+}
+
+/// True when `nft list chain` output already has the current accepts
+/// and not a previous generation's marker.
+pub fn forward_chain_current(listing: &str) -> bool {
+    if listing_has_comment(listing, FORWARD_MARK_OLD) {
+        return false;
+    }
+    if !listing_has_comment(listing, FORWARD_MARK) {
+        return false;
+    }
+    // A leftover blanket pool accept is the bug this generation removes.
+    if listing.contains("ip daddr 10.220.0.0/16") || listing.contains("ip6 daddr fd22:220::/32") {
+        return false;
+    }
+    forward_accept_lines().iter().all(|l| listing.contains(l))
 }
 
 /// Rebuild the `ip rustypods` table from scratch for `pods` — every running
@@ -775,7 +804,10 @@ pub fn nat_script<'a>(
     pods: impl Iterator<Item = &'a PodMeta>,
     running: &std::collections::BTreeSet<String>,
 ) -> String {
-    let mut dnat = String::new();
+    let mut dnat_pre = String::new();
+    let mut dnat_out = String::new();
+    let mut dnat6_pre = String::new();
+    let mut dnat6_out = String::new();
     let mut gw: Option<u32> = None;
     for m in pods.filter(|m| m.net_index > 0 && running.contains(&m.name)) {
         if m.ingress_gateway {
@@ -785,16 +817,52 @@ pub fn nat_script<'a>(
             continue;
         }
         for spec in &m.ports {
-            let Some((hp, pp, proto)) = port_rule_ports(spec) else {
+            let Ok(map) = rustypods_proto::parse_port(spec) else {
                 continue;
             };
-            let dst = format!("{}:{}", pod_ip(m.net_index), pp);
-            // `fib daddr type local` scopes DNAT to traffic addressed to
-            // THIS host — without it, outbound connections to another
-            // machine on a mapped port would be redirected into the pod.
-            dnat.push_str(&format!(
-                "    fib daddr type local {proto} dport {hp} dnat ip to {dst}\n"
-            ));
+            let v4dst = format!("{}:{}", pod_ip(m.net_index), map.pod_port);
+            let v6dst = format!("[{}]:{}", pod_ip6(m.net_index), map.pod_port);
+            match map.bind_addr() {
+                std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                    // Explicit 0.0.0.0 — every local IPv4 address. `fib`
+                    // keeps DNAT off traffic that is only forwarded.
+                    let line = format!(
+                        "    fib daddr type local {} dport {} dnat ip to {v4dst}\n",
+                        map.proto, map.host_port
+                    );
+                    dnat_pre.push_str(&line);
+                    dnat_out.push_str(&line);
+                }
+                std::net::IpAddr::V4(ip) => {
+                    let line = format!(
+                        "    ip daddr {ip} {} dport {} dnat ip to {v4dst}\n",
+                        map.proto, map.host_port
+                    );
+                    // 127.0.0.0/8 is only reachable from the host itself.
+                    // A prerouting rule would not see those packets, and
+                    // must not exist so a neighbour cannot aim at them.
+                    if !ip.is_loopback() {
+                        dnat_pre.push_str(&line);
+                    }
+                    dnat_out.push_str(&line);
+                }
+                std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                    let line = format!(
+                        "    fib daddr type local {} dport {} dnat ip6 to {v6dst}\n",
+                        map.proto, map.host_port
+                    );
+                    dnat6_pre.push_str(&line);
+                    dnat6_out.push_str(&line);
+                }
+                std::net::IpAddr::V6(ip) => {
+                    let line = format!(
+                        "    ip6 daddr {ip} {} dport {} dnat ip6 to {v6dst}\n",
+                        map.proto, map.host_port
+                    );
+                    dnat6_pre.push_str(&line);
+                    dnat6_out.push_str(&line);
+                }
+            }
         }
     }
     // Loopback-only ingress redirects — OUTPUT hook, 127/8 destinations,
@@ -818,12 +886,12 @@ pub fn nat_script<'a>(
         "table ip rustypods {{\n\
          \x20 chain prerouting {{\n\
          \x20   type nat hook prerouting priority dstnat; policy accept;\n\
-         {dnat}\
+         {dnat_pre}\
          \x20 }}\n\
          \x20 chain output {{\n\
          \x20   type nat hook output priority -100; policy accept;\n\
          {gw_v4}\
-         {dnat}\
+         {dnat_out}\
          \x20 }}\n\
          \x20 chain postrouting {{\n\
          \x20   type nat hook postrouting priority srcnat; policy accept;\n\
@@ -835,6 +903,14 @@ pub fn nat_script<'a>(
          \x20 }}\n\
          }}\n\
          table ip6 rustypods6 {{\n\
+         \x20 chain prerouting {{\n\
+         \x20   type nat hook prerouting priority dstnat; policy accept;\n\
+         {dnat6_pre}\
+         \x20 }}\n\
+         \x20 chain output {{\n\
+         \x20   type nat hook output priority -100; policy accept;\n\
+         {dnat6_out}\
+         \x20 }}\n\
          \x20 chain postrouting {{\n\
          \x20   type nat hook postrouting priority srcnat; policy accept;\n\
          \x20   # ULA pod egress onto the real network\n\
@@ -885,48 +961,33 @@ pub fn rebuild_nat<'a>(
 /// failures only warn (a strict host firewall shouldn't sink a start —
 /// doctor reports the gap instead).
 pub fn ensure_forward_accepts() {
-    const MARK: &str = "rustypods-forward";
-    const V4: [&str; 2] = [
-        "ip saddr 10.220.0.0/16 accept",
-        "ip daddr 10.220.0.0/16 accept",
-    ];
-    const V6: [&str; 2] = [
-        "ip6 saddr fd22:220::/32 accept",
-        "ip6 daddr fd22:220::/32 accept",
-    ];
-    const BOTH: [&str; 4] = [
-        "ip saddr 10.220.0.0/16 accept",
-        "ip daddr 10.220.0.0/16 accept",
-        "ip6 saddr fd22:220::/32 accept",
-        "ip6 daddr fd22:220::/32 accept",
-    ];
-    // (family, table, chain, rules to insert) — cover ufw's iptables-compat
-    // tables and a plain inet filter table. firewalld is deliberately
-    // absent: its `inet firewalld` table carries the kernel `owner`
-    // flag (EPERM on any foreign insert — see firewalld_bind for the
-    // sanctioned path). Insert whenever the chain exists and lacks our
-    // marker, not only on drop policies — accepts scoped to pod subnets
-    // are harmless where nothing was blocking.
-    for (fam, table, chain, rules) in [
-        ("ip", "filter", "FORWARD", V4.as_slice()),
-        ("ip6", "filter", "FORWARD", V6.as_slice()),
-        ("inet", "filter", "FORWARD", BOTH.as_slice()),
+    // (family, table, chain) — ufw's iptables-compat tables and a plain
+    // inet filter. firewalld's `inet firewalld` table is absent: it
+    // carries the kernel `owner` flag (EPERM — see firewalld_bind).
+    // Insert whenever the chain exists and is not already current, not
+    // only on drop policies: firewalld's filter_FORWARD is policy accept
+    // yet still rejects via its zone dispatch.
+    for (fam, table, chain) in [
+        ("ip", "filter", "FORWARD"),
+        ("ip6", "filter", "FORWARD"),
+        ("inet", "filter", "FORWARD"),
     ] {
         let out = Command::new("nft")
-            .args(["list", "chain", fam, table, chain])
+            .args(["-a", "list", "chain", fam, table, chain])
             .output();
         let Ok(out) = out else { continue };
         if !out.status.success() {
             continue;
         }
         let txt = String::from_utf8_lossy(&out.stdout);
-        if txt.contains(MARK) {
+        if forward_chain_current(&txt) {
             continue;
         }
-        for r in rules {
+        delete_marked_rules(fam, table, chain, &txt, &[FORWARD_MARK, FORWARD_MARK_OLD]);
+        for r in forward_accept_lines() {
             let mut argv: Vec<&str> = vec!["insert", "rule", fam, table, chain];
             argv.extend(r.split_whitespace());
-            argv.extend(["comment", MARK]);
+            argv.extend(["comment", FORWARD_MARK]);
             match Command::new("nft").args(&argv).status() {
                 Ok(s) if s.success() => {}
                 Ok(s) => tracing::warn!("nft insert into {fam} {table} {chain}: exit {s}"),
@@ -934,6 +995,28 @@ pub fn ensure_forward_accepts() {
             }
         }
         tracing::info!("installed pod-traffic accepts in {fam} {table} {chain}");
+    }
+}
+
+/// Delete rules whose comment is one of `marks`. `listing` must come from
+/// `nft -a list chain` so each rule line carries `handle N`.
+fn delete_marked_rules(fam: &str, table: &str, chain: &str, listing: &str, marks: &[&str]) {
+    for line in listing.lines() {
+        if !marks.iter().any(|m| listing_has_comment(line, m)) {
+            continue;
+        }
+        let Some(h) = line
+            .rsplit("handle ")
+            .next()
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let handle = h.to_string();
+        let _ = Command::new("nft")
+            .args(["delete", "rule", fam, table, chain, "handle", &handle])
+            .status();
     }
 }
 
@@ -1052,7 +1135,49 @@ mod tests {
         assert!(s.contains("add table ip rustypods"));
     }
 
+    fn pod_meta(name: &str, idx: u32, ports: &[&str]) -> PodMeta {
+        let mut m = gw_meta();
+        m.name = name.into();
+        m.ingress_gateway = false;
+        m.net_index = idx;
+        m.ports = ports.iter().map(|s| s.to_string()).collect();
+        m
+    }
+
     #[test]
+    fn published_ports_bind_loopback_unless_explicit() {
+        let any = pod_meta("web", 1, &["0.0.0.0:8080:80"]);
+        let db = pod_meta("db", 2, &["5432:5432"]);
+        let s = nat_script([&any, &db].into_iter(), &running(&["web", "db"]));
+        let pre = &s[s.find("chain prerouting").unwrap()..s.find("chain output").unwrap()];
+        assert!(pre.contains("fib daddr type local tcp dport 8080 dnat ip to 10.220.1.2:80"));
+        assert!(
+            !pre.contains("5432"),
+            "implicit loopback publish must not appear in prerouting"
+        );
+        let out = &s[s.find("chain output").unwrap()..s.find("chain postrouting").unwrap()];
+        assert!(out.contains("ip daddr 127.0.0.1 tcp dport 5432 dnat ip to 10.220.2.2:5432"));
+        assert!(!s.contains("fib daddr type local tcp dport 5432"));
+        assert!(!s.contains("ip daddr 10.220.0.0/16 accept"));
+    }
+
+    #[test]
+    fn forward_accepts_are_not_a_blanket_pool() {
+        let lines = forward_accept_lines().join("\n");
+        assert!(lines.contains("ct status dnat accept"));
+        assert!(lines.contains("iifname \"ve-*\" accept"));
+        assert!(lines.contains("ct state established,related accept"));
+        assert!(!lines.contains("10.220.0.0/16"));
+        let stale = "ip daddr 10.220.0.0/16 accept comment \"rustypods-forward\"";
+        assert!(!forward_chain_current(stale));
+        let current = forward_accept_lines()
+            .iter()
+            .map(|l| format!("{l} comment \"{FORWARD_MARK}\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(forward_chain_current(&current));
+    }
+
     fn address_helpers() {
         assert_eq!(host_ip(1).to_string(), "10.220.1.1");
         assert_eq!(pod_ip(1).to_string(), "10.220.1.2");

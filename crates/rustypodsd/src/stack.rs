@@ -87,7 +87,7 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
             def.name
         );
     }
-    let mut host_ports: BTreeSet<(u16, &str)> = BTreeSet::new();
+    let mut host_ports: BTreeSet<(String, u16, &'static str)> = BTreeSet::new();
     let mut ingress_hosts: BTreeSet<String> = BTreeSet::new();
     for (member, p) in &def.pods {
         let full = member_name(&def.name, member);
@@ -107,9 +107,9 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
         }
         for spec in &p.ports {
             rustypods_proto::validate_port(spec).with_context(|| format!("pods.{member}"))?;
-            let (hp, proto) = host_port_key(spec);
-            if !host_ports.insert((hp, proto)) {
-                bail!("pods.{member}: host port {hp}/{proto} is already used by another member");
+            let (bind, hp, proto) = host_port_key(spec);
+            if !host_ports.insert((bind.clone(), hp, proto)) {
+                bail!("pods.{member}: {bind}:{hp}/{proto} is already used by another member");
             }
         }
         for spec in &p.ingress {
@@ -132,18 +132,11 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
     Ok(def)
 }
 
-fn host_port_key(spec: &str) -> (u16, &'static str) {
-    let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
-    let proto = match proto {
-        "udp" => "udp",
-        _ => "tcp",
-    };
-    let hp = ports
-        .split(':')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    (hp, proto)
+fn host_port_key(spec: &str) -> (String, u16, &'static str) {
+    match rustypods_proto::parse_port(spec) {
+        Ok(p) => (p.bind_addr().to_string(), p.host_port, p.proto),
+        Err(_) => (String::new(), 0, "tcp"),
+    }
 }
 
 #[cfg(test)]
