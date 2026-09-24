@@ -383,6 +383,12 @@ install -Dm755 "$REPO_ROOT/target/release/rustypods-ingress" /var/lib/rustypods/
 # ── data dirs ────────────────────────────────────────────────────────────
 echo "==> [3/6] data dirs (btrfs CoW lives here)"
 install -d -m0755 "${DATA_DIRS[@]}"
+# Rootfs trees (setuid binaries), confs (env), and the CA key stay
+# root-only; the daemon enforces the same modes at start.
+chmod 0700 /var/lib/rustypods/images /var/lib/rustypods/pods \
+           /var/lib/rustypods/snapshots /var/lib/rustypods/pki \
+           /var/lib/rustypods/conf /var/lib/rustypods/conf/pods \
+           /var/lib/rustypods/conf/images
 apply_selinux_label
 
 # ── unit + env ───────────────────────────────────────────────────────────
