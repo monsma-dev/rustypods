@@ -188,6 +188,10 @@ rustypodsd does it itself:
   Supervisor-driven halts do not set the flag. Confs written before
   this field existed load as not user-stopped, so the first restart
   after upgrade still brings those pods back once.
+- A pod conf that fails to parse, or that breaks the ingress-host or
+  gateway invariant, is quarantined (logged, omitted from serving, name
+  and net_index reserved) instead of aborting startup or freeing its
+  /30. `rustypods ping` lists quarantined confs.
 - Exec probes reuse `exec_argv` — the payload ends with an
   `exec 0<&200` stdin-restore wrapper that ONLY works with
   `pre_exec(exec::preserve_stdin)` on the spawn (util-linux ≤2.42

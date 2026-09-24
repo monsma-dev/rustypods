@@ -1999,6 +1999,14 @@ impl PodControl for Svc {
             btrfs: self.storage.supports_quota(),
             storage_driver: self.storage.name().into(),
             runtime_engine: self.engine.name().into(),
+            quarantined: self
+                .st
+                .lock()
+                .await
+                .quarantined
+                .iter()
+                .map(|q| format!("{}: {}", q.name, q.reason))
+                .collect(),
         }))
     }
 
@@ -2752,7 +2760,7 @@ impl PodControl for Svc {
                 .filter_map(|m| st.pods.get(&stack::member_name(&def.name, m)))
                 .map(|m| m.net_index)
                 .find(|i| *i > 0)
-                .unwrap_or_else(|| net::alloc_index(&st.pods))
+                .unwrap_or_else(|| state::alloc_net_index(&st.pods, &st.reserved_net))
         };
         if idx == 0 {
             return Err(Status::failed_precondition(
@@ -3023,7 +3031,7 @@ impl PodControl for Svc {
         }
         let meta = {
             let mut st = self.st.lock().await;
-            let next_idx = net::alloc_index(&st.pods);
+            let next_idx = state::alloc_net_index(&st.pods, &st.reserved_net);
             let Some(meta) = st.pods.get_mut(&name) else {
                 return Err(Status::not_found(format!("pod {name} not found")));
             };
@@ -5337,6 +5345,8 @@ mod tests {
             images: BTreeMap::new(),
             pods: BTreeMap::new(),
             volumes: BTreeMap::new(),
+            quarantined: Vec::new(),
+            reserved_net: BTreeSet::new(),
         };
         st.pods.insert(
             "taken".into(),
@@ -5372,6 +5382,8 @@ mod tests {
             images: BTreeMap::new(),
             pods: BTreeMap::new(),
             volumes: BTreeMap::new(),
+            quarantined: Vec::new(),
+            reserved_net: BTreeSet::new(),
         };
         // Persisted: stack member web owns a.host, api owns b.host.
         st.pods.insert(

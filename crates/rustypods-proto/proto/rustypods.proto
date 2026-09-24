@@ -126,6 +126,9 @@ message DaemonInfo {
   // lets clients (and a future GUI) show which capabilities are live.
   string storage_driver = 6;
   string runtime_engine = 7;
+  // Pod confs excluded from serving (parse error or invariant breach).
+  // Empty when every conf loaded.
+  repeated string quarantined = 8;
 }
 
 message Image {

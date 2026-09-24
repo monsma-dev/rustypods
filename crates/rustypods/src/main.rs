@@ -1367,6 +1367,9 @@ async fn main() -> Result<()> {
                 "storage:  {}   engine: {}",
                 i.storage_driver, i.runtime_engine
             );
+            for q in &i.quarantined {
+                println!("quarantine: {q}");
+            }
         }
         Cmd::Images => {
             let l = connect(cli.socket.clone(), cli.remote.clone())
