@@ -1,3 +1,4 @@
+mod cmd;
 mod doctor;
 
 use anyhow::{Context, Result};
@@ -16,7 +17,7 @@ use tokio_stream::StreamExt;
     arg_required_else_help = true,
     about = "nspawn pods on Btrfs — podman/distrobox-light"
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Print this CLI's version and, when the daemon answers, its version too.
     #[arg(short = 'V', long = "version", global = true, action = clap::ArgAction::SetTrue)]
     show_version: bool,
@@ -39,7 +40,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Cmd {
+pub(crate) enum Cmd {
     /// Daemon status (version, machined, btrfs).
     Ping,
     /// Check that the local host can run rustypodsd — works before the
@@ -507,7 +508,7 @@ enum ShmCmd {
 
 /// Whether a destructive command should proceed.
 /// Non-TTY (scripts) and `-y` proceed. A TTY proceeds only on `y`/`Y`.
-fn proceed_destructive(tty: bool, yes: bool, answer: &str) -> bool {
+pub(crate) fn proceed_destructive(tty: bool, yes: bool, answer: &str) -> bool {
     if yes || !tty {
         true
     } else {
@@ -515,7 +516,7 @@ fn proceed_destructive(tty: bool, yes: bool, answer: &str) -> bool {
     }
 }
 
-fn confirm_destructive(yes: bool, prompt: &str) -> Result<bool> {
+pub(crate) fn confirm_destructive(yes: bool, prompt: &str) -> Result<bool> {
     use std::io::{IsTerminal, Write};
     if !std::io::stdin().is_terminal() || yes {
         return Ok(true);
@@ -527,7 +528,11 @@ fn confirm_destructive(yes: bool, prompt: &str) -> Result<bool> {
     Ok(proceed_destructive(true, false, &line))
 }
 
-fn limits_proto(high: Option<&str>, max: Option<&str>, cpu: Option<u32>) -> Result<Option<Limits>> {
+pub(crate) fn limits_proto(
+    high: Option<&str>,
+    max: Option<&str>,
+    cpu: Option<u32>,
+) -> Result<Option<Limits>> {
     let l = Limits {
         memory_high_bytes: high.map(parse_bytes).transpose()?.unwrap_or(0),
         memory_max_bytes: max.map(parse_bytes).transpose()?.unwrap_or(0),
@@ -539,7 +544,7 @@ fn limits_proto(high: Option<&str>, max: Option<&str>, cpu: Option<u32>) -> Resu
 /// `rustypods shell` over the Exec RPC: the daemon nsenters on the machined
 /// leader pid, a host pty gives job control, the remote exit code comes back
 /// exactly. Raw mode + SIGWINCH forwarding on this side.
-async fn shell_exec(
+pub(crate) async fn shell_exec(
     sock: PathBuf,
     remote: Option<String>,
     name: String,
@@ -658,7 +663,7 @@ async fn shell_exec(
 
 /// `pod:/abs/path` → (pod, path). Host paths (anything without a bare
 /// `name:` prefix) return None.
-fn split_pod_path(s: &str) -> Result<Option<(String, String)>> {
+pub(crate) fn split_pod_path(s: &str) -> Result<Option<(String, String)>> {
     let Some((name, path)) = s.split_once(':') else {
         return Ok(None);
     };
@@ -672,7 +677,7 @@ fn split_pod_path(s: &str) -> Result<Option<(String, String)>> {
 }
 
 /// Open an Exec stream: sends Start, returns the stdin channel + response.
-async fn exec_open(
+pub(crate) async fn exec_open(
     sock: &std::path::Path,
     remote: &Option<String>,
     start: ExecStart,
@@ -693,7 +698,7 @@ async fn exec_open(
 }
 
 /// Drain an exec stream: collects stderr, returns (exit_code, stderr).
-async fn exec_wait(inbound: &mut tonic::Streaming<ExecChunk>) -> Result<(i32, String)> {
+pub(crate) async fn exec_wait(inbound: &mut tonic::Streaming<ExecChunk>) -> Result<(i32, String)> {
     use rustypods_proto::rpc::exec_chunk::Kind;
     let mut code = 1;
     let mut err = String::new();
@@ -710,7 +715,7 @@ async fn exec_wait(inbound: &mut tonic::Streaming<ExecChunk>) -> Result<(i32, St
     Ok((code, err))
 }
 
-fn cp_start(pod: &str, user: &str, argv: Vec<String>) -> ExecStart {
+pub(crate) fn cp_start(pod: &str, user: &str, argv: Vec<String>) -> ExecStart {
     ExecStart {
         pod: pod.to_string(),
         user: user.to_string(),
@@ -724,7 +729,7 @@ fn cp_start(pod: &str, user: &str, argv: Vec<String>) -> ExecStart {
 }
 
 /// Remote `[ -d path ]` probe — exit 0 = directory.
-async fn pod_is_dir(
+pub(crate) async fn pod_is_dir(
     sock: &std::path::Path,
     remote: &Option<String>,
     pod: &str,
@@ -813,7 +818,7 @@ impl Producer {
     }
 }
 
-async fn cp_to_pod(
+pub(crate) async fn cp_to_pod(
     sock: PathBuf,
     remote: Option<String>,
     pod: &str,
@@ -876,7 +881,7 @@ async fn cp_to_pod(
     Ok(())
 }
 
-async fn cp_from_pod(
+pub(crate) async fn cp_from_pod(
     sock: PathBuf,
     remote: Option<String>,
     pod: &str,
@@ -987,7 +992,7 @@ async fn cp_from_pod(
     Ok(())
 }
 
-async fn cp_cmd(
+pub(crate) async fn cp_cmd(
     sock: PathBuf,
     remote: Option<String>,
     src: String,
@@ -1015,7 +1020,7 @@ async fn cp_cmd(
 
 /// Username for commands that need a host user (import). $USER wins when it
 /// is set and not root; otherwise /etc/passwd is consulted for the euid.
-fn current_username() -> Result<String> {
+pub(crate) fn current_username() -> Result<String> {
     if let Ok(u) = std::env::var("USER") {
         if !u.is_empty() && u != "root" {
             return Ok(u);
@@ -1027,7 +1032,7 @@ fn current_username() -> Result<String> {
         .with_context(|| format!("no /etc/passwd entry for uid {euid} — pass --user"))
 }
 
-fn term_size() -> (u32, u32) {
+pub(crate) fn term_size() -> (u32, u32) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 {
@@ -1064,7 +1069,7 @@ impl Drop for RawGuard {
     }
 }
 
-fn pod_state(p: &Pod) -> &'static str {
+pub(crate) fn pod_state(p: &Pod) -> &'static str {
     match PodState::try_from(p.state).unwrap_or(PodState::Unknown) {
         PodState::Running => "running",
         PodState::Created => "created",
@@ -1076,7 +1081,7 @@ fn pod_state(p: &Pod) -> &'static str {
 
 /// One line when a publish omits the host address. The daemon then
 /// binds 127.0.0.1 — a deliberate change from "every interface".
-fn note_implicit_port_binds(ports: &[String]) {
+pub(crate) fn note_implicit_port_binds(ports: &[String]) {
     let implicit = ports.iter().any(|s| {
         rustypods_proto::parse_port(s)
             .ok()
@@ -1090,7 +1095,7 @@ fn note_implicit_port_binds(ports: &[String]) {
     }
 }
 
-fn print_pod(p: &Pod) {
+pub(crate) fn print_pod(p: &Pod) {
     let lim = p.limits.as_ref().map(|l| {
         let mut s = String::new();
         if l.memory_high_bytes > 0 {
@@ -1162,7 +1167,7 @@ fn print_pod(p: &Pod) {
     );
 }
 
-fn print_mesh_status(st: &MeshStatus) {
+pub(crate) fn print_mesh_status(st: &MeshStatus) {
     println!("pubkey:  {}", st.pubkey);
     println!("listen:  {}", st.listen);
     println!("prefix:  {}", st.prefix);
@@ -1202,7 +1207,7 @@ fn print_mesh_status(st: &MeshStatus) {
 /// Build the proto HealthCheck from the CLI's --health-* flags.
 /// `--health-cmd` runs via `sh -c` (same model as Docker HEALTHCHECK CMD);
 /// the daemon re-validates before persisting.
-fn healthcheck_proto(
+pub(crate) fn healthcheck_proto(
     exec: Option<&String>,
     tcp: Option<&String>,
     http: Option<&String>,
@@ -1247,7 +1252,7 @@ fn healthcheck_proto(
 /// file first, then explicit flags win per key (the same rule the
 /// daemon applies merging pod env over image env). No shell expansion —
 /// `A=$HOME` stores the literal.
-fn collect_env(env_file: Option<&PathBuf>, env: Vec<String>) -> Result<Vec<String>> {
+pub(crate) fn collect_env(env_file: Option<&PathBuf>, env: Vec<String>) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     if let Some(p) = env_file {
         let text =
@@ -1279,7 +1284,7 @@ fn collect_env(env_file: Option<&PathBuf>, env: Vec<String>) -> Result<Vec<Strin
 /// Bidirectional copy between stdio and the daemon socket. Blocking is
 /// fine: this process does nothing else. Shutdown(Write) on stdin EOF
 /// so the daemon sees the client go away.
-fn stdio_bridge(socket: &std::path::Path) -> Result<()> {
+pub(crate) fn stdio_bridge(socket: &std::path::Path) -> Result<()> {
     use std::io::Write;
     let mut writer = std::os::unix::net::UnixStream::connect(socket)
         .with_context(|| format!("connect {}", socket.display()))?;
@@ -1333,7 +1338,7 @@ impl Progress {
     }
 }
 
-async fn print_versions(cli: &Cli) -> Result<()> {
+pub(crate) async fn print_versions(cli: &Cli) -> Result<()> {
     println!("rustypods {}", env!("CARGO_PKG_VERSION"));
     match connect(cli.socket.clone(), cli.remote.clone()).await {
         Ok(mut c) => match c.ping(PingRequest {}).await {
@@ -1352,1026 +1357,7 @@ async fn main() -> Result<()> {
         print_versions(&cli).await?;
         return Ok(());
     }
-    let Some(cmd) = cli.cmd else {
-        Cli::command().print_long_help()?;
-        std::process::exit(2);
-    };
-    match cmd {
-        Cmd::StdioBridge { socket } => {
-            stdio_bridge(&socket)?;
-            return Ok(());
-        }
-        Cmd::Doctor => {
-            if cli.remote.is_some() {
-                anyhow::bail!(
-                    "doctor inspects the local host; run 'rustypods doctor' on the remote host"
-                );
-            }
-            doctor::run(cli.socket.clone()).await?;
-        }
-        Cmd::Shell {
-            name,
-            user,
-            workdir,
-            strict,
-            cmd,
-        } => {
-            shell_exec(cli.socket, cli.remote, name, user, workdir, strict, cmd).await?;
-        }
-        Cmd::Cp { src, dst, user } => {
-            cp_cmd(cli.socket, cli.remote, src, dst, user).await?;
-        }
-        Cmd::Volume { sub } => {
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            match sub {
-                VolumeCmd::Create { name } => {
-                    let v = c.create_volume(VolumeRef { name }).await?.into_inner();
-                    println!("volume {} → {}", v.name, v.path);
-                }
-                VolumeCmd::Ls => {
-                    let l = c.list_volumes(Empty {}).await?.into_inner();
-                    for v in &l.volumes {
-                        println!(
-                            "{:<24} {:>9}  pods=[{}]  {}",
-                            v.name,
-                            fmt_bytes(v.size_bytes),
-                            v.pods.join(","),
-                            v.path
-                        );
-                    }
-                    if l.volumes.is_empty() {
-                        println!("no volumes — `rustypods volume create <name>` or mount one with --volume");
-                    }
-                }
-                VolumeCmd::Inspect { name } => {
-                    let l = c.list_volumes(Empty {}).await?.into_inner();
-                    let v = l
-                        .volumes
-                        .into_iter()
-                        .find(|v| v.name == name)
-                        .context(format!("volume {name} not found"))?;
-                    println!("name:    {}", v.name);
-                    println!("path:    {}", v.path);
-                    println!("size:    {}", fmt_bytes(v.size_bytes));
-                    println!("created: {}", v.created_unix);
-                    println!(
-                        "pods:    {}",
-                        if v.pods.is_empty() {
-                            "-".into()
-                        } else {
-                            v.pods.join(", ")
-                        }
-                    );
-                }
-                VolumeCmd::Rm { name } => {
-                    if !confirm_destructive(cli.yes, &format!("Delete volume {name}?"))? {
-                        println!("aborted");
-                        return Ok(());
-                    }
-                    c.remove_volume(VolumeRef { name: name.clone() }).await?;
-                    println!("volume {name} removed");
-                }
-            }
-        }
-        Cmd::Mesh { sub } => match sub {
-            MeshCmd::Init { port } => {
-                let st = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .mesh_init(MeshInitRequest { listen_port: port })
-                    .await?
-                    .into_inner();
-                print_mesh_status(&st);
-            }
-            MeshCmd::Status => {
-                let st = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .get_mesh_status(Empty {})
-                    .await?
-                    .into_inner();
-                if !st.enabled {
-                    println!("mesh disabled — `rustypods mesh init` to enable");
-                } else {
-                    print_mesh_status(&st);
-                }
-            }
-            MeshCmd::AddPeer { endpoint, pubkey } => {
-                let st = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .mesh_add_peer(MeshPeer { endpoint, pubkey })
-                    .await?
-                    .into_inner();
-                print_mesh_status(&st);
-            }
-            MeshCmd::RmPeer { pubkey } => {
-                let st = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .mesh_remove_peer(MeshPeer {
-                        endpoint: String::new(),
-                        pubkey,
-                    })
-                    .await?
-                    .into_inner();
-                print_mesh_status(&st);
-            }
-            MeshCmd::Deinit => {
-                connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .mesh_deinit(Empty {})
-                    .await?;
-                println!("mesh down — rp-mesh0 removed, identity forgotten");
-            }
-        },
-        Cmd::Ingress { sub } => match sub {
-            IngressCmd::Init { image, install_ca } => {
-                let d = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .init_ingress(InitIngressRequest { image, install_ca })
-                    .await?
-                    .into_inner();
-                let Some(pod) = d.pod else {
-                    anyhow::bail!("daemon returned no gateway pod");
-                };
-                // Init provisions but doesn't boot — start it like
-                // `rustypods start` would (already-running is a no-op).
-                let pod = if pod.state == PodState::Running as i32 {
-                    pod
-                } else {
-                    connect(cli.socket.clone(), cli.remote.clone())
-                        .await?
-                        .start_pod(StartPodRequest {
-                            name: pod.name.clone(),
-                            limits: None,
-                            ephemeral: false,
-                            private_users: None,
-                        })
-                        .await?
-                        .into_inner()
-                };
-                println!("ca:    {}", d.ca_cert_path);
-                println!(
-                    "trust: {}",
-                    if d.ca_installed {
-                        "installed into host store"
-                    } else {
-                        "not installed (re-run with --install-ca or import the CA yourself)"
-                    }
-                );
-                print_pod(&pod);
-            }
-            IngressCmd::Status => {
-                let s = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .ingress_gateway_status(IngressGatewayStatusRequest {})
-                    .await?
-                    .into_inner();
-                println!("configured:    {}", s.configured);
-                println!("running:       {}", s.running);
-                println!("control ready: {}", s.control_ready);
-                println!("generation:    {}", s.generation);
-                println!("routes:        {}", s.route_count);
-                println!("ca:            {}", s.ca_cert_path);
-            }
-            IngressCmd::UninstallCa => {
-                let r = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .uninstall_ingress_ca(Empty {})
-                    .await?
-                    .into_inner();
-                println!("removed: {}", r.ca_cert_path);
-                println!("{}", r.detail);
-            }
-            IngressCmd::RotateCa => {
-                let r = connect(cli.socket.clone(), cli.remote.clone())
-                    .await?
-                    .rotate_ingress_ca(Empty {})
-                    .await?
-                    .into_inner();
-                println!("ca: {}", r.ca_cert_path);
-                println!("{}", r.detail);
-            }
-        },
-        Cmd::Ping => {
-            let i = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .ping(PingRequest {})
-                .await?
-                .into_inner();
-            println!("rustypodsd v{}", i.version);
-            println!("socket:   {}", i.socket_path);
-            println!("data:     {}", i.data_dir);
-            println!("machined: {}   btrfs: {}", i.machined, i.btrfs);
-            println!(
-                "storage:  {}   engine: {}",
-                i.storage_driver, i.runtime_engine
-            );
-            for q in &i.quarantined {
-                println!("quarantine: {q}");
-            }
-        }
-        Cmd::Images => {
-            let l = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .list_images(ListImagesRequest {})
-                .await?
-                .into_inner();
-            for i in &l.images {
-                let mut extra = String::new();
-                if !i.entrypoint.is_empty() || !i.cmd.is_empty() {
-                    extra = format!(
-                        "  run: {}",
-                        i.entrypoint
-                            .iter()
-                            .chain(i.cmd.iter())
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                }
-                println!("{:<20} {:<28} {}{}", i.name, i.source, i.path, extra);
-            }
-            if l.images.is_empty() {
-                println!("no images — `rustypods pull busybox:latest` or `rustypods import --from-distrobox arch`");
-            }
-        }
-        Cmd::Pull {
-            reference,
-            name,
-            strip_setuid,
-        } => {
-            println!("pulling {reference} (this can take a while)...");
-            // Pulls routinely outlast the default 30s call bound.
-            let img =
-                rustypods_client::connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                    .await?
-                    .pull_image(PullImageRequest {
-                        reference,
-                        name: name.unwrap_or_default(),
-                        strip_setuid,
-                    })
-                    .await?
-                    .into_inner();
-            println!("image {} → {}", img.name, img.path);
-            if !img.entrypoint.is_empty() || !img.cmd.is_empty() {
-                println!(
-                    "  runs non-boot: {}",
-                    img.entrypoint
-                        .iter()
-                        .chain(img.cmd.iter())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-            }
-        }
-        Cmd::Import {
-            from_distrobox,
-            name,
-            user,
-        } => {
-            let name = name.unwrap_or_else(|| format!("{from_distrobox}-base"));
-            let user = match user {
-                Some(u) => u,
-                None => current_username()?,
-            };
-            println!("exporting: {from_distrobox} → {name} (this can take a while)...");
-            let img =
-                rustypods_client::connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                    .await?
-                    .import_image(ImportImageRequest {
-                        name: name.clone(),
-                        distrobox: from_distrobox,
-                        import_user: user,
-                    })
-                    .await?
-                    .into_inner();
-            println!("image {} → {}", img.name, img.path);
-        }
-        Cmd::Rmi { name } => {
-            if !confirm_destructive(cli.yes, &format!("Remove image {name}?"))? {
-                println!("aborted");
-                return Ok(());
-            }
-            connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .remove_image(ImageRef { name: name.clone() })
-                .await?;
-            println!("image {name} removed");
-        }
-        Cmd::Create {
-            name,
-            image,
-            storage_max,
-            port,
-            desktop,
-            bind,
-            autostart,
-            ingress,
-            cmd,
-            restart,
-            health_cmd,
-            health_tcp,
-            health_http,
-            health_interval,
-            health_timeout,
-            health_retries,
-            env,
-            env_file,
-            volume,
-            stop_timeout,
-        } => {
-            let storage_max_bytes = storage_max
-                .as_deref()
-                .map(parse_bytes)
-                .transpose()?
-                .unwrap_or(0);
-            if !port.is_empty() || !ingress.is_empty() {
-                eprintln!("note: --port/--ingress imply a private netns (--network-veth); the pod no longer shares host networking");
-            }
-            note_implicit_port_binds(&port);
-            let mut ingress_rules = Vec::with_capacity(ingress.len());
-            for spec in &ingress {
-                ingress_rules.push(rustypods_proto::parse_ingress_rule(spec)?);
-            }
-            let healthcheck = healthcheck_proto(
-                health_cmd.as_ref(),
-                health_tcp.as_ref(),
-                health_http.as_ref(),
-                health_interval.as_ref(),
-                health_timeout.as_ref(),
-                health_retries,
-            )?;
-            let env = collect_env(env_file.as_ref(), env)?;
-            for spec in &volume {
-                rustypods_proto::parse_volume_spec(spec)?;
-            }
-            let p = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                .await?
-                .create_pod(CreatePodRequest {
-                    name,
-                    image,
-                    storage_max_bytes,
-                    ports: port,
-                    ingress: ingress_rules,
-                    desktop,
-                    binds: bind,
-                    limits: None,
-                    autostart,
-                    cmd,
-                    restart: restart.unwrap_or_default(),
-                    healthcheck,
-                    env,
-                    volumes: volume,
-                    stop_timeout_secs: stop_timeout.unwrap_or(0),
-                })
-                .await?
-                .into_inner();
-            print_pod(&p);
-        }
-        Cmd::Start {
-            name,
-            memory_high,
-            memory_max,
-            cpu,
-            ephemeral,
-            private_users,
-            no_private_users,
-        } => {
-            let pu = if private_users {
-                Some(true)
-            } else if no_private_users {
-                Some(false)
-            } else {
-                None
-            };
-            let p = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                .await?
-                .start_pod(StartPodRequest {
-                    name: name.clone(),
-                    limits: limits_proto(memory_high.as_deref(), memory_max.as_deref(), cpu)?,
-                    ephemeral,
-                    private_users: pu,
-                })
-                .await?
-                .into_inner();
-            print_pod(&p);
-            println!("shell: rustypods shell {name}");
-        }
-        Cmd::Stop { name } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .stop_pod(PodRef { name })
-                .await?
-                .into_inner();
-            print_pod(&p);
-        }
-        Cmd::Restart { name } => {
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            c.stop_pod(PodRef { name: name.clone() }).await?;
-            let p = c
-                .start_pod(StartPodRequest {
-                    name,
-                    limits: None,
-                    ephemeral: false,
-                    private_users: None,
-                })
-                .await?
-                .into_inner();
-            print_pod(&p);
-        }
-        Cmd::Ps => {
-            let l = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .list_pods(ListPodsRequest {})
-                .await?
-                .into_inner();
-            for p in &l.pods {
-                print_pod(p);
-            }
-            if l.pods.is_empty() {
-                println!("no pods — `rustypods create <name> --image <image>`");
-            }
-        }
-        Cmd::Destroy { name } => {
-            use std::io::IsTerminal;
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            let n = if std::io::stdin().is_terminal() && !cli.yes {
-                c.list_snapshots(PodRef { name: name.clone() })
-                    .await?
-                    .into_inner()
-                    .snapshots
-                    .len()
-            } else {
-                0
-            };
-            if !confirm_destructive(
-                cli.yes,
-                &format!("Destroy pod {name} and its {n} snapshots?"),
-            )? {
-                println!("aborted");
-                return Ok(());
-            }
-            c.destroy_pod(PodRef { name: name.clone() }).await?;
-            println!("pod {name} destroyed");
-        }
-        Cmd::Clone { source, dest } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .clone_pod(ClonePodRequest {
-                    source: source.clone(),
-                    dest,
-                })
-                .await?
-                .into_inner();
-            print_pod(&p);
-            if !p.ports.is_empty() {
-                eprintln!("note: ports copied — running both pods needs distinct host ports (edit conf/pods/{}.conf + reload)", p.name);
-            }
-        }
-        Cmd::Commit { pod, label } => {
-            let s = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .commit_pod(CommitPodRequest {
-                    pod: pod.clone(),
-                    label: label.unwrap_or_default(),
-                })
-                .await?
-                .into_inner();
-            println!("snapshot {} — instant CoW ({})", s.id, s.path);
-        }
-        Cmd::Rollback { pod, to } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .rollback_pod(RollbackPodRequest {
-                    pod: pod.clone(),
-                    snapshot: to.clone().unwrap_or_default(),
-                })
-                .await?
-                .into_inner();
-            println!(
-                "{} rolled back{}",
-                p.name,
-                to.map(|t| format!(" to {t}"))
-                    .unwrap_or_else(|| " to latest".into())
-            );
-            print_pod(&p);
-        }
-        Cmd::Snapshots { pod } => {
-            let l = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .list_snapshots(PodRef { name: pod })
-                .await?
-                .into_inner();
-            for s in &l.snapshots {
-                println!("{:<44} {}", s.id, s.label);
-            }
-            if l.snapshots.is_empty() {
-                println!("no snapshots — `rustypods commit <pod> [label]`");
-            }
-        }
-        Cmd::Export {
-            pod,
-            output,
-            format,
-            allow_inconsistent,
-        } => {
-            let mut c = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?;
-            let mut stream = c
-                .export_pod(ExportRequest {
-                    name: pod.clone(),
-                    format: format.unwrap_or_default(),
-                    allow_inconsistent,
-                })
-                .await?
-                .into_inner();
-            use tokio::io::AsyncWriteExt;
-            let mut out: Box<dyn tokio::io::AsyncWrite + Unpin> = match &output {
-                Some(p) => Box::new(
-                    tokio::fs::File::create(p)
-                        .await
-                        .with_context(|| format!("create {}", p.display()))?,
-                ),
-                None => Box::new(tokio::io::stdout()),
-            };
-            let write = async {
-                let mut total = 0u64;
-                let mut progress = Progress::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    if !chunk.warning.is_empty() {
-                        progress.done(&format!("warning: {}", chunk.warning));
-                    }
-                    if chunk.data.is_empty() {
-                        continue;
-                    }
-                    total += chunk.data.len() as u64;
-                    out.write_all(&chunk.data).await?;
-                    progress.tick(|| format!("exporting {pod}: {}", fmt_bytes(total)));
-                }
-                out.flush().await?;
-                progress.done(&format!("exported {pod}: {}", fmt_bytes(total)));
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            if let Err(e) = write {
-                if let Some(p) = &output {
-                    match tokio::fs::remove_file(p).await {
-                        Ok(()) => eprintln!("removed partial archive {}", p.display()),
-                        Err(rm) => eprintln!(
-                            "warning: failed to remove partial archive {}: {rm}",
-                            p.display()
-                        ),
-                    }
-                }
-                return Err(e);
-            }
-        }
-        Cmd::Load { file, name, trust } => {
-            // The unary reply only lands after the full upload — the
-            // default 30s call timeout would cut big archives mid-send.
-            let mut c = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?;
-            use rustypods_proto::rpc::import_chunk::Kind;
-            // Open before the RPC so a missing file errors locally.
-            let mut input: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if file == "-" {
-                Box::new(tokio::io::stdin())
-            } else {
-                Box::new(
-                    tokio::fs::File::open(&file)
-                        .await
-                        .with_context(|| format!("open {file}"))?,
-                )
-            };
-            let (tx, rx) = tokio::sync::mpsc::channel::<ImportChunk>(8);
-            tokio::spawn(async move {
-                if name.is_some() || trust {
-                    let _ = tx
-                        .send(ImportChunk {
-                            kind: Some(Kind::Options(ImportOptions {
-                                rename: name.unwrap_or_default(),
-                                trust,
-                            })),
-                        })
-                        .await;
-                }
-                use tokio::io::AsyncReadExt;
-                let mut buf = vec![0u8; 1 << 20];
-                let mut total = 0u64;
-                let mut progress = Progress::new();
-                loop {
-                    match input.read(&mut buf).await {
-                        Ok(0) => {
-                            progress.done(&format!("uploaded: {}", fmt_bytes(total)));
-                            break;
-                        }
-                        Ok(n) => {
-                            total += n as u64;
-                            progress.tick(|| format!("uploading: {}", fmt_bytes(total)));
-                            if tx
-                                .send(ImportChunk {
-                                    kind: Some(Kind::Data(buf[..n].to_vec())),
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            progress.done(&format!("read error after {}: {e}", fmt_bytes(total)));
-                            break;
-                        }
-                    }
-                }
-            });
-            let pod = c
-                .import_pod(tokio_stream::wrappers::ReceiverStream::new(rx))
-                .await?
-                .into_inner();
-            eprintln!("imported {} ({})", pod.name, pod.rootfs);
-            for n in &pod.notes {
-                eprintln!("import: {n}");
-            }
-        }
-        Cmd::Rmsnap { pod, id } => {
-            if !confirm_destructive(cli.yes, &format!("Delete snapshot {id} of pod {pod}?"))? {
-                println!("aborted");
-                return Ok(());
-            }
-            connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .delete_snapshot(SnapshotRef {
-                    pod,
-                    id: id.clone(),
-                })
-                .await?;
-            println!("snapshot {id} deleted");
-        }
-        Cmd::Apply { file } => {
-            let toml =
-                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
-            let r = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                .await?
-                .apply_stack(ApplyStackRequest { toml })
-                .await?
-                .into_inner();
-            println!(
-                "stack {} applied ({} pods, shared netns)",
-                r.name,
-                r.pods.len()
-            );
-            for p in &r.pods {
-                print_pod(p);
-            }
-            println!("start: rustypods stack start {}", r.name);
-            let published: Vec<String> = r.pods.iter().flat_map(|p| p.ports.clone()).collect();
-            note_implicit_port_binds(&published);
-        }
-        Cmd::Stack { sub } => {
-            let start = matches!(sub, StackCmd::Start { .. });
-            let mut c = if start {
-                connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?
-            } else {
-                connect(cli.socket.clone(), cli.remote.clone()).await?
-            };
-            match sub {
-                StackCmd::Destroy { name } => {
-                    if !confirm_destructive(
-                        cli.yes,
-                        &format!("Destroy stack {name} and its pods?"),
-                    )? {
-                        println!("aborted");
-                        return Ok(());
-                    }
-                    c.destroy_stack(PodRef { name: name.clone() }).await?;
-                    println!("stack {name} destroyed");
-                }
-                StackCmd::Start { name } | StackCmd::Stop { name } => {
-                    let members: Vec<String> = c
-                        .list_pods(ListPodsRequest {})
-                        .await?
-                        .into_inner()
-                        .pods
-                        .into_iter()
-                        .filter(|p| p.stack == name)
-                        .map(|p| p.name)
-                        .collect();
-                    if members.is_empty() {
-                        anyhow::bail!("stack {name} not found");
-                    }
-                    for m in members {
-                        let p = if start {
-                            c.start_pod(StartPodRequest {
-                                name: m,
-                                limits: None,
-                                ephemeral: false,
-                                private_users: None,
-                            })
-                            .await?
-                            .into_inner()
-                        } else {
-                            c.stop_pod(PodRef { name: m }).await?.into_inner()
-                        };
-                        print_pod(&p);
-                    }
-                }
-            }
-        }
-        Cmd::Config {
-            name,
-            memory_high,
-            memory_max,
-            cpu,
-            storage_max,
-            bind,
-            clear_binds,
-            snap_keep,
-            snap_max_age,
-            autostart,
-            ingress,
-            clear_ingress,
-            cmd,
-            clear_cmd,
-            restart,
-            health_cmd,
-            health_tcp,
-            health_http,
-            health_interval,
-            health_timeout,
-            health_retries,
-            clear_health,
-            env,
-            env_file,
-            clear_env,
-            volume,
-            clear_volumes,
-            stop_timeout,
-        } => {
-            // Missing flags = keep current values → fetch them first.
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            let cur = c
-                .list_pods(ListPodsRequest {})
-                .await?
-                .into_inner()
-                .pods
-                .into_iter()
-                .find(|p| p.name == name)
-                .context(format!("pod {name} not found"))?;
-            let cur_lim = cur.limits.unwrap_or_default();
-            let lim = Limits {
-                memory_high_bytes: memory_high
-                    .as_deref()
-                    .map(parse_bytes)
-                    .transpose()?
-                    .unwrap_or(cur_lim.memory_high_bytes),
-                memory_max_bytes: memory_max
-                    .as_deref()
-                    .map(parse_bytes)
-                    .transpose()?
-                    .unwrap_or(cur_lim.memory_max_bytes),
-                cpu_quota_percent: cpu.unwrap_or(cur_lim.cpu_quota_percent),
-            };
-            let storage_max_bytes = storage_max
-                .as_deref()
-                .map(parse_bytes)
-                .transpose()?
-                .unwrap_or(cur.storage_max_bytes);
-            let binds = if clear_binds {
-                Some(BindList { binds: vec![] })
-            } else if !bind.is_empty() {
-                Some(BindList { binds: bind })
-            } else {
-                None
-            };
-            let ingress = if clear_ingress {
-                Some(IngressList { rules: vec![] })
-            } else if !ingress.is_empty() {
-                let mut rules = Vec::with_capacity(ingress.len());
-                for spec in &ingress {
-                    rules.push(rustypods_proto::parse_ingress_rule(spec)?);
-                }
-                Some(IngressList { rules })
-            } else {
-                None
-            };
-            let cmd = if clear_cmd {
-                Some(CmdList { argv: vec![] })
-            } else if !cmd.is_empty() {
-                Some(CmdList { argv: cmd })
-            } else {
-                None
-            };
-            let healthcheck = if clear_health {
-                // Present-but-empty kind disables the probe.
-                Some(HealthCheck::default())
-            } else {
-                healthcheck_proto(
-                    health_cmd.as_ref(),
-                    health_tcp.as_ref(),
-                    health_http.as_ref(),
-                    health_interval.as_ref(),
-                    health_timeout.as_ref(),
-                    health_retries,
-                )?
-            };
-            let env = if clear_env {
-                Some(EnvList { entries: vec![] })
-            } else if env_file.is_some() || !env.is_empty() {
-                Some(EnvList {
-                    entries: collect_env(env_file.as_ref(), env)?,
-                })
-            } else {
-                None
-            };
-            let volumes = if clear_volumes {
-                Some(VolumeList { specs: vec![] })
-            } else if !volume.is_empty() {
-                for spec in &volume {
-                    rustypods_proto::parse_volume_spec(spec)?;
-                }
-                Some(VolumeList { specs: volume })
-            } else {
-                None
-            };
-            let p = c
-                .update_pod_config(UpdatePodConfigRequest {
-                    name,
-                    limits: Some(lim),
-                    storage_max_bytes,
-                    ports: None,
-                    binds,
-                    ingress,
-                    cmd,
-                    snap_keep_last: snap_keep,
-                    snap_max_age_secs: snap_max_age.as_deref().map(parse_duration).transpose()?,
-                    autostart,
-                    restart,
-                    healthcheck,
-                    env,
-                    volumes,
-                    stop_timeout_secs: stop_timeout,
-                })
-                .await?
-                .into_inner();
-            print_pod(&p);
-        }
-        Cmd::Reload { name } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .reload_pod_config(PodRef { name })
-                .await?
-                .into_inner();
-            print_pod(&p);
-        }
-        Cmd::Logs { name, follow } => {
-            use std::io::Write;
-            use tokio::time::{Duration, Instant};
-            /// -f only: a dying stream (daemon restart, journalctl hiccup)
-            /// is no reason to exit — reconnect while the pod lives.
-            const MAX_RECONNECTS: u32 = 5;
-            let print = |data: &[u8]| -> Result<()> {
-                let mut out = std::io::stdout().lock();
-                out.write_all(data)?;
-                out.write_all(b"\n")?;
-                out.flush()?;
-                Ok(())
-            };
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            let mut retries = 0u32;
-            loop {
-                let mut s = match c.stream_logs(PodRef { name: name.clone() }).await {
-                    Ok(r) => r.into_inner(),
-                    Err(e) => {
-                        // A pod that doesn't exist will never produce logs.
-                        if !follow || e.code() == tonic::Code::NotFound || retries >= MAX_RECONNECTS
-                        {
-                            return Err(e.into());
-                        }
-                        retries += 1;
-                        eprintln!("logs: {e} — reconnecting ({retries}/{MAX_RECONNECTS})…");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        if let Ok(nc) = connect(cli.socket.clone(), cli.remote.clone()).await {
-                            c = nc;
-                        }
-                        continue;
-                    }
-                };
-                if !follow {
-                    // Bounded backlog drain: the daemon's sources
-                    // (journalctl -f, tail -F) never EOF on their own, so
-                    // instead of a per-message "quiet" heuristic cap the
-                    // TOTAL wait — 3s after the first line arrives, or 3s
-                    // overall for an empty backlog. A real stream end or
-                    // error exits immediately.
-                    let mut deadline = Instant::now() + Duration::from_secs(3);
-                    let mut first = true;
-                    loop {
-                        match tokio::time::timeout_at(deadline, s.message()).await {
-                            Ok(Ok(Some(l))) => {
-                                print(&l.data)?;
-                                if first {
-                                    first = false;
-                                    deadline = Instant::now() + Duration::from_secs(3);
-                                }
-                            }
-                            Ok(Ok(None)) | Err(_) => break,
-                            Ok(Err(e)) => return Err(e.into()),
-                        }
-                    }
-                    break;
-                }
-                // EOF or error ends the loop → reconnect
-                while let Ok(Some(l)) = s.message().await {
-                    retries = 0; // healthy stream resets the budget
-                    print(&l.data)?;
-                }
-                // Reconnect only while the pod is alive and running — a
-                // dead pod's stream ending is a normal exit, not a retry.
-                let running = c
-                    .list_pods(ListPodsRequest {})
-                    .await
-                    .map(|l| {
-                        l.into_inner()
-                            .pods
-                            .iter()
-                            .any(|p| p.name == name && p.state == PodState::Running as i32)
-                    })
-                    .unwrap_or(true); // daemon unreachable → don't guess, retry
-                if !running {
-                    break;
-                }
-                retries += 1;
-                if retries > MAX_RECONNECTS {
-                    eprintln!("logs: stream keeps dying ({MAX_RECONNECTS} retries) — giving up");
-                    break;
-                }
-                eprintln!("logs: stream ended — reconnecting ({retries}/{MAX_RECONNECTS})…");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Ok(nc) = connect(cli.socket.clone(), cli.remote.clone()).await {
-                    c = nc;
-                }
-            }
-        }
-        Cmd::Metrics { name } => {
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            let mut s = c.pod_metrics(PodRef { name }).await?.into_inner();
-            while let Some(m) = s.message().await? {
-                let high = if m.mem_high_bytes > 0 {
-                    fmt_bytes(m.mem_high_bytes)
-                } else {
-                    "max".into()
-                };
-                println!(
-                    "mem {:>8}/{:<8} cpu {:>6.1}%  pids {:<5} psi mem={:.1} io={:.1}",
-                    fmt_bytes(m.mem_bytes),
-                    high,
-                    m.cpu_pct,
-                    m.pids,
-                    m.mem_psi_avg10,
-                    m.io_psi_avg10
-                );
-            }
-        }
-        Cmd::Shm { sub } => {
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
-            match sub {
-                ShmCmd::Create { pod, name, size } => {
-                    let seg = c
-                        .create_shm(ShmRequest {
-                            pod,
-                            name,
-                            size_bytes: parse_bytes(&size)?,
-                        })
-                        .await?
-                        .into_inner();
-                    println!("shm {} ({})", seg.name, fmt_bytes(seg.size_bytes));
-                    println!("  host: {}", seg.host_path);
-                    println!("  pod:  {}", seg.pod_path);
-                }
-                ShmCmd::Ls { pod } => {
-                    let l = c.list_shm(PodRef { name: pod }).await?.into_inner();
-                    for s in &l.segs {
-                        println!(
-                            "{:<20} {:>10}  {}",
-                            s.name,
-                            fmt_bytes(s.size_bytes),
-                            s.host_path
-                        );
-                    }
-                    if l.segs.is_empty() {
-                        println!("no segments");
-                    }
-                }
-                ShmCmd::Rm { pod, name } => {
-                    c.remove_shm(ShmRef {
-                        pod,
-                        name: name.clone(),
-                    })
-                    .await?;
-                    println!("segment {name} removed");
-                }
-            }
-        }
-    }
-    Ok(())
+    cmd::dispatch(cli).await
 }
 
 #[cfg(test)]
