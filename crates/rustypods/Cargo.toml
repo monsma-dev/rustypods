@@ -2,6 +2,7 @@
 name = "rustypods"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "RustyPods CLI — podman/distrobox-style frontend for rustypodsd"
 
 [[bin]]

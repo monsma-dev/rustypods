@@ -2,6 +2,7 @@
 name = "rustypods-proto"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "RustyPods protobuf API + shared constants/util"
 build = "build.rs"
 

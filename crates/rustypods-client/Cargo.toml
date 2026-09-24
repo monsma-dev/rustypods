@@ -2,6 +2,7 @@
 name = "rustypods-client"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "RustyPods client — tonic gRPC over UDS or ssh+socat"
 
 [dependencies]

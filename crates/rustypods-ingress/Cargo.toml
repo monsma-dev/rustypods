@@ -2,6 +2,7 @@
 name = "rustypods-ingress"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "RustyPods ingress — hostname L7 reverse proxy (route control over UDS)"
 
 [lib]
@@ -34,7 +35,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 futures-util = "0.3"
-tokio-tungstenite = "=0.27.0"
+tokio-tungstenite = "0.27.0"
 
 [lints]
 workspace = true
