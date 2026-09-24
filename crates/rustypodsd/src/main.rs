@@ -43,6 +43,17 @@ struct Args {
     /// `nft --check -f -` on the host. Applies nothing.
     #[arg(long, hide = true)]
     print_nat: bool,
+
+    #[command(subcommand)]
+    cmd: Option<DaemonCmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum DaemonCmd {
+    /// Remove RustyPods nft tables, marker firewall inserts, and
+    /// firewalld runtime zone bindings. Does not restore sysctls.
+    /// Root only. For uninstall scripts.
+    TeardownNet,
 }
 
 #[tokio::main]
@@ -72,6 +83,12 @@ async fn main() -> Result<()> {
                 args.http_addr
             );
         }
+    }
+    if matches!(args.cmd, Some(DaemonCmd::TeardownNet)) {
+        if euid() != 0 {
+            anyhow::bail!("teardown-net must run as root");
+        }
+        return rustypodsd::net::teardown_all();
     }
     if euid() != 0 {
         tracing::warn!("rustypodsd is not running as root — nspawn/btrfs/machined will fail");

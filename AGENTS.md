@@ -167,6 +167,13 @@ rustypodsd does it itself:
   in init_user_ns) → stack members run with `private_users: false`;
   standalone `create` pods get userns by default.
 - Privileged pod ports (<1024) need `--user root` inside the pod.
+- Stack uplinks are `ve-<4-char stem>-<7 hex>` (15 chars). A truncated
+  `ve-<first 12>` was reused when it already existed, so two stacks
+  sharing a prefix shared one veth and the second had no uplink. An
+  existing link is reused only when its peer sits in that stack's netns.
+- `rustypodsd teardown-net` (root) deletes the rustypods nft tables,
+  marker FORWARD/INPUT inserts (including mesh), and firewalld runtime
+  bindings. It does not restore sysctls; it logs what may still be set.
 - Hard-won: nspawn's host veth name for a >12-char machine name is NOT a
   plain truncation — systemd v257 rewrites it with a hash suffix
   (`ve-rustypod0iFF`). Resolve the host veth by peer ifindex

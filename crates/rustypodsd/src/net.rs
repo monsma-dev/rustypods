@@ -37,7 +37,9 @@ impl PodPool {
 }
 
 pub fn parse_pod_pool(v4: &str, v6: &str) -> Result<PodPool> {
-    let (addr, prefix) = v4.split_once('/').context("RUSTYPODS_POD_NET4 must be a.b.0.0/16")?;
+    let (addr, prefix) = v4
+        .split_once('/')
+        .context("RUSTYPODS_POD_NET4 must be a.b.0.0/16")?;
     if prefix != "16" {
         bail!("RUSTYPODS_POD_NET4 must be a /16, got {v4}");
     }
@@ -95,6 +97,36 @@ pub fn pool() -> &'static PodPool {
 /// Host iface for a pod's veth pair (nspawn truncates to IFNAMSIZ-1 chars).
 pub fn veth_name(pod: &str) -> String {
     format!("ve-{}", &pod[..pod.len().min(12)])
+}
+
+/// Stack uplink name. Two stacks that share a 12-character prefix must
+/// not share a veth: nspawn-style truncation did that, and the second
+/// stack then had no uplink. 15 chars (IFNAMSIZ-1): `ve-` + 4-char stem
+/// + `-` + 7 hex of a stable hash of the full stack name.
+pub fn stack_veth_name(stack: &str) -> String {
+    let mut h: u32 = 2166136261;
+    for b in stack.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(16777619);
+    }
+    let hex = format!("{h:08x}");
+    let stem: String = stack
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(4)
+        .collect();
+    let stem = if stem.is_empty() { "x" } else { stem.as_str() };
+    format!("ve-{stem}-{}", &hex[..7])
+}
+
+fn stack_veth_is_ours(host_v: &str, ns: &str) -> bool {
+    let Ok(idx) = std::fs::read_to_string(format!("/sys/class/net/{host_v}/ifindex")) else {
+        return false;
+    };
+    let Ok(out) = run_out("ip", &["netns", "exec", ns, "ip", "-o", "link"]) else {
+        return false;
+    };
+    out.contains(&format!("@if{}", idx.trim()))
 }
 
 pub fn host_ip(idx: u32) -> Ipv4Addr {
@@ -420,9 +452,15 @@ pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
     if !netns_path(stack).exists() {
         run("ip", &["netns", "add", &ns])?;
     }
-    let host_v = veth_name(stack);
+    let host_v = stack_veth_name(stack);
     let peer = stack_peer(stack);
-    if !Path::new(&format!("/sys/class/net/{host_v}")).exists() {
+    if Path::new(&format!("/sys/class/net/{host_v}")).exists() {
+        if !stack_veth_is_ours(&host_v, &ns) {
+            bail!(
+                "{host_v} already exists and is not the uplink for stack {stack} — refusing to reuse it"
+            );
+        }
+    } else {
         run(
             "ip",
             &[
@@ -533,7 +571,7 @@ pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
 /// Tear the stack netns down: deleting the host veth also kills the peer
 /// inside the ns; `ip netns del` removes the named namespace itself.
 pub fn teardown_stack_net(stack: &str) {
-    let _ = run("ip", &["link", "del", &veth_name(stack)]);
+    let _ = run("ip", &["link", "del", &stack_veth_name(stack)]);
     let _ = run("ip", &["netns", "del", &netns_name(stack)]);
 }
 
@@ -730,9 +768,7 @@ pub fn ensure_ip_forward() -> Result<()> {
     let fwd6 = "/proc/sys/net/ipv6/conf/all/forwarding";
     if std::fs::read_to_string(fwd6).ok().as_deref() != Some("1\n") {
         std::fs::write(fwd6, "1").context("enable net.ipv6.conf.all.forwarding")?;
-        tracing::warn!(
-            "set net.ipv6.conf.all.forwarding=1 (not restored on teardown)"
-        );
+        tracing::warn!("set net.ipv6.conf.all.forwarding=1 (not restored on teardown)");
     }
     Ok(())
 }
@@ -1182,18 +1218,34 @@ pub fn rebuild_nat<'a>(
     running: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
     let script = nat_script(pods, running);
+    nft_apply(&script)?;
+    ensure_forward_accepts();
+    Ok(())
+}
+
+/// Feed `script` to `nft -f -` and always reap the child. A failed write
+/// must not leave nft running with a live stdin pipe.
+fn nft_apply(script: &str) -> Result<()> {
     use std::io::Write;
-    let mut c = Command::new("nft")
+    let mut child = Command::new("nft")
         .args(["-f", "-"])
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .context("spawn nft")?;
-    c.stdin.take().unwrap().write_all(script.as_bytes())?;
-    let st = c.wait()?;
-    if !st.success() {
-        bail!("nft -f exited {st}");
+    let write_err = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(script.as_bytes()).err(),
+        None => Some(std::io::Error::other("nft stdin was not piped")),
+    };
+    let out = child.wait_with_output().context("wait for nft")?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    if let Some(e) = write_err {
+        bail!("writing nft script: {e}; stderr: {}", err.trim());
     }
-    ensure_forward_accepts();
+    if !out.status.success() {
+        bail!("nft -f exited {}: {}", out.status, err.trim());
+    }
     Ok(())
 }
 
@@ -1265,6 +1317,64 @@ fn delete_marked_rules(fam: &str, table: &str, chain: &str, listing: &str, marks
             .args(["delete", "rule", fam, table, chain, "handle", &handle])
             .status();
     }
+}
+
+/// Remove everything RustyPods inserted into the host firewall: the
+/// `rustypods` nft tables, marker-commented FORWARD/INPUT rules (including
+/// mesh), and firewalld runtime trusted-zone bindings. Sysctls are left
+/// as-is; the log line says which ones may have been changed.
+pub fn teardown_all() -> Result<()> {
+    for (fam, name) in [
+        ("ip", "rustypods"),
+        ("ip6", "rustypods6"),
+        ("inet", "rustypods"),
+    ] {
+        let _ = run("nft", &["delete", "table", fam, name]);
+    }
+    let marks = [
+        FORWARD_MARK,
+        FORWARD_MARK_OLD,
+        "rustypods-mesh-fwd",
+        "rustypods-mesh-in",
+    ];
+    for (fam, table, chain) in [
+        ("ip", "filter", "FORWARD"),
+        ("ip6", "filter", "FORWARD"),
+        ("inet", "filter", "FORWARD"),
+        ("ip", "filter", "INPUT"),
+        ("ip6", "filter", "INPUT"),
+        ("inet", "filter", "INPUT"),
+    ] {
+        let out = Command::new("nft")
+            .args(["-a", "list", "chain", fam, table, chain])
+            .output();
+        let Ok(out) = out else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let txt = String::from_utf8_lossy(&out.stdout);
+        delete_marked_rules(fam, table, chain, &txt, &marks);
+    }
+    if run("firewall-cmd", &["--state"]).is_ok() {
+        if let Ok(list) = run_out("firewall-cmd", &["--zone=trusted", "--list-interfaces"]) {
+            for iface in list.split_whitespace() {
+                if iface.starts_with(POD_VETH_PREFIX) || iface.starts_with("rp-mesh") {
+                    let _ = run(
+                        "firewall-cmd",
+                        &["--zone=trusted", "--remove-interface", iface],
+                    );
+                }
+            }
+        }
+    }
+    tracing::warn!(
+        "teardown-net removed nft tables ip rustypods, ip6 rustypods6, inet rustypods, \
+         marker rules ({FORWARD_MARK}, rustypods-mesh-fwd, rustypods-mesh-in), and firewalld \
+         trusted-zone bindings for ve-* and rp-mesh*. Sysctls were NOT restored: \
+         net.ipv4.ip_forward and net.ipv6.conf.all.forwarding may still be 1, and non-pod \
+         interfaces may have accept_ra=2. Revert those by hand if nothing else needs them."
+    );
+    Ok(())
 }
 
 /// TCP 80+443 on BOTH loopback stacks must be free before the gateway
@@ -1466,6 +1576,17 @@ mod tests {
         assert!(parse_pod_pool("10.220.0.0/16", "fd22:220::/48").is_err());
     }
 
+    #[test]
+    fn stack_veth_names_do_not_collide() {
+        let a = stack_veth_name("verylongstackname");
+        let b = stack_veth_name("verylongstackother");
+        assert_ne!(a, b);
+        assert!(a.len() <= 15 && b.len() <= 15, "{a} {b}");
+        assert!(a.starts_with("ve-") && b.starts_with("ve-"));
+        assert_eq!(stack_veth_name("demo"), stack_veth_name("demo"));
+    }
+
+    #[test]
     fn address_helpers() {
         assert_eq!(host_ip(1).to_string(), "10.220.1.1");
         assert_eq!(pod_ip(1).to_string(), "10.220.1.2");
