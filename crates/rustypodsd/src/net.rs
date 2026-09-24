@@ -250,6 +250,62 @@ async fn firewalld_bind(veth: &str) {
     }
 }
 
+/// Re-bind every pod veth and the mesh TUN to firewalld's trusted zone.
+/// Runtime-only bindings die on `firewall-cmd --reload`; this puts them
+/// back. Idempotent. No-op when firewalld is not running.
+pub fn rebind_firewalld_ifaces() {
+    let Ok(rd) = std::fs::read_dir("/sys/class/net") else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(POD_VETH_PREFIX) || name.starts_with("rp-mesh") {
+            firewalld_bind_sync(&name);
+        }
+    }
+}
+
+/// firewalld emits `Reloaded` on `org.fedoraproject.FirewallD1` after
+/// `--reload` drops runtime interface bindings. The receiver fires once
+/// per signal. If firewalld is absent the channel simply stays quiet
+/// and the periodic reconcile is the backstop.
+pub fn watch_firewalld_reloads(conn: zbus::Connection) -> tokio::sync::mpsc::Receiver<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        let proxy = match FirewallD1Proxy::new(&conn).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("firewalld not available: {e}");
+                return;
+            }
+        };
+        use tokio_stream::StreamExt;
+        let mut stream = match proxy.receive_reloaded().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("firewalld Reloaded subscribe: {e}");
+                return;
+            }
+        };
+        while stream.next().await.is_some() {
+            if tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+#[zbus::proxy(
+    interface = "org.fedoraproject.FirewallD1",
+    default_service = "org.fedoraproject.FirewallD1",
+    default_path = "/org/fedoraproject/FirewallD1"
+)]
+trait FirewallD1 {
+    #[zbus(signal)]
+    fn reloaded(&self) -> zbus::Result<()>;
+}
+
 /// Blocking variant for the sync stack-net path.
 pub(crate) fn firewalld_bind_sync(veth: &str) {
     if run("firewall-cmd", &["--state"]).is_err() {

@@ -4745,11 +4745,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     // Engine + storage drivers, auto-detected. The nspawn engine owns the
     // shared system-bus connection (zbus multiplexes all calls over it).
-    let engine: Arc<dyn RuntimeEngine> = Arc::new(runtime::SystemdNspawn {
-        dbus: zbus::Connection::system()
-            .await
-            .context("connecting to system D-Bus")?,
-    });
+    let dbus = zbus::Connection::system()
+        .await
+        .context("connecting to system D-Bus")?;
+    let engine: Arc<dyn RuntimeEngine> = Arc::new(runtime::SystemdNspawn { dbus: dbus.clone() });
     // `detect` probes the fs with `stat -f` — a subprocess; off the
     // executor even though nothing is serving yet.
     let dd = cfg.data_dir.clone();
@@ -4920,6 +4919,28 @@ pub async fn serve(cfg: Config) -> Result<()> {
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // firewalld --reload and an nft flush drop pod NAT and zone bindings.
+    // Rebuild on a 30s tick and immediately on firewalld's Reloaded signal.
+    {
+        let svc = svc.clone();
+        let mut reloaded = net::watch_firewalld_reloads(dbus);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = reloaded.recv() => {
+                        tracing::info!("firewalld reloaded — reconciling pod firewall");
+                    }
+                }
+                if let Err(e) = svc.sync_nat().await {
+                    tracing::warn!("net reconcile: {e}");
+                }
+                let _ = tokio::task::spawn_blocking(net::rebind_firewalld_ifaces).await;
             }
         });
     }

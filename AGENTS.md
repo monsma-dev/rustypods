@@ -181,6 +181,10 @@ rustypodsd does it itself:
   adds each pod veth to the built-in `trusted` zone (ACCEPT target) —
   runtime-only, zero config mutation, inert once the veth dies.
   Verified on Fedora 44 / firewalld 2.4.4 / SELinux Enforcing.
+  `firewall-cmd --reload` drops those runtime bindings (and a flush
+  drops the nft table). `serve()` reconciles every 30s and on
+  firewalld's D-Bus `Reloaded` signal: rebuild the nft tables, reinsert
+  marker FORWARD/INPUT rules, and re-bind `ve-*` / `rp-mesh*` to trusted.
 - Hard-won: `::1`→pod dnat can NEVER work — the kernel hard-drops
   loopback tuples on non-loopback devices (tcp_v6_rcv; no v6
   `route_localnet` exists — same wall Docker hits). Leaving `::1:80/443`
