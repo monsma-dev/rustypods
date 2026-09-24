@@ -1,4 +1,5 @@
 //! rustypods-ingress — the public edge for `<host>.rustypods.localhost`.
+#![forbid(unsafe_code)]
 //! Plain HTTP only redirects to HTTPS; TLS terminates here (local PKI
 //! certs, pod traffic never leaves the box). Route control comes from
 //! rustypodsd over a root-only UDS.

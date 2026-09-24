@@ -12,3 +12,6 @@ tonic.workspace = true
 tower.workspace = true
 http.workspace = true
 hyper-util.workspace = true
+
+[lints]
+workspace = true

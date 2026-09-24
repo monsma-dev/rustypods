@@ -1,4 +1,5 @@
 //! Shared client transport for the daemon's gRPC API.
+#![forbid(unsafe_code)]
 //!
 //! Local mode connects straight to the Unix socket; remote mode spawns
 //! `ssh -T <dest> socat - UNIX-CONNECT:<sock>` and pipes gRPC over its

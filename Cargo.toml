@@ -78,3 +78,9 @@ base64 = "0.22"
 
 rustypods-proto = { path = "crates/rustypods-proto" }
 rustypods-client = { path = "crates/rustypods-client" }
+
+# Only lints the tree already passes under `clippy -D warnings`.
+# Stricter clippy groups (unwrap_used, indexing_slicing, …) are not
+# enabled — see AGENTS.md for the hit counts and why.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
