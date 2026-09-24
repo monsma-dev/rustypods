@@ -1,0 +1,39 @@
+# cargo-deny policy. `cargo deny check advisories bans licenses sources`.
+# Advisories that cannot be fixed inside this branch are listed under
+# [advisories].ignore only after they are recorded in the commit message
+# or AGENTS.md — do not ignore a reachable CVE to make the check green.
+
+[advisories]
+yanked = "deny"
+# Never ignore a reachable advisory to make the scan green; record any
+# exception here with its reason.
+ignore = []
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "simplest-path"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

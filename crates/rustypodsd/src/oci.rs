@@ -81,7 +81,7 @@ pub fn default_name(reference: &str) -> Result<String> {
 /// Pull `reference` into `dest` (an existing empty dir/subvol) and return
 /// the image's runtime config. Anonymous auth; multi-arch indexes resolve
 /// to the native linux/<arch> manifest (oci-client's default resolver).
-pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
+pub async fn pull(reference: &str, dest: &Path, strip_setuid: bool) -> Result<ImageConfig> {
     let image = Reference::from_str(reference)
         .with_context(|| format!("invalid image reference '{reference}'"))?;
     let client = Client::new(ClientConfig {
@@ -113,7 +113,7 @@ pub async fn pull(reference: &str, dest: &Path) -> Result<ImageConfig> {
                 MAX_LAYER_BLOB >> 30
             );
         }
-        pull_layer(&client, &image, layer, dest).await?;
+        pull_layer(&client, &image, layer, dest, strip_setuid).await?;
     }
     write_machine_id(dest)?;
     Ok(cfg)
@@ -198,6 +198,7 @@ async fn pull_layer(
     image: &Reference,
     layer: &OciDescriptor,
     dest: &Path,
+    strip_setuid: bool,
 ) -> Result<()> {
     tracing::info!(
         "{image}: layer {} ({}, {} bytes)",
@@ -233,7 +234,7 @@ async fn pull_layer(
     let mt = layer.media_type.clone();
     // `guard` is still live here — its Drop removes the temp file once
     // this fn returns, whatever the unpack outcome.
-    tokio::task::spawn_blocking(move || unpack_layer(&tmp2, &mt, &dest2))
+    tokio::task::spawn_blocking(move || unpack_layer(&tmp2, &mt, &dest2, strip_setuid))
         .await
         .context("untar task")?
         .with_context(|| format!("unpacking layer {}", layer.digest))
@@ -241,7 +242,7 @@ async fn pull_layer(
 
 /// Decompress by media type and untar. Covers the OCI + docker layer types:
 /// `.tar` plain, `+gzip`/`.gzip`, `+zstd`/`.zstd`.
-fn unpack_layer(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
+fn unpack_layer(blob: &Path, media_type: &str, dest: &Path, strip_setuid: bool) -> Result<()> {
     let f = std::fs::File::open(blob).with_context(|| format!("open {}", blob.display()))?;
     let mt = media_type.to_ascii_lowercase();
     let reader: Box<dyn Read> = if mt.ends_with("+gzip") || mt.ends_with(".gzip") {
@@ -257,7 +258,7 @@ fn unpack_layer(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
     // cut mid-stream — the untar then fails on the truncated entry — and a
     // fully-drained reader means the stream hit the cap exactly.
     let mut limited = reader.take(MAX_LAYER_DECOMPRESSED + 1);
-    unpack_tar(&mut limited, dest)?;
+    unpack_tar_mode(&mut limited, dest, strip_setuid)?;
     if limited.limit() == 0 {
         bail!(
             "layer decompresses past {} GiB — refusing (possible decompression bomb)",
@@ -307,9 +308,120 @@ fn remove_children(dir: &Path) {
 
 /// Stream-untar one layer into `dest`, applying whiteouts. Entry order in
 /// the tar is preserved (whiteouts land where the spec puts them).
-/// crate-visible: the distrobox import routes its export stream through
-/// the same hardened untar.
-pub(crate) fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
+#[cfg(test)]
+fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
+    unpack_entries(reader, dest, false, None)
+}
+
+/// The distrobox import goes through the same hardened untar. A rootless `podman export` writes owners as seen from the user's
+/// podman namespace, not the container's. For a `--userns=keep-id` box
+/// (every distrobox) container root is namespace uid 1, so the export
+/// says `1/1` for /usr/bin/sudo. `idmap` translates them back.
+pub(crate) fn unpack_tar_remapped<R: Read>(reader: R, dest: &Path, idmap: &IdMap) -> Result<()> {
+    unpack_entries(
+        reader,
+        dest,
+        false,
+        Some(idmap).filter(|m| !m.is_identity()),
+    )
+}
+
+/// `strip_setuid` clears S_ISUID/S_ISGID after each entry lands. The
+/// default keeps those bits: images ship sudo/ping, and a user namespace
+/// contains host impact. Pods with `private_users = false` are trusted
+/// images only — pass `pull --strip-setuid` when that is not true.
+pub(crate) fn unpack_tar_mode<R: Read>(reader: R, dest: &Path, strip_setuid: bool) -> Result<()> {
+    unpack_entries(reader, dest, strip_setuid, None)
+}
+
+/// Inverse of a podman `HostConfig.IDMappings` table. Each entry is
+/// `container:namespace:len`; `map` takes a namespace id (what the export
+/// tar records) to the container id. Ids outside every range pass through.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IdMap {
+    uid: Vec<(u32, u32, u32)>,
+    gid: Vec<(u32, u32, u32)>,
+}
+
+impl IdMap {
+    /// `podman inspect --format '{{json .HostConfig.IDMappings}}'` output.
+    /// `null` or empty maps (a box without its own userns) is identity.
+    pub(crate) fn from_podman_json(s: &str) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(s.trim()).context("parse IDMappings")?;
+        let ranges = |key: &str| -> Result<Vec<(u32, u32, u32)>> {
+            let Some(list) = v.get(key).and_then(|x| x.as_array()) else {
+                return Ok(Vec::new());
+            };
+            list.iter()
+                .map(|e| {
+                    let s = e.as_str().context("IDMappings entry is not a string")?;
+                    let mut it = s.split(':').map(str::parse::<u32>);
+                    match (it.next(), it.next(), it.next(), it.next()) {
+                        (Some(Ok(c)), Some(Ok(h)), Some(Ok(n)), None) if n > 0 => Ok((c, h, n)),
+                        _ => bail!("bad IDMappings entry {s:?}"),
+                    }
+                })
+                .collect()
+        };
+        Ok(Self {
+            uid: ranges("UidMap")?,
+            gid: ranges("GidMap")?,
+        })
+    }
+
+    fn is_identity(&self) -> bool {
+        self.uid.iter().chain(&self.gid).all(|&(c, h, _)| c == h)
+    }
+
+    fn lookup(ranges: &[(u32, u32, u32)], id: u32) -> u32 {
+        ranges
+            .iter()
+            .find(|&&(_, h, n)| id >= h && id - h < n)
+            .map_or(id, |&(c, h, _)| c + (id - h))
+    }
+
+    pub(crate) fn uid(&self, id: u32) -> u32 {
+        Self::lookup(&self.uid, id)
+    }
+
+    pub(crate) fn gid(&self, id: u32) -> u32 {
+        Self::lookup(&self.gid, id)
+    }
+}
+
+/// chown clears S_ISUID/S_ISGID on regular files, so the recorded mode is
+/// put back afterwards (sudo must stay setuid root).
+fn remap_owner(path: &Path, h: &tar::Header, m: &IdMap) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (Some(u), Some(g)) = (
+        h.uid().ok().and_then(|x| u32::try_from(x).ok()),
+        h.gid().ok().and_then(|x| u32::try_from(x).ok()),
+    ) else {
+        return Ok(());
+    };
+    let (cu, cg) = (m.uid(u), m.gid(g));
+    if (cu, cg) == (u, g) {
+        return Ok(());
+    }
+    std::os::unix::fs::lchown(path, Some(cu), Some(cg))
+        .with_context(|| format!("chown {}", path.display()))?;
+    let md = std::fs::symlink_metadata(path)?;
+    if !md.file_type().is_symlink() {
+        if let Ok(mode) = h.mode() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+                .with_context(|| format!("chmod {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn unpack_entries<R: Read>(
+    reader: R,
+    dest: &Path,
+    strip_setuid: bool,
+    idmap: Option<&IdMap>,
+) -> Result<()> {
+    let idmap = idmap.filter(|_| crate::euid() == 0);
     let mut ar = tar::Archive::new(reader);
     // Keep recorded uids/modes — only meaningful (and only permitted) when
     // the daemon runs as root; a rootless run just gets extractor-owned files.
@@ -385,9 +497,35 @@ pub(crate) fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
         }
         if !e.unpack_in(&dest).context("untar entry")? {
             tracing::warn!("skipping entry escaping dest: {}", rel.display());
+            continue;
+        }
+        // A hardlink shares its target's inode, which its own entry
+        // already remapped; link headers often carry mode 0.
+        if let Some(m) = idmap.filter(|_| e.header().entry_type() != tar::EntryType::Link) {
+            remap_owner(&dest.join(&rel), e.header(), m)?;
+        }
+        if strip_setuid {
+            clear_setid_bits(&dest.join(&rel));
         }
     }
     Ok(())
+}
+
+fn clear_setid_bits(path: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    // chmod follows symlinks; never clear bits on a target outside the rootfs.
+    if md.file_type().is_symlink() {
+        return;
+    }
+    let mode = md.mode() & 0o7777;
+    let cleared = mode & !0o6000;
+    if cleared != mode {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(cleared));
+    }
 }
 
 // --- image config JSON --------------------------------------------------
@@ -574,6 +712,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
+    /// The table a distrobox (`--userns=keep-id`, uid 1000) reports.
+    #[test]
+    fn keep_id_map_translates_export_owners_back() {
+        let m = IdMap::from_podman_json(
+            r#"{"UidMap":["0:1:1000","1000:0:1","1001:1001:64536"],
+                "GidMap":["0:1:1000","1000:0:1","1001:1001:64536"]}"#,
+        )
+        .unwrap();
+        assert!(!m.is_identity());
+        assert_eq!(m.uid(1), 0, "export 1/1 is container root");
+        assert_eq!(m.gid(1), 0);
+        assert_eq!(m.uid(0), 1000, "export 0 is the keep-id user");
+        assert_eq!(m.uid(34), 33);
+        assert_eq!(m.uid(1000), 999);
+        assert_eq!(m.uid(1001), 1001);
+        assert_eq!(m.uid(65535), 65535);
+        assert_eq!(m.uid(70000), 70000, "outside every range: unchanged");
+    }
+
+    #[test]
+    fn idmap_identity_and_bad_input() {
+        for s in ["null", "{}", r#"{"UidMap":null,"GidMap":null}"#] {
+            assert!(IdMap::from_podman_json(s).unwrap().is_identity(), "{s}");
+        }
+        assert!(IdMap::from_podman_json(r#"{"UidMap":["0:0:65536"]}"#)
+            .unwrap()
+            .is_identity());
+        for bad in [
+            r#"{"UidMap":["0:1"]}"#,
+            r#"{"UidMap":["0:1:1000:5"]}"#,
+            r#"{"UidMap":["a:1:1000"]}"#,
+            r#"{"UidMap":["0:1:0"]}"#,
+            r#"{"UidMap":[7]}"#,
+            "not json",
+        ] {
+            assert!(IdMap::from_podman_json(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Needs root (lchown); skipped otherwise. setuid must survive chown.
+    #[test]
+    fn remapped_unpack_restores_owner_and_setuid() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if crate::euid() != 0 {
+            return;
+        }
+        let dest = std::env::temp_dir().join(format!("rp-oci-remap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut t = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_mode(0o4755);
+        hdr.set_size(0);
+        hdr.set_uid(1);
+        hdr.set_gid(1);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "sudo", std::io::empty()).unwrap();
+        let bytes = t.into_inner().unwrap();
+        let m =
+            IdMap::from_podman_json(r#"{"UidMap":["0:1:1000"],"GidMap":["0:1:1000"]}"#).unwrap();
+        unpack_tar_remapped(&bytes[..], &dest, &m).unwrap();
+        let md = std::fs::metadata(dest.join("sudo")).unwrap();
+        assert_eq!((md.uid(), md.gid()), (0, 0));
+        assert_eq!(md.permissions().mode() & 0o7777, 0o4755);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
     /// A whiteout under an in-rootfs symlink must NOT delete files outside
     /// the rootfs: layer1 plants `d` -> <outside>, layer2 carries
     /// `d/.wh.victim` — the real victim file must survive.
@@ -669,6 +875,35 @@ mod tests {
             dest.join("x/file").exists(),
             "x/.wh... must not delete x's parent chain"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn strip_setuid_clears_bits_default_keeps_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("rp-oci-suid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let keep = base.join("keep");
+        let strip = base.join("strip");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(&strip).unwrap();
+        let mut t = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_mode(0o4755);
+        hdr.set_size(1);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "bin/ping", std::io::Cursor::new(b"x"))
+            .unwrap();
+        let bytes = t.into_inner().unwrap();
+        unpack_tar(&bytes[..], &keep).unwrap();
+        unpack_tar_mode(&bytes[..], &strip, true).unwrap();
+        let mode = |p: &std::path::Path| {
+            std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+        };
+        assert_eq!(mode(&keep.join("bin/ping")) & 0o6000, 0o4000);
+        assert_eq!(mode(&strip.join("bin/ping")) & 0o6000, 0);
+        assert_eq!(mode(&strip.join("bin/ping")) & 0o755, 0o755);
         let _ = std::fs::remove_dir_all(&base);
     }
 

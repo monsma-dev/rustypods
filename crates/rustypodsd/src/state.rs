@@ -11,17 +11,61 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustypods_proto::{fmt_bytes, parse_bytes};
 
+/// On-disk conf schema this binary writes. Older files omit `format` and
+/// load as 1. A newer `format` is loaded but never rewritten: serde would
+/// drop unknown fields on save.
+pub const CONF_FORMAT: u32 = 1;
+
+fn default_format() -> u32 {
+    CONF_FORMAT
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(into = "LimitsToml")]
 pub struct LimitsSpec {
     pub memory_high_bytes: u64,
     pub memory_max_bytes: u64,
     pub cpu_quota_percent: u32,
+    /// systemd TasksMax on the pod scope. 0 = unset (existing pods).
+    /// New pods created by the daemon get [`DEFAULT_TASKS_MAX`].
+    pub tasks_max: u64,
 }
+
+/// Applied to every newly created pod unless the request already set one.
+pub const DEFAULT_TASKS_MAX: u64 = 4096;
 
 impl LimitsSpec {
     pub fn is_empty(&self) -> bool {
-        self.memory_high_bytes == 0 && self.memory_max_bytes == 0 && self.cpu_quota_percent == 0
+        self.memory_high_bytes == 0
+            && self.memory_max_bytes == 0
+            && self.cpu_quota_percent == 0
+            && self.tasks_max == 0
+    }
+
+    /// Fill defaults for a pod that does not exist on disk yet. Explicit
+    /// non-zero limits win. MemoryMax and CPUQuota are applied only when
+    /// `RUSTYPODS_DEFAULT_MEMORY_MAX` / `RUSTYPODS_DEFAULT_CPU` are set
+    /// (typically via `/etc/rustypods/daemon.env`). TasksMax is always set.
+    pub fn with_create_defaults(mut self) -> Self {
+        if self.tasks_max == 0 {
+            self.tasks_max = DEFAULT_TASKS_MAX;
+        }
+        if self.memory_max_bytes == 0 {
+            if let Ok(s) = std::env::var("RUSTYPODS_DEFAULT_MEMORY_MAX") {
+                if let Ok(b) = parse_bytes(s.trim()) {
+                    self.memory_max_bytes = b;
+                }
+            }
+        }
+        if self.cpu_quota_percent == 0 {
+            if let Ok(s) = std::env::var("RUSTYPODS_DEFAULT_CPU") {
+                let t = s.trim().trim_end_matches('%');
+                if let Ok(n) = t.parse::<u32>() {
+                    self.cpu_quota_percent = n;
+                }
+            }
+        }
+        self
     }
 }
 
@@ -32,6 +76,7 @@ struct LimitsToml {
     memory_high: String,
     memory_max: String,
     cpu_quota_percent: u32,
+    tasks_max: u64,
 }
 
 impl From<LimitsSpec> for LimitsToml {
@@ -48,6 +93,7 @@ impl From<LimitsSpec> for LimitsToml {
                 fmt_bytes(l.memory_max_bytes)
             },
             cpu_quota_percent: l.cpu_quota_percent,
+            tasks_max: l.tasks_max,
         }
     }
 }
@@ -65,6 +111,8 @@ struct LimitsTomlIn {
     memory_max_bytes: Option<u64>,
     #[serde(default)]
     cpu_quota_percent: Option<u32>,
+    #[serde(default)]
+    tasks_max: Option<u64>,
 }
 
 fn val_to_bytes(v: &toml::Value, key: &str) -> std::result::Result<u64, String> {
@@ -140,12 +188,15 @@ impl<'de> Deserialize<'de> for LimitsSpec {
             memory_high_bytes: conv(raw.memory_high, raw.memory_high_bytes, "memory_high")?,
             memory_max_bytes: conv(raw.memory_max, raw.memory_max_bytes, "memory_max")?,
             cpu_quota_percent: raw.cpu_quota_percent.unwrap_or(0),
+            tasks_max: raw.tasks_max.unwrap_or(0),
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {
+    #[serde(default = "default_format")]
+    pub format: u32,
     pub name: String,
     /// Human-readable origin, e.g. "distrobox:arch" or "oci:busybox:latest".
     pub source: String,
@@ -176,6 +227,24 @@ pub struct IngressSpec {
 /// A missing `private_users` key must mean ON: serde's default(false)
 /// would silently drop userns isolation on a hand-edited conf. Explicit
 /// `private_users = false` (stack members, desktop pods) still parses.
+pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 8;
+
+fn default_stop_timeout() -> u64 {
+    DEFAULT_STOP_TIMEOUT_SECS
+}
+
+/// Poweroff grace for a conf value. 0 means the historical 8s default.
+pub fn stop_grace(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(if secs == 0 {
+        DEFAULT_STOP_TIMEOUT_SECS
+    } else {
+        secs
+    })
+}
+
+/// A missing `private_users` key must mean ON: serde's default(false)
+/// would silently drop userns isolation on a hand-edited conf. Explicit
+/// `private_users = false` (stack members, desktop pods) still parses.
 fn default_true() -> bool {
     true
 }
@@ -200,10 +269,18 @@ pub struct HealthSpec {
     pub timeout_secs: u32,
     #[serde(default)]
     pub retries: u32,
+    /// exec probe identity (image passwd name or numeric uid). "" = pod
+    /// root in userns pods, nobody/65534 in pods without a user namespace
+    /// (root there is HOST root — set `user = "root"` explicitly to accept).
+    /// Conf-only for now; survives `config --healthcheck` updates.
+    #[serde(default)]
+    pub user: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
+    #[serde(default = "default_format")]
+    pub format: u32,
     pub name: String,
     pub image: String,
     pub created_unix: u64,
@@ -215,6 +292,17 @@ pub struct PodMeta {
     pub private_users: bool,
     #[serde(default)]
     pub started: bool,
+    /// User asked the pod to stay down (`rustypods stop`). Distinct from
+    /// `started`, which only means "was ever started" and drives the
+    /// Created/Stopped display. Survives daemon restart: the supervisor
+    /// and autostart leave the pod stopped until an explicit start
+    /// (unless-stopped). Absent in older confs → false.
+    #[serde(default)]
+    pub stopped_by_user: bool,
+    /// How long `stop` waits after SIGRTMIN+3 before TerminateMachine.
+    /// 0 and older confs use [`DEFAULT_STOP_TIMEOUT_SECS`] (8s).
+    #[serde(default = "default_stop_timeout")]
+    pub stop_timeout_secs: u64,
     /// Btrfs qgroup cap on the pod rootfs; 0 = none.
     /// Serialized as `storage_max = "20G"`.
     #[serde(default, with = "bytes_field")]
@@ -274,6 +362,22 @@ pub struct PodMeta {
     /// subvols under volumes/ that outlive the pod.
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Allow this pod to open new connections to host-local addresses
+    /// (including 127.0.0.1). Default false: pod root can otherwise
+    /// reach host loopback services via the veth (route_localnet).
+    #[serde(default)]
+    pub host_access: bool,
+    /// Drop forwarded traffic between this pod and other pod veths.
+    /// Pod egress to the outside and published ports still work.
+    #[serde(default)]
+    pub isolated: bool,
+    /// Exec sessions skip NO_NEW_PRIVS, so sudo/su work. In a pod without a
+    /// user namespace that means any process as the pod user can reach
+    /// HOST root through a setuid binary (distrobox sudoers is often
+    /// NOPASSWD). Conf-only: set it in the root-owned conf and `reload`.
+    /// Probes keep NO_NEW_PRIVS. Userns pods never set it.
+    #[serde(default)]
+    pub allow_setuid: bool,
 }
 
 /// A named volume: a btrfs subvolume under volumes/<name> that pods
@@ -281,8 +385,22 @@ pub struct PodMeta {
 /// registry survives daemon restarts even when the fs doesn't.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMeta {
+    #[serde(default = "default_format")]
+    pub format: u32,
     pub name: String,
     pub created_unix: u64,
+}
+
+/// A conf the daemon refused to serve. Its name and net_index stay
+/// reserved so a later pod cannot reuse them.
+#[derive(Debug, Clone)]
+pub struct QuarantinedConf {
+    pub name: String,
+    pub reason: String,
+    /// 0 when the file did not yield an index.
+    pub net_index: u32,
+    /// Volume specs when the file parsed far enough; empty otherwise.
+    pub volumes: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -290,6 +408,62 @@ pub struct State {
     pub images: BTreeMap<String, ImageMeta>,
     pub pods: BTreeMap<String, PodMeta>,
     pub volumes: BTreeMap<String, VolumeMeta>,
+    /// Pod confs excluded from serving (parse error, invariant breach).
+    pub quarantined: Vec<QuarantinedConf>,
+    /// net_index values owned by quarantined or unparsable pod confs.
+    pub reserved_net: std::collections::BTreeSet<u32>,
+}
+
+/// Lowest free index in 1..=255, treating `reserved` as taken. Mirrors
+/// `net::alloc_index` so a quarantined conf's /30 cannot be reissued
+/// without changing the net module's signature.
+pub fn alloc_net_index(
+    pods: &BTreeMap<String, PodMeta>,
+    reserved: &std::collections::BTreeSet<u32>,
+) -> u32 {
+    let mut used: std::collections::BTreeSet<u32> = pods
+        .values()
+        .map(|p| p.net_index)
+        .filter(|i| *i > 0)
+        .collect();
+    used.extend(reserved.iter().copied().filter(|i| *i > 0 && *i <= 255));
+    (1..=255).find(|i| !used.contains(i)).unwrap_or(0)
+}
+
+/// Best-effort `net_index = N` from a conf that did not parse as PodMeta.
+pub fn peek_net_index(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("net_index") else {
+            continue;
+        };
+        let rest = rest.trim_start().strip_prefix('=')?.trim();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        return digits.parse().ok();
+    }
+    None
+}
+
+/// Conf directories are 0700. The CLI and GUI talk to the daemon over
+/// gRPC; nothing non-root reads these files directly. Pod confs contain
+/// env, mesh.conf contains the WireGuard private key.
+pub fn secure_conf_dirs(data_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = [
+        rustypods_proto::conf_dir(data_dir),
+        pods_conf_dir(data_dir),
+        images_conf_dir(data_dir),
+        volumes_conf_dir(data_dir),
+    ];
+    for d in dirs {
+        std::fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", d.display()))?;
+    }
+    Ok(())
 }
 
 pub fn pods_conf_dir(data_dir: &Path) -> PathBuf {
@@ -306,13 +480,21 @@ fn image_conf(data_dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Atomic-ish write: tmp file + fsync + rename (+ dir sync so the rename
-/// itself survives a crash).
+/// itself survives a crash). The temp file is created mode 0600 — confs
+/// hold pod env — so a crash window is not world-readable either. Mode is
+/// set at open time, not via a later chmod.
 fn write_conf(path: &Path, body: &str) -> Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("conf.tmp");
     {
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(body.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
         f.sync_all()
@@ -337,22 +519,46 @@ fn volume_conf(data_dir: &Path, name: &str) -> std::path::PathBuf {
 }
 
 pub fn save_volume(data_dir: &Path, m: &VolumeMeta) -> Result<()> {
-    std::fs::create_dir_all(volumes_conf_dir(data_dir))?;
-    write_conf(&volume_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
+    secure_conf_dirs(data_dir)?;
+    let path = volume_conf(data_dir, &m.name);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
-pub fn remove_volume(data_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(volume_conf(data_dir, name));
+pub fn remove_volume(data_dir: &Path, name: &str) -> Result<()> {
+    remove_conf(&volume_conf(data_dir, name))
 }
 
 pub fn save_pod(data_dir: &Path, m: &PodMeta) -> Result<()> {
-    std::fs::create_dir_all(pods_conf_dir(data_dir))?;
-    write_conf(&pod_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
+    secure_conf_dirs(data_dir)?;
+    let path = pod_conf(data_dir, &m.name);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
 /// Multi-host mesh config (Wave I): the host's WG identity + static
 /// peers. One TOML file — not per-entity confs — because it's a single
 /// daemon-scoped object, not a registry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct MeshConf {
+    #[serde(default = "default_format")]
+    pub format: u32,
     /// base64 x25519 private key; "" = mesh not initialized.
     #[serde(default)]
     pub private_key: String,
@@ -375,30 +581,61 @@ fn default_mesh_port() -> u16 {
     51820
 }
 
+impl std::fmt::Debug for MeshConf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshConf")
+            .field("format", &self.format)
+            .field("private_key", &"<redacted>")
+            .field("listen_port", &self.listen_port)
+            .field("peers", &self.peers)
+            .finish()
+    }
+}
+
 fn mesh_conf_path(data_dir: &Path) -> std::path::PathBuf {
     rustypods_proto::conf_dir(data_dir).join("mesh.conf")
 }
 
-pub fn load_mesh(data_dir: &Path) -> Option<MeshConf> {
+/// Load the host mesh identity.
+///
+/// `Ok(None)` — no file, or a parsed file with an empty key (never
+/// initialized). `Err` — the file exists but cannot be read or parsed.
+/// Callers must not treat that as "no mesh" and mint a new key: the
+/// /48 is sha256(pubkey), so a fresh key silently breaks every peer.
+pub fn load_mesh(data_dir: &Path) -> Result<Option<MeshConf>> {
     let p = mesh_conf_path(data_dir);
-    let s = std::fs::read_to_string(p).ok()?;
-    let m: MeshConf = toml::from_str(&s).ok()?;
+    let s = match std::fs::read_to_string(&p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
+    };
+    let m: MeshConf = toml::from_str(&s).with_context(|| {
+        format!(
+            "{} is corrupt; fix or remove it before mesh init (a new key would change this host's /48 and break every peer)",
+            p.display()
+        )
+    })?;
     if m.private_key.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(m)
+    Ok(Some(m))
 }
 
 pub fn save_mesh(data_dir: &Path, m: &MeshConf) -> Result<()> {
-    std::fs::create_dir_all(rustypods_proto::conf_dir(data_dir))?;
-    // 0600 — the file holds the host's WG private key.
-    write_conf(&mesh_conf_path(data_dir), &toml::to_string_pretty(m)?)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        mesh_conf_path(data_dir),
-        std::fs::Permissions::from_mode(0o600),
-    )?;
-    Ok(())
+    secure_conf_dirs(data_dir)?;
+    // 0600 comes from write_conf — the file holds the host's WG private key.
+    let path = mesh_conf_path(data_dir);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
 
 /// `mesh deinit` — drop the persisted identity+peers so a daemon
@@ -412,14 +649,63 @@ pub fn remove_mesh(data_dir: &Path) -> Result<()> {
 }
 
 pub fn save_image(data_dir: &Path, m: &ImageMeta) -> Result<()> {
-    std::fs::create_dir_all(images_conf_dir(data_dir))?;
-    write_conf(&image_conf(data_dir, &m.name), &toml::to_string_pretty(m)?)
+    secure_conf_dirs(data_dir)?;
+    let path = image_conf(data_dir, &m.name);
+    refuse_newer_conf(&path)?;
+    if m.format > CONF_FORMAT {
+        anyhow::bail!(
+            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            path.display(),
+            m.format
+        );
+    }
+    let mut m = m.clone();
+    m.format = canonical_format(m.format)?;
+    write_conf(&path, &toml::to_string_pretty(&m)?)
 }
-pub fn remove_pod(data_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(pod_conf(data_dir, name));
+
+fn canonical_format(format: u32) -> Result<u32> {
+    if format > CONF_FORMAT {
+        anyhow::bail!(
+            "conf format {format} is newer than supported {CONF_FORMAT}; refusing to overwrite"
+        );
+    }
+    Ok(if format == 0 { CONF_FORMAT } else { format })
 }
-pub fn remove_image(data_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(image_conf(data_dir, name));
+
+/// A conf written by a newer daemon stays on disk untouched.
+fn refuse_newer_conf(path: &Path) -> Result<()> {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(v) = toml::from_str::<toml::Value>(&s) else {
+        return Ok(());
+    };
+    let fmt = v.get("format").and_then(|x| x.as_integer()).unwrap_or(1);
+    if fmt > CONF_FORMAT as i64 {
+        anyhow::bail!(
+            "{} format {fmt} is newer than supported {CONF_FORMAT}; refusing to overwrite (loaded read-only)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+pub fn remove_pod(data_dir: &Path, name: &str) -> Result<()> {
+    remove_conf(&pod_conf(data_dir, name))
+}
+pub fn remove_image(data_dir: &Path, name: &str) -> Result<()> {
+    remove_conf(&image_conf(data_dir, name))
+}
+
+fn remove_conf(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            tracing::error!("failed to remove {}: {e}", path.display());
+            Err(e).with_context(|| format!("remove {}", path.display()))
+        }
+    }
 }
 
 /// Conf sanity beyond TOML parsing — applied at boot (scan) and on
@@ -517,18 +803,22 @@ fn scan<T: for<'de> Deserialize<'de>>(
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        match std::fs::read_to_string(&p)
-            .ok()
-            .and_then(|s| toml::from_str::<T>(&s).ok())
-        {
-            Some(m) => {
+        let text = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("conf {} skipped (read error: {e})", p.display());
+                continue;
+            }
+        };
+        match toml::from_str::<T>(&text) {
+            Ok(m) => {
                 if let Err(e) = check(&m, &stem) {
                     tracing::warn!("conf {} skipped ({e:#})", p.display());
                     continue;
                 }
                 out.insert(name_of(&m).to_string(), m);
             }
-            None => tracing::warn!("conf {} skipped (parse error)", p.display()),
+            Err(e) => tracing::warn!("conf {} skipped (parse error: {e})", p.display()),
         }
     }
 }
@@ -560,12 +850,7 @@ fn check_image_meta(m: &ImageMeta, stem: &str) -> Result<()> {
 pub fn load(data_dir: &Path) -> Result<State> {
     migrate_json(data_dir);
     let mut st = State::default();
-    scan(
-        &pods_conf_dir(data_dir),
-        &mut st.pods,
-        |m: &PodMeta| m.name.as_str(),
-        |m, stem| check_pod_meta(m, stem, false),
-    );
+    scan_pods(data_dir, &mut st);
     scan(
         &images_conf_dir(data_dir),
         &mut st.images,
@@ -578,57 +863,140 @@ pub fn load(data_dir: &Path) -> Result<State> {
         |m: &VolumeMeta| m.name.as_str(),
         check_volume_meta,
     );
-    // Ingress hostnames are globally unique — a hand-edited conf pair
-    // claiming the same host would silently split traffic between pods,
-    // so a cross-conf collision aborts startup (fail closed). A single
-    // malformed conf is still just skipped+warned above.
-    let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
+    // Ingress hostnames are globally unique. A colliding conf is
+    // quarantined (not served) instead of aborting startup — a restart
+    // loop helps nobody, and the name/net_index stay reserved.
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    let mut drop_pods: Vec<(String, String)> = Vec::new();
     for m in st.pods.values() {
         for i in &m.ingress {
-            if let Some(other) = claimed.insert(i.host.as_str(), m.name.as_str()) {
-                anyhow::bail!(
-                    "ingress host '{}' is claimed by both pod {} and pod {}",
-                    i.host,
-                    other,
-                    m.name
-                );
+            if let Some(other) = claimed.get(&i.host) {
+                drop_pods.push((
+                    m.name.clone(),
+                    format!("ingress host '{}' is also claimed by pod {other}", i.host),
+                ));
+                break;
             }
+            claimed.insert(i.host.clone(), m.name.clone());
         }
     }
-    // Exactly one managed ingress gateway may exist, and only under the
-    // reserved name — a hand-edited conf claiming the flag elsewhere
-    // would hijack the managed role, so abort startup (fail closed).
-    let gateways: Vec<&str> = st
+    for (name, reason) in drop_pods {
+        quarantine_pod(&mut st, &name, reason);
+    }
+    // Exactly one managed ingress gateway, and only under the reserved
+    // name. Offenders are quarantined; a valid gateway stays up.
+    let bad_gateways: Vec<String> = st
         .pods
         .values()
-        .filter(|m| m.ingress_gateway)
-        .map(|m| m.name.as_str())
+        .filter(|m| m.ingress_gateway && m.name != rustypods_proto::INGRESS_POD)
+        .map(|m| m.name.clone())
         .collect();
-    for name in &gateways {
-        if *name != rustypods_proto::INGRESS_POD {
-            anyhow::bail!(
-                "pod {name} claims ingress_gateway but only {} may hold it",
+    for name in bad_gateways {
+        quarantine_pod(
+            &mut st,
+            &name,
+            format!(
+                "claims ingress_gateway but only {} may hold it",
                 rustypods_proto::INGRESS_POD
-            );
-        }
-    }
-    if gateways.len() > 1 {
-        anyhow::bail!(
-            "multiple pods claim ingress_gateway ({})",
-            gateways.join(", ")
+            ),
         );
     }
-    // …and the reserved name may ONLY be the gateway: an ordinary pod
-    // conf squatting on it would shadow the managed one.
     if let Some(m) = st.pods.get(rustypods_proto::INGRESS_POD) {
         if !m.ingress_gateway {
-            anyhow::bail!(
-                "pod {} must be the managed ingress gateway (ingress_gateway = true) — the name is reserved",
-                rustypods_proto::INGRESS_POD
+            quarantine_pod(
+                &mut st,
+                rustypods_proto::INGRESS_POD,
+                "name is reserved for the managed ingress gateway".into(),
             );
         }
     }
     Ok(st)
+}
+
+fn quarantine_pod(st: &mut State, name: &str, reason: String) {
+    let Some(m) = st.pods.remove(name) else {
+        return;
+    };
+    if m.net_index > 0 {
+        st.reserved_net.insert(m.net_index);
+    }
+    tracing::error!("quarantine pod {}: {reason}", m.name);
+    st.quarantined.push(QuarantinedConf {
+        name: m.name,
+        reason,
+        net_index: m.net_index,
+        volumes: m.volumes,
+    });
+}
+
+/// Pod confs: a parse or check failure quarantines the file (name and
+/// net_index reserved) instead of treating its /30 as free.
+fn scan_pods(data_dir: &Path, st: &mut State) {
+    let dir = pods_conf_dir(data_dir);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("conf") {
+            continue;
+        }
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            tracing::error!("quarantine pod {stem}: unreadable {}", p.display());
+            hold_unparsed(st, &stem, 0, format!("unreadable {}", p.display()));
+            continue;
+        };
+        match toml::from_str::<PodMeta>(&text) {
+            Ok(m) => match check_pod_meta(&m, &stem, false) {
+                Ok(()) => {
+                    st.pods.insert(m.name.clone(), m);
+                }
+                Err(err) => {
+                    let idx = m.net_index;
+                    let volumes = m.volumes.clone();
+                    let name = if m.name.is_empty() {
+                        stem.clone()
+                    } else {
+                        m.name.clone()
+                    };
+                    tracing::error!("quarantine pod {name}: {err:#}");
+                    if idx > 0 {
+                        st.reserved_net.insert(idx);
+                    }
+                    st.quarantined.push(QuarantinedConf {
+                        name,
+                        reason: format!("{err:#}"),
+                        net_index: idx,
+                        volumes,
+                    });
+                }
+            },
+            Err(err) => {
+                let idx = peek_net_index(&text).unwrap_or(0);
+                tracing::error!("quarantine pod {stem}: parse error: {err}");
+                hold_unparsed(st, &stem, idx, format!("parse error: {err}"));
+            }
+        }
+    }
+}
+
+fn hold_unparsed(st: &mut State, name: &str, net_index: u32, reason: String) {
+    if net_index > 0 && net_index <= 255 {
+        st.reserved_net.insert(net_index);
+    }
+    if !name.is_empty() {
+        st.quarantined.push(QuarantinedConf {
+            name: name.to_string(),
+            reason,
+            net_index,
+            volumes: vec![],
+        });
+    }
 }
 
 // --- one-time migration from the central state.json ---------------------------
@@ -690,6 +1058,7 @@ fn migrate_json(data_dir: &Path) {
             continue;
         }
         let m = ImageMeta {
+            format: CONF_FORMAT,
             name: i.name.clone(),
             source: i.source.clone(),
             created_unix: i.created_unix,
@@ -708,6 +1077,7 @@ fn migrate_json(data_dir: &Path) {
             continue;
         }
         let m = PodMeta {
+            format: CONF_FORMAT,
             name: p.name.clone(),
             image: p.image.clone(),
             created_unix: p.created_unix,
@@ -715,11 +1085,14 @@ fn migrate_json(data_dir: &Path) {
                 memory_high_bytes: p.limits.memory_high_bytes,
                 memory_max_bytes: p.limits.memory_max_bytes,
                 cpu_quota_percent: p.limits.cpu_quota_percent,
+                tasks_max: 0,
             },
             ephemeral: p.ephemeral,
             private_users: p.private_users,
             // started is volatile; running state comes from machined live.
             started: false,
+            stopped_by_user: false,
+            stop_timeout_secs: 0,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![],
@@ -735,6 +1108,9 @@ fn migrate_json(data_dir: &Path) {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
+            isolated: false,
+            allow_setuid: false,
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");
@@ -742,6 +1118,121 @@ fn migrate_json(data_dir: &Path) {
     }
     let _ = std::fs::rename(&f, f.with_extension("json.migrated"));
     tracing::info!("state.json migrated to conf/*.conf");
+}
+
+/// What startup should do with one name under the pods directory.
+/// Deletes are only planned for trees that are no longer the sole copy
+/// (spent `.rollback-old` after the live rootfs is back, or `.rollback-new`
+/// staging once a rootfs exists).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootfsAction {
+    Rename {
+        from: String,
+        to: String,
+    },
+    Delete {
+        name: String,
+    },
+    /// Logged, data left in place.
+    Report {
+        message: String,
+    },
+}
+
+/// Plan startup repair from directory basenames plus the set of pod names
+/// that have a loadable conf. `.import-*` / `.export-*` are ignored (the
+/// transfer path owns them). `.rollback-old` is restored when it is the
+/// only rootfs, and never deleted until a live rootfs exists.
+pub fn plan_rootfs_reconcile(
+    entries: &[String],
+    conf_names: &std::collections::BTreeSet<String>,
+) -> Vec<RootfsAction> {
+    let mut present: std::collections::BTreeSet<String> = entries.iter().cloned().collect();
+    let mut actions = Vec::new();
+    let olds: Vec<String> = present
+        .iter()
+        .filter(|n| n.ends_with(".rollback-old"))
+        .cloned()
+        .collect();
+    for old in olds {
+        let stem = old.trim_end_matches(".rollback-old").to_string();
+        if stem.is_empty() || present.contains(&stem) {
+            actions.push(RootfsAction::Delete { name: old.clone() });
+        } else {
+            actions.push(RootfsAction::Rename {
+                from: old.clone(),
+                to: stem.clone(),
+            });
+            present.insert(stem);
+        }
+        present.remove(&old);
+    }
+    let news: Vec<String> = present
+        .iter()
+        .filter(|n| n.ends_with(".rollback-new"))
+        .cloned()
+        .collect();
+    for staging in news {
+        let stem = staging.trim_end_matches(".rollback-new").to_string();
+        if stem.is_empty() || present.contains(&stem) {
+            actions.push(RootfsAction::Delete {
+                name: staging.clone(),
+            });
+        } else {
+            // A lone staging tree may be a half-finished clone (the
+            // reflink fallback copies file by file); never promote it
+            // to the live rootfs unattended.
+            actions.push(RootfsAction::Report {
+                message: format!(
+                    "'{staging}' has no live rootfs next to it — possibly an interrupted rollback clone; left in place, inspect and rename to '{stem}' by hand"
+                ),
+            });
+        }
+        present.remove(&staging);
+    }
+    let mut orphans: Vec<String> = present
+        .iter()
+        .filter(|n| {
+            !n.starts_with(".import-")
+                && !n.starts_with(".export-")
+                && !n.ends_with(".orphan")
+                && !n.contains(".orphan-")
+                && !conf_names.contains(n.as_str())
+        })
+        .cloned()
+        .collect();
+    orphans.sort();
+    for name in orphans {
+        let mut dest = format!("{name}.orphan");
+        if present.contains(&dest) {
+            dest = format!("{name}.orphan-{}", now_unix());
+        }
+        if present.contains(&dest) {
+            actions.push(RootfsAction::Report {
+                message: format!(
+                    "orphan rootfs '{name}' left in place — quarantine name '{dest}' is taken"
+                ),
+            });
+        } else {
+            actions.push(RootfsAction::Rename {
+                from: name.clone(),
+                to: dest.clone(),
+            });
+            present.insert(dest);
+        }
+        present.remove(&name);
+    }
+    let mut missing: Vec<&String> = conf_names
+        .iter()
+        .filter(|n| !present.contains(*n))
+        .collect();
+    missing.sort();
+    for name in missing {
+        actions.push(RootfsAction::Report {
+            message: format!("pod '{name}' has a conf but no rootfs"),
+        });
+    }
+    actions
 }
 
 pub fn now_unix() -> u64 {
@@ -753,18 +1244,75 @@ pub fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn unparsable_conf_reserves_net_index() {
+        let dir = std::env::temp_dir().join(format!("rp-q-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(pods_conf_dir(&dir)).unwrap();
+        std::fs::write(
+            pods_conf_dir(&dir).join("broken.conf"),
+            "name = \"broken\"\nimage = \"img\"\ncreated_unix = 1\nnet_index = 7\nthis is not toml\n",
+        )
+        .unwrap();
+        assert_eq!(peek_net_index("net_index = 7\n"), Some(7));
+        let st = load(&dir).unwrap();
+        assert!(st.pods.is_empty());
+        assert!(st.reserved_net.contains(&7));
+        assert!(st.quarantined.iter().any(|q| q.name == "broken"));
+        let mut pods = BTreeMap::new();
+        pods.insert(
+            "ok".into(),
+            PodMeta {
+                format: CONF_FORMAT,
+                name: "ok".into(),
+                image: "img".into(),
+                created_unix: 0,
+                limits: Default::default(),
+                ephemeral: false,
+                private_users: true,
+                started: false,
+                stopped_by_user: false,
+                stop_timeout_secs: 0,
+                storage_max_bytes: 0,
+                ports: vec![],
+                ingress: vec![],
+                net_index: 1,
+                stack: String::new(),
+                binds: vec![],
+                cmd: vec![],
+                snap_keep_last: 0,
+                snap_max_age_secs: 0,
+                autostart: false,
+                ingress_gateway: false,
+                restart: String::new(),
+                healthcheck: Default::default(),
+                env: vec![],
+                volumes: vec![],
+                host_access: false,
+                isolated: false,
+                allow_setuid: false,
+            },
+        );
+        assert_ne!(alloc_net_index(&pods, &st.reserved_net), 7);
+        assert_ne!(alloc_net_index(&pods, &st.reserved_net), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn volume_meta_roundtrip_and_adoption() {
         let dir = std::env::temp_dir().join(format!("rustypods-vol-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let v = VolumeMeta {
+            format: CONF_FORMAT,
             name: "pgdata".into(),
             created_unix: 42,
         };
         save_volume(&dir, &v).unwrap();
         let st = load(&dir).unwrap();
         assert_eq!(st.volumes["pgdata"].created_unix, 42);
-        remove_volume(&dir, "pgdata");
+        remove_volume(&dir, "pgdata").unwrap();
         let st = load(&dir).unwrap();
         assert!(st.volumes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -776,7 +1324,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // A minimal legacy conf (pre-Wave-E) must load with env/volumes
         // defaulting to empty.
-        let pod = PodMeta {
+        let mut pod = PodMeta {
+            format: CONF_FORMAT,
             name: "legacy".into(),
             image: "img".into(),
             created_unix: 0,
@@ -793,12 +1342,17 @@ mod tests {
             autostart: false,
             cmd: vec![],
             started: false,
+            stopped_by_user: false,
+            stop_timeout_secs: 0,
             ingress: vec![],
             ingress_gateway: false,
             restart: String::new(),
             healthcheck: Default::default(),
             env: vec!["A=1".into(), "B=two=parts".into()],
             volumes: vec!["data:/data".into(), "cfg:/etc/app:ro".into()],
+            host_access: false,
+            isolated: false,
+            allow_setuid: false,
         };
         save_pod(&dir, &pod).unwrap();
         let st = load(&dir).unwrap();
@@ -808,6 +1362,7 @@ mod tests {
         // Bad env / bad volume specs in a hand-edited conf are rejected
         // by the boot-time scan too.
         let bad = PodMeta {
+            format: CONF_FORMAT,
             env: vec!["NOEQ".into()],
             ..pod.clone()
         };
@@ -825,13 +1380,20 @@ mod tests {
         let st = load(&dir).unwrap();
         assert!(st.pods["old"].env.is_empty());
         assert!(st.pods["old"].volumes.is_empty());
+        assert!(!st.pods["old"].stopped_by_user);
+        pod.stopped_by_user = true;
+        save_pod(&dir, &pod).unwrap();
+        let st = load(&dir).unwrap();
+        assert!(st.pods["legacy"].stopped_by_user);
+        assert_eq!(st.pods["old"].stop_timeout_secs, DEFAULT_STOP_TIMEOUT_SECS);
+        assert_eq!(stop_grace(0).as_secs(), 8);
+        assert_eq!(stop_grace(30).as_secs(), 30);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    use super::*;
-
     fn meta(name: &str, host: &str) -> PodMeta {
         PodMeta {
+            format: CONF_FORMAT,
             name: name.into(),
             image: "img".into(),
             created_unix: 0,
@@ -839,6 +1401,8 @@ mod tests {
             ephemeral: false,
             private_users: true,
             started: false,
+            stopped_by_user: false,
+            stop_timeout_secs: 0,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![IngressSpec {
@@ -857,6 +1421,9 @@ mod tests {
             healthcheck: Default::default(),
             env: vec![],
             volumes: vec![],
+            host_access: false,
+            isolated: false,
+            allow_setuid: false,
         }
     }
 
@@ -876,6 +1443,7 @@ mod tests {
             interval_secs: 15,
             timeout_secs: 2,
             retries: 5,
+            user: String::new(),
         };
         save_pod(&dir, &m).unwrap();
         let back = load_pod(&dir, "hc").unwrap();
@@ -895,6 +1463,22 @@ mod tests {
         let old = load_pod(&dir, "legacy").unwrap();
         assert_eq!(old.restart, "");
         assert_eq!(old.healthcheck.kind, "");
+        // A [healthcheck] table written before `user` existed loads with
+        // "" (→ probe identity chosen by userns mode), and an explicit
+        // user round-trips.
+        let pre_user = dir.join("conf").join("pods").join("preuser.conf");
+        std::fs::write(
+            &pre_user,
+            "name = 'preuser'\nimage = 'img'\ncreated_unix = 0\n\
+             [healthcheck]\nkind = 'exec'\nargv = ['true']\n",
+        )
+        .unwrap();
+        let pu = load_pod(&dir, "preuser").unwrap();
+        assert_eq!(pu.healthcheck.kind, "exec");
+        assert_eq!(pu.healthcheck.user, "");
+        m.healthcheck.user = "nobody".into();
+        save_pod(&dir, &m).unwrap();
+        assert_eq!(load_pod(&dir, "hc").unwrap().healthcheck.user, "nobody");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -909,8 +1493,10 @@ mod tests {
         save_pod(&dir, &meta("a", "a.rustypods.localhost")).unwrap();
         assert!(load(&dir).is_ok(), "distinct hosts must load");
         save_pod(&dir, &meta("b", "a.rustypods.localhost")).unwrap();
-        let e = load(&dir).expect_err("shared host must abort load");
-        assert!(e.to_string().contains("a.rustypods.localhost"));
+        let st = load(&dir).expect("collision quarantines, does not abort");
+        assert!(st.pods.contains_key("a"));
+        assert!(!st.pods.contains_key("b"));
+        assert!(st.quarantined.iter().any(|q| q.name == "b"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -937,14 +1523,21 @@ mod tests {
         bad.ingress.clear();
         bad.ingress_gateway = true;
         save_pod(&dir, &bad).unwrap();
-        assert!(load(&dir).is_err(), "gateway flag on wrong name");
+        let st = load(&dir).unwrap();
+        assert!(st.pods.contains_key("rustypods-ingress"));
+        assert!(
+            !st.pods.contains_key("evil"),
+            "wrong-name gateway is quarantined"
+        );
         std::fs::remove_file(dir.join("conf/pods/evil.conf")).unwrap();
 
-        // Reserved name without the flag → fail.
+        // Reserved name without the flag → quarantine, daemon still loads.
         let mut squatter = meta("rustypods-ingress", "");
         squatter.ingress.clear();
         save_pod(&dir, &squatter).unwrap();
-        assert!(load(&dir).is_err(), "reserved name without gateway flag");
+        let st = load(&dir).unwrap();
+        assert!(!st.pods.contains_key("rustypods-ingress"));
+        assert!(st.quarantined.iter().any(|q| q.name == "rustypods-ingress"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -953,8 +1546,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rp-mesh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Absent file → None (mesh never initialized).
-        assert!(load_mesh(&dir).is_none());
+        assert!(load_mesh(&dir).unwrap().is_none());
         let conf = MeshConf {
+            format: CONF_FORMAT,
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             listen_port: 51820,
             peers: vec![MeshPeerConf {
@@ -970,13 +1564,130 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "mesh.conf holds a private key");
-        let back = load_mesh(&dir).unwrap();
+        let back = load_mesh(&dir).unwrap().unwrap();
         assert_eq!(back.private_key, conf.private_key);
         assert_eq!(back.peers.len(), 1);
         assert_eq!(back.peers[0].endpoint, "192.0.2.1:51820");
         // Empty key = uninitialized even if the file exists.
         save_mesh(&dir, &MeshConf::default()).unwrap();
-        assert!(load_mesh(&dir).is_none());
+        assert!(load_mesh(&dir).unwrap().is_none());
+        // Debug must not leak the private key.
+        let shown = format!("{:?}", conf);
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains(&conf.private_key));
+        // A truncated file is an error, not "uninitialized".
+        std::fs::write(dir.join("conf/mesh.conf"), "private_key = \"abc\n").unwrap();
+        let err = load_mesh(&dir).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_defaults_explicit_override_and_newer_format_is_readonly() {
+        std::env::set_var("RUSTYPODS_DEFAULT_MEMORY_MAX", "64M");
+        std::env::set_var("RUSTYPODS_DEFAULT_CPU", "50%");
+        let d = LimitsSpec::default().with_create_defaults();
+        assert_eq!(d.tasks_max, DEFAULT_TASKS_MAX);
+        assert_eq!(d.memory_max_bytes, 64 << 20);
+        assert_eq!(d.cpu_quota_percent, 50);
+        let custom = LimitsSpec {
+            memory_max_bytes: 1,
+            cpu_quota_percent: 10,
+            tasks_max: 3,
+            ..LimitsSpec::default()
+        }
+        .with_create_defaults();
+        assert_eq!(custom.memory_max_bytes, 1);
+        assert_eq!(custom.cpu_quota_percent, 10);
+        assert_eq!(custom.tasks_max, 3);
+        std::env::remove_var("RUSTYPODS_DEFAULT_MEMORY_MAX");
+        std::env::remove_var("RUSTYPODS_DEFAULT_CPU");
+        let bare = LimitsSpec::default().with_create_defaults();
+        assert_eq!(bare.tasks_max, DEFAULT_TASKS_MAX);
+        assert_eq!(bare.memory_max_bytes, 0);
+        assert_eq!(bare.cpu_quota_percent, 0);
+
+        let dir = std::env::temp_dir().join(format!("rp-fmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(pods_conf_dir(&dir)).unwrap();
+        std::fs::write(
+            pod_conf(&dir, "old"),
+            "name = \"old\"\nimage = \"img\"\ncreated_unix = 1\n",
+        )
+        .unwrap();
+        let st = load(&dir).unwrap();
+        assert_eq!(st.pods["old"].format, CONF_FORMAT);
+        assert_eq!(st.pods["old"].limits.tasks_max, 0);
+        std::fs::write(
+            pod_conf(&dir, "new"),
+            "format = 9\nname = \"new\"\nimage = \"img\"\ncreated_unix = 1\nextra_future = true\n",
+        )
+        .unwrap();
+        let st = load(&dir).unwrap();
+        assert_eq!(st.pods["new"].format, 9);
+        let err = save_pod(&dir, &st.pods["new"]).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:#}");
+        let raw = std::fs::read_to_string(pod_conf(&dir, "new")).unwrap();
+        assert!(raw.contains("extra_future"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(pods_conf_dir(&dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rootfs_reconcile_restores_rollback_and_quarantines_orphans() {
+        let conf = ["web".to_string(), "ghost".to_string()]
+            .into_iter()
+            .collect();
+        let entries = vec![
+            "web.rollback-old".into(),
+            "web.rollback-new".into(),
+            "db".into(),
+            ".import-abc".into(),
+            ".export-xyz".into(),
+        ];
+        let actions = plan_rootfs_reconcile(&entries, &conf);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Rename { from, to }
+                if from == "web.rollback-old" && to == "web"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Delete { name } if name == "web.rollback-new"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Rename { from, to } if from == "db" && to == "db.orphan"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RootfsAction::Report { message } if message.contains("ghost")
+        )));
+        assert!(!actions.iter().any(|a| format!("{a:?}").contains("import")));
+        assert!(!actions.iter().any(|a| format!("{a:?}").contains("export")));
+        // Both the live rootfs and the backup: do not delete the live tree.
+        let both = plan_rootfs_reconcile(&["web".into(), "web.rollback-old".into()], &conf);
+        assert!(both.iter().any(|a| matches!(
+            a,
+            RootfsAction::Delete { name } if name == "web.rollback-old"
+        )));
+        assert!(!both.iter().any(|a| matches!(
+            a,
+            RootfsAction::Delete { name } if name == "web"
+        )));
+        let lone = plan_rootfs_reconcile(&["web.rollback-new".into()], &conf);
+        assert!(lone.iter().any(|a| matches!(
+            a,
+            RootfsAction::Report { message } if message.contains("web.rollback-new")
+        )));
+        assert!(!lone
+            .iter()
+            .any(|a| matches!(a, RootfsAction::Rename { .. } | RootfsAction::Delete { .. })));
     }
 }

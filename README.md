@@ -20,7 +20,7 @@ dataplane: /dev/shm/rustypods/<pod>/  ──bind──>  /run/rustypods/shm/  (m
 channel:   /var/lib/rustypods/run/<pod>/agent.sock ──bind──> /run/rustypods/run/
 network:   pods with --port get a private netns: ve-<pod> (10.220.<idx>.1/30) ↔ host0 (10.220.<idx>.2/30)
 stacks:    all members share ONE named netns (rustypods-<stack>) — 127.0.0.1 is shared, K8s-pod style
-remote:    rustypods --remote user@host … — gRPC over `ssh … socat - UNIX-CONNECT:` (no extra ports)
+remote:    rustypods --remote user@host … — gRPC over `ssh … rustypods stdio-bridge` (socat fallback)
 ```
 
 - `crates/rustypods-proto` — gRPC contract + shared helpers
@@ -57,7 +57,7 @@ Supported distro families — the installer maps each to its package set
 | --- | --- | --- |
 | Debian/Ubuntu | Debian, Ubuntu, Mint, Pop!_OS, Neon, Raspbian, Kali | runtime + deployment live-tested on Debian 13 |
 | Fedora | Fedora 44 | full runtime + deployment live-tested under KVM with SELinux Enforcing, Btrfs, cgroup v2 |
-| RHEL family | RHEL, CentOS, Alma, Rocky, Oracle | package mapping checked; runtime/SELinux unverified |
+| RHEL family | RHEL, CentOS, Alma, Rocky, Oracle | required packages mapped; `btrfs-progs` is optional (not in RHEL 8/9 repos — reflink fallback). Runtime/SELinux still unverified |
 | Arch | Arch, Manjaro, EndeavourOS, CachyOS | distro detection + installer dry-run validated; runtime unverified |
 
 Release artifacts are currently built from source and should be compiled
@@ -70,10 +70,33 @@ On Arch-family systems the package database and installed packages must
 be current before installing (`pacman -Syu`) — the installer deliberately
 uses `pacman -S`, never `-Sy`, to avoid partial upgrades.
 
+On the RHEL family the installer does **not** fail the transaction when
+`btrfs-progs` is absent (Alma/RHEL/Rocky 8 and 9 do not ship it). It
+installs the required set (`systemd-container`, `nftables`, `iproute`,
+`util-linux`, `socat`) and warns that the reflink fallback will be used.
+If `dnf` cannot see `socat` or `systemd-container`, enable CRB (RHEL 9)
+or PowerTools (RHEL 8) and EPEL yourself — the installer does not enable
+repos. `--dry-run` prints that decision.
+
+SELinux: `rustypods doctor` reports the mode and the context of
+`/var/lib/rustypods`. Fedora 44 was validated enforcing with the default
+`var_lib_t`. Other policies are unverified. `--selinux-label` is opt-in:
+it runs `semanage fcontext` + `restorecon` (needs
+`policycoreutils-python-utils`) and is a no-op when SELinux is off.
+
 Unsupported distro: install the packages manually and re-run with
 `--skip-packages`. `--dry-run` prints the detected family, target
 user/uid, package commands and every path it would touch, without
-changing anything.
+changing anything and without root.
+
+Uninstall: `sudo bash scripts/uninstall-daemon.sh` stops and disables the
+unit, runs `rustypodsd teardown-net` (or deletes the nft tables and
+`rustypods-forward*` / `rustypods-mesh-*` rules), removes binaries, the
+unit, the polkit rule, `/etc/rustypods`, and the ingress CA from the host
+trust store. It prints `ip_forward`, IPv6 forwarding, and `accept_ra`
+and does **not** revert them. `/var/lib/rustypods` is kept unless
+`--purge-data` is passed, and `--purge-data` is refused while a pod is
+running. `--dry-run` needs no root.
 
 The daemon's allowed non-root uid goes in `/etc/rustypods/daemon.env`
 (written by the installer); the unit's `Environment=` default is 1000.
@@ -109,11 +132,21 @@ rustypods commit dev "pre-upgrade"        # instant rootfs snapshot — the time
 rustypods snapshots dev
 rustypods rollback dev                    # or: --to <id>; swaps rootfs, pod ends stopped
 rustypods destroy dev                     # also removes its snapshots
-rustypods --remote user@server ps         # manage a remote daemon over SSH (needs socat there)
+rustypods --remote user@server ps         # SSH; remote rustypods stdio-bridge, or socat if the CLI is old
 ```
 
 Handy flags: `start --ephemeral` (throwaway run, `-x`) and
 `start --no-private-users` (drops the user namespace; persisted to the conf).
+
+### Mesh
+
+`rustypods mesh init` creates `conf/mesh.conf` (mode 0600, holds the
+WireGuard private key) and a stable ULA /48. Peers are added with
+`mesh add-peer`. There is no in-band key rotation: `mesh deinit` (or
+remove a corrupt `conf/mesh.conf` by hand) on every host, then `mesh
+init` and re-add peers with the new pubkeys. `mesh init` will not
+replace a file it cannot parse — that would mint a new /48 and break
+every peer. `mesh status` shows that parse error when the mesh is down.
 
 ## Bind mounts & sandboxing
 
@@ -145,6 +178,24 @@ namespace. They join a pre-made shared netns via
 the netns's owning userns (init_user_ns) — a pick-userns child never has
 that, so the pod can't even boot. Standalone `create` pods do get userns.
 
+**Pods without a user namespace are for trusted code only.** Root inside
+such a pod (`--desktop`, `--no-private-users`, stack members) *is* host
+uid 0 — confined by nspawn's mount/pid/net namespaces and its default
+capability set, not by a userns. `rustypods shell`/`exec`/`cp` therefore
+refuse an unspecified user there and require an explicit `--user root`
+(logged as a warning on the daemon); the default `--user $USER` path runs
+as that unprivileged user with `NO_NEW_PRIVS` set, so `sudo` inside such
+a session does not work — use `--user root` instead. Exec healthchecks in
+these pods default to `nobody` (see below).
+
+A trusted dev pod that needs `sudo`/`yay` in its sessions can opt out per
+pod: add `allow_setuid = true` to `/var/lib/rustypods/conf/pods/<pod>.conf`
+(root-only, so this takes sudo) and run `rustypods reload <pod>`. `ps`
+then shows `setuid(host-root)`. Any process running as the pod user can
+then become host root through sudo, and distrobox sets up passwordless
+sudo. Health probes keep `NO_NEW_PRIVS`, and an untrusted `load` clears
+the flag.
+
 ## Storage quotas (btrfs qgroups)
 
 ```bash
@@ -161,24 +212,52 @@ limits are re-applied at every pod start.
 
 ```bash
 rustypods create web --image arch-base --port 18080:80 --port 53:53/udp
+# those two bind 127.0.0.1 only. To publish on every host address:
+rustypods create web --image arch-base --port 0.0.0.0:18080:80
+# or on one address: --port 192.0.2.10:18080:80
+# IPv6 host addresses go in brackets: --port [2001:db8::10]:18080:80
 ```
 
-Any pod with `--port` gets a private network namespace (`--network-veth`):
-host side `ve-<pod>` gets `10.220.<idx>.1/30`, the pod's `host0` gets a static
-`10.220.<idx>.2/30` (written into the rootfs before boot; index is stable per
-pod). The daemon manages its own `ip rustypods` nftables table:
+**Default bind is loopback.** A spec without a host address
+(`[hostIp:]hostPort:podPort[/tcp|/udp]`) publishes on **127.0.0.1 only**.
+`0.0.0.0:host:pod` is the explicit "every IPv4 address" form. This is
+intentional: `-p 5432:5432` must not open Postgres on the public zone
+just because the pod exists. The CLI prints a one-line notice when it
+creates an implicit loopback publish.
 
-- DNAT `host:port → pod:port` in prerouting + output (external *and*
-  localhost clients work)
+Any pod with `--port` gets a private network namespace (`--network-veth`):
+host side `ve-<pod>` gets `<pool>.<idx>.1/30`, the pod's `host0` gets a static
+`<pool>.<idx>.2/30` (written into the rootfs before boot; index is stable per
+pod). The pool defaults to `10.220.0.0/16` and `fd22:220::/32` (255 pods).
+Override it with `RUSTYPODS_POD_NET4` and `RUSTYPODS_POD_NET6` on the
+daemon if those ranges collide with a VPN; `doctor` warns when the v4
+pool overlaps an existing host route. The daemon manages its own `ip rustypods` nftables table:
+
+- DNAT matches `ip daddr <hostIp>`. Loopback publishes are **output-hook
+  only** (a prerouting rule cannot see them and must not exist).
+  `0.0.0.0` uses `fib daddr type local` in prerouting and output.
 - SNAT of host-originated traffic to the veth address (otherwise the pod
   would answer 127.0.0.1 on *its* loopback)
 - masquerade for pod egress
+- foreign FORWARD chains get marker accepts for DNATed flows, established
+  replies, and packets that arrive on `ve-*` — not a blanket accept of
+  the whole pod prefix, so an L2 neighbour cannot reach unpublished ports.
+  Pod-to-pod traffic is allowed (both ends are `ve-*`). Set
+  `isolated = true` on a pod to drop traffic between it and other pods.
 
 We do **not** use nspawn's `--port`: it depends on the host side of the veth
 being managed by systemd-networkd (its `80-container-ve.network` provides the
 DHCP+nft glue), which NetworkManager/Netplan desktops don't run. Required
 sysctls (`ip_forward`, `route_localnet` on the veth) are enabled
-automatically. Privileged pod ports (<1024) need `--user root` inside the
+automatically. Before IPv6 forwarding is turned on, interfaces still at
+`accept_ra=1` are set to `2` so kernel router advertisements keep
+working; NetworkManager hosts already learn RAs in userspace. `doctor`
+warns if a non-pod interface is left at `accept_ra=1` while forwarding
+is on. These sysctls are not restored on teardown. `route_localnet` is required for localhost→pod replies;
+the daemon compensates by dropping pod packets aimed at `127.0.0.0/8`
+and by refusing new connections from a pod to host-local addresses.
+Set `host_access = true` in the pod conf (or stack.toml) for a pod
+that must reach host services. Privileged pod ports (<1024) need `--user root` inside the
 pod, same as anywhere. Note: pods with ports lose host-net parity — DNS and
 outbound go through the NAT, and the pod's own IP replaces `localhost`.
 
@@ -200,7 +279,24 @@ rustypods ingress status
 `--install-ca` writes the generated CA (`/var/lib/rustypods/pki/ca.crt`)
 into the host's system trust store (`update-ca-certificates` /
 `update-ca-trust`) — it **mutates system trust**; skip it and import the
-CA into your browser/store yourself if you prefer. Host loopback
+CA into your browser/store yourself if you prefer. New CAs are
+path-length constrained (`pathLen=0`) and name-constrained to
+`rustypods.localhost`. An older unconstrained CA is left in place (replacing
+it would drop existing trust) and `rustypods doctor` warns.
+`rustypods ingress rotate-ca` mints a new constrained CA — re-import it.
+`rustypods ingress uninstall-ca` removes the CA from the host trust store.
+The leaf is renewed automatically when fewer than 30 days remain; a running
+gateway is restarted so it loads the new pair, and the gateway also reloads
+the files when they change. The public proxy
+caps request bodies (`RUSTYPODS_INGRESS_MAX_BODY`, default 32 MiB),
+waits `RUSTYPODS_INGRESS_UPSTREAM_TIMEOUT_SECS` (default 30) for upstream
+response headers, drops a silent WebSocket after
+`RUSTYPODS_INGRESS_WS_IDLE_SECS` (default 60), and admits
+`RUSTYPODS_INGRESS_MAX_CONNS` in-flight requests (default 1024). TLS
+handshakes and HTTP/1 header reads time out after
+`RUSTYPODS_INGRESS_TLS_HANDSHAKE_SECS` and
+`RUSTYPODS_INGRESS_HEADER_TIMEOUT_SECS` (both default 10). HTTP/2 is
+capped at 100 concurrent streams with a 20s keepalive. Host loopback
 `127.0.0.0/8` and `::1` ports 80/443 are redirected to the gateway via
 nft OUTPUT rules only — nothing on the LAN can reach it, and init/start
 refuses if either port is already bound.
@@ -213,7 +309,7 @@ name = "demo"
 
 [pods.web]
 image = "arch-base"
-ports = ["8081:8080"]        # published on the shared stack IP
+ports = ["8081:8080"]        # 127.0.0.1 only; DNAT to the shared stack IP
 
 [pods.api]
 image = "arch-base"
@@ -245,13 +341,26 @@ stack.toml is idempotent — confs update, running rootfs stays.
 
 `rustypods shell` no longer uses `machinectl`: the daemon runs
 `nsenter -t <leader> -m -u -i -n -p` with a host pty (`setsid`+`TIOCSCTTY`
-→ real job control), drops to the container user via `setpriv` with passwd
-data from the image, and joins the leader's cgroup atomically
+→ real job control) and joins the leader's cgroup atomically
 (`nsenter --cgroup --join-cgroup`): exec'd processes land in
 `machine-<pod>.scope/payload/init.scope` — inside the pod's scope, so the
 pod's MemoryHigh/CPUQuota apply to them. SIGWINCH and exit codes are
 forwarded over the stream; machined is only used for the leader-pid
 lookup.
+
+No binary from the pod image ever runs with more privilege than the
+requested user: the daemon prepares the identity host-side (bounding set
+reduced to nspawn's default, gid + supplementary groups from the image's
+`/etc/group`, environment via a cleared env) and `nsenter --setuid`
+switches uid right after entering the namespaces, so the first image
+binary executed is already the unprivileged user. In userns pods root is
+pod root; in pods without a userns root is host root and must be requested
+explicitly (`--user root`).
+
+A session's processes form one process group; a timeout, a dropped REST
+call or a vanished client kills the whole group, including the pod-side
+child `nsenter -p` forks. Only payloads that call `setsid()` themselves
+survive that.
 
 Known limitation: `tty(1)` fails on path resolution (the pty fd lives in the
 host devpts); the fd itself works fully.
@@ -297,11 +406,11 @@ The host's `LANG` is forwarded on exec — a fresh OCI rootfs that hasn't
 generated it gets `C.UTF-8` instead, so locale-aware tools don't die; run
 `locale-gen` in the pod for the real locale.
 
-Note: non-userns pods (including `--desktop`) require util-linux `setpriv`
-inside the image for secure exec — the daemon drops the capability
-bounding set through it. Minimal BusyBox images lack a usable `setpriv`,
-so `shell`/`exec` there is intentionally refused rather than retaining
-host-root's bounding set.
+Exec healthchecks (`--healthcheck exec …`) run through the same path. In
+pods without a user namespace they default to the image's `nobody` (or
+bare uid 65534), never host root; set `user = "root"` (or any image user)
+under `[healthcheck]` in the pod conf to change that. A probe that
+outlives its timeout is killed as a whole process group and reaped.
 
 or over REST/JSON with the bearer token in `/run/rustypods/http-token`:
 
@@ -336,6 +445,11 @@ Files are owned by uid 1000 so host and pod processes can map them as `nick`.
 ```bash
 rustypods pull busybox:latest        # native OCI pull — no podman/docker needed
 rustypods pull ghcr.io/org/tool:v1 --name tool
+rustypods pull some/image:latest --strip-setuid   # drop S_ISUID/S_ISGID
+rustypods export db -o db.rpod       # RPEX0002 archive (sha256 trailer)
+rustypods export db --format tar -o db.rpod   # tar payload, even on btrfs
+rustypods load db.rpod               # strips binds/ports/env unless --trust
+rustypods load db.rpod --trust --name db2
 rustypods logs dev                   # journal backlog; non-boot pods → console log
 rustypods logs dev -f                # keep following
 rustypods config dev --snap-keep 5 --snap-max-age 7d   # snapshot GC; 0 = keep all
@@ -343,20 +457,49 @@ rustypods config dev --snap-keep 5 --snap-max-age 7d   # snapshot GC; 0 = keep a
 
 Pulled images carry their OCI entrypoint/cmd — pods on them run non-boot
 (the payload replaces systemd), which is also why their `logs` come from the
-console log instead of the journal.
+console log instead of the journal. Layer extract keeps setuid/setgid so
+`sudo` and `ping` work inside a user namespace. That containment is gone
+when `private_users` is off (desktop pods, `--trust` imports that kept it):
+treat those as trusted images only, or pull with `--strip-setuid`.
+
+`export` fails if the `btrfs send`/`tar` child fails, and `export -o`
+deletes the partial file. `load` verifies the RPEX0002 trailer before
+the rootfs is moved into place; a truncated archive leaves no pod and no
+staging dir. Archives whose conf bind-mounts `/root` come up with no
+binds unless `load --trust`. A btrfs-send archive cannot be loaded on
+XFS/ext4 — export it again with `--format tar`. Payload size is capped
+by `RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB).
 
 ### REST API
 
 The same PodControl surface is exposed as REST/JSON for automation and
 agents: `rustypodsd --http-addr 127.0.0.1:9180` (the default; `--http-addr ""`
 disables it). Every `/v1/*` request needs
-`Authorization: Bearer <token>` — the daemon generates the token at startup
-and writes it to `/run/rustypods/http-token` (mode `0400`, owned by the
-allowed uid). Requests carrying `Origin`/`Sec-Fetch-Site` headers are
-rejected (no browser-driven calls); `/healthz` stays open. The bind is
-loopback-only — a non-loopback `--http-addr` is refused unless
-`RUSTYPODS_HTTP_INSECURE=1` is set. Request bodies are snake_case;
-responses are the proto messages in camelCase JSON:
+`Authorization: Bearer <token>`. The daemon writes two tokens, mode `0400`,
+owned by the allowed uid, and **reuses them across restarts**:
+
+- `/run/rustypods/http-token` — full access (root-equivalent)
+- `/run/rustypods/http-token-ro` — GET only (list, stats, logs, export)
+
+Set `RUSTYPODS_HTTP_TOKEN_ROTATE=1` to mint new tokens at the next start.
+Requests carrying `Origin`/`Sec-Fetch-Site` are rejected (no browser-driven
+calls). `/healthz` stays open and returns 503 when the daemon cannot lock
+its state or reach machined. The bind is loopback-only. A non-loopback
+`--http-addr` is refused unless `RUSTYPODS_HTTP_INSECURE=1` is set; that
+flag logs a warning on every start and is **not** a supported remote path.
+Use SSH forwarding or the gRPC client instead:
+
+```bash
+ssh -L 9180:127.0.0.1:9180 host
+rustypods --remote host exec dev -- true
+```
+
+JSON bodies are limited to 1 MiB. `POST /v1/import` streams up to
+`RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB). Other handlers time out
+after 60s; `exec` may run up to 900s. Export, import, and logs are not
+cut by that deadline. The listener caps connections at 256 and drops
+HTTP/1 clients that don't finish their headers within 10s. Request bodies
+are snake_case; responses are the proto messages in camelCase JSON:
 
 ```
 GET    /healthz                      GET    /v1/daemon
@@ -365,6 +508,8 @@ PATCH  /v1/pods/:name                {"memory_high_bytes","ports","binds",
                                       "snap_keep_last","autostart",…}
 POST   /v1/pods/:name/start|stop     DELETE /v1/pods/:name
 GET    /v1/images                    GET    /v1/pods/:name/metrics
+GET    /v1/pods/:name/export?format=tar
+POST   /v1/import?name=&trust=true
 POST   /v1/stacks   (raw stack.toml) DELETE /v1/stacks/:name
 ```
 

@@ -2,44 +2,50 @@
 Description=RustyPods daemon — nspawn pod orchestrator
 After=systemd-machined.service
 Wants=systemd-machined.service
+# A crash loop (panic=abort release builds) must not spin forever.
+# These keys are [Unit]-only; under [Service] systemd ignores them.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
+# READY=1 is sent once the control socket accepts, so `systemctl restart`
+# returns only when the CLI can connect.
+Type=notify
 # The uid allowed to drive the daemon besides root; override via
 # /etc/rustypods/daemon.env (written by scripts/install-daemon.sh).
 Environment=RUSTYPODS_ALLOWED_UID=1000
 EnvironmentFile=-/etc/rustypods/daemon.env
 ExecStart=/usr/local/bin/rustypodsd --allowed-uid=${RUSTYPODS_ALLOWED_UID}
-# Only the daemon's main pid belongs to systemd — on restart, leave the
-# nspawn pods (which live in this cgroup via machined scopes) alone.
+# Pods live in machine.slice (machined scopes), not in this unit's cgroup.
+# nspawn itself is spawned as a daemon child and only reparents to PID 1
+# after the daemon exits — KillMode=control-group would SIGKILL that nspawn
+# and take the pod down with the daemon. KillMode=process signals only the
+# main pid, so pods survive `systemctl restart`. nsenter/exec waiters also
+# live in this cgroup and are left behind on purpose; the in-pod payload
+# is already in the machine scope (see exec.rs --join-cgroup).
+# NEEDS LIVE VERIFICATION on Alma/Debian before calling this settled.
 KillMode=process
+# The daemon's stop path is a tonic shutdown on SIGTERM. 45s is longer
+# than a ~30s drain so systemd does not SIGKILL mid-shutdown.
+TimeoutStopSec=45
 RuntimeDirectory=rustypods
+# The REST tokens (http-token, http-token-ro) live here and must survive
+# daemon restarts; without this systemd wipes the dir on every stop.
+RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=2
+# nspawn + one exec per pod can hold a lot of fds (ptys, logs, sockets).
+LimitNOFILE=1048576
 
-# Hardening — the daemon manages nspawn pods, not the kernel. Deliberately
-# NOT set (each breaks real functionality):
-#   ProtectKernelTunables — daemon writes /proc/sys ip_forward/route_localnet
-#   ProtectControlGroups  — exec path writes cgroup.procs
-#   ProtectHome           — desktop pods bind the user's home
-#   UMask=0077            — run dirs must stay 0755 for userns pods
-#   PrivateMounts         — `ip netns` bind-mounts into /run/netns
-#   RestrictSUIDSGID      — breaks su/setuid binaries inside pods
-#   ProtectSystem=strict  — /var/lib/rustypods must stay writable
-#   LockPersonality       — verified live (2026-09-20): its seccomp filter is
-#                           inherited by nspawn/pod init; every sandboxed pod
-#                           service (journald, networkd, logind…) then fails
-#                           exec with status=228/SECCOMP
-#   PrivateTmp            — verified live: nspawn resolves --bind sources in
-#                           the daemon's mountns, so --bind /tmp (desktop pods'
-#                           X11 socket dir) would mount the private tmpfs, not
-#                           the host's /tmp
-#   RestrictAddressFamilies — verified live: the seccomp socket() filter is
-#                           inherited by every pod process; systemd-networkd
-#                           inside pods then can't open AF_PACKET (LLDP/DHCP)
-#                           → host0 never gets its address → NAT dead. Any
-#                           allowlist will keep breaking pod payloads.
-NoNewPrivileges=true
+# Hardening that is safe for a root daemon which only supervises nspawn:
+# it does not load modules, set the clock, or use realtime scheduling,
+# and it is native-arch only.
 ProtectSystem=full
+# `ingress init --install-ca` / `uninstall-ca` write the CA into the host
+# trust store and run update-ca-certificates / update-ca-trust, which
+# rewrite the bundles under /etc. "-" skips paths another distro lacks.
+ReadWritePaths=-/usr/local/share/ca-certificates -/etc/ssl/certs \
+               -/etc/ca-certificates -/etc/pki/ca-trust
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectClock=true
@@ -47,6 +53,30 @@ ProtectHostname=true
 RestrictRealtime=true
 SystemCallArchitectures=native
 RemoveIPC=true
+
+# Deliberately NOT set — each one breaks nspawn, binds, or pod payloads.
+# NEEDS LIVE VERIFICATION; several were confirmed on a Debian desktop
+# (2026-09-20) and must not be "tightened" without a pod boot test.
+#   NoNewPrivileges       — PR_SET_NO_NEW_PRIVS is inherited by nspawn and
+#                           every pod process, so setuid/file-caps inside
+#                           a pod (su, ping, sudo) stop working
+#   ProtectKernelTunables — daemon writes /proc/sys ip_forward/route_localnet
+#   ProtectControlGroups  — exec path writes cgroup.procs
+#   ProtectHome           — desktop pods bind the user's home
+#   PrivateTmp            — nspawn resolves --bind sources in the daemon's
+#                           mountns, so --bind /tmp would mount a private
+#                           tmpfs instead of the host's /tmp (X11 socket)
+#   ProtectSystem=strict  — /var/lib/rustypods must stay writable (full is
+#                           enough: /usr is read-only, /var stays writable)
+#   LockPersonality       — seccomp filter is inherited by nspawn/pod init;
+#                           journald/networkd/logind then fail exec with
+#                           status=228/SECCOMP
+#   RestrictAddressFamilies — the socket() filter is inherited by every pod
+#                           process; systemd-networkd can't open AF_PACKET
+#                           and host0 never gets an address
+#   PrivateMounts         — `ip netns` bind-mounts into /run/netns
+#   RestrictSUIDSGID      — breaks su/setuid binaries inside pods
+#   UMask=0077            — run dirs must stay 0755 for userns pods
 
 [Install]
 WantedBy=multi-user.target

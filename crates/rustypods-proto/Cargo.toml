@@ -2,6 +2,8 @@
 name = "rustypods-proto"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 description = "RustyPods protobuf API + shared constants/util"
 build = "build.rs"
 
@@ -15,3 +17,6 @@ tonic-prost.workspace = true
 [build-dependencies]
 tonic-prost-build.workspace = true
 protoc-bin-vendored.workspace = true
+
+[lints]
+workspace = true

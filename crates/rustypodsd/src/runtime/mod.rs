@@ -3,6 +3,7 @@
 //! keeps server.rs free of engine specifics so an OCI runtime (crun/youki)
 //! can slot in later for systems without systemd.
 
+pub mod logs;
 pub mod nspawn;
 
 use anyhow::Result;
@@ -41,7 +42,8 @@ pub struct StartSpec {
     /// OCI payload (entrypoint+cmd). Some → non-boot mode: the image has no
     /// systemd, nspawn execs this argv directly. None → --boot.
     pub payload: Option<Vec<String>>,
-    /// OCI env ("K=V") → nspawn --setenv.
+    /// OCI env ("K=V"). nspawn sees `--setenv=KEY` only; the value is
+    /// placed in the nspawn process environment (not argv).
     pub env: Vec<String>,
     /// OCI working dir → nspawn --chdir (non-boot only).
     pub chdir: String,
@@ -59,7 +61,7 @@ pub trait RuntimeEngine: Send + Sync {
     /// Returns the leader pid (init inside the pod).
     async fn start(&self, spec: &StartSpec, limits: &LimitsSpec) -> Result<u32>;
     /// Clean shutdown (SIGRTMIN+3 → terminate fallback for nspawn).
-    async fn stop(&self, pod: &str) -> Result<()>;
+    async fn stop(&self, pod: &str, grace: std::time::Duration) -> Result<()>;
     /// Leader pid while running, None otherwise. A pod registered with
     /// machined but still booting reports Some(0) — running, but without a
     /// usable pid yet (nsenter callers must refuse 0).

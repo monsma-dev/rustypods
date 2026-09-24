@@ -43,10 +43,30 @@ struct Args {
     /// `nft --check -f -` on the host. Applies nothing.
     #[arg(long, hide = true)]
     print_nat: bool,
+
+    #[command(subcommand)]
+    cmd: Option<DaemonCmd>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(clap::Subcommand)]
+enum DaemonCmd {
+    /// Remove RustyPods nft tables, marker firewall inserts, and
+    /// firewalld runtime zone bindings. Does not restore sysctls.
+    /// Root only. For uninstall scripts.
+    TeardownNet,
+}
+
+fn main() -> Result<()> {
+    // Before the runtime spawns its worker threads (see Notifier docs).
+    let notify = rustypodsd::notify::Notifier::take_from_env();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?
+        .block_on(run(notify))
+}
+
+async fn run(notify: rustypodsd::notify::Notifier) -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -65,13 +85,28 @@ async fn main() -> Result<()> {
             .parse::<std::net::SocketAddr>()
             .map(|a| a.ip().is_loopback())
             .unwrap_or(false);
-        if !loopback && std::env::var_os("RUSTYPODS_HTTP_INSECURE").is_none() {
+        if !loopback && !rustypodsd::server::http_insecure_enabled() {
             anyhow::bail!(
                 "refusing to bind the REST API to non-loopback '{}' — \
-                 set RUSTYPODS_HTTP_INSECURE=1 to override",
+                 set RUSTYPODS_HTTP_INSECURE=1 to override. The supported \
+                 remote path is SSH forwarding (ssh -L 9180:127.0.0.1:9180 host) \
+                 or the gRPC client --remote mode",
                 args.http_addr
             );
         }
+        if !loopback {
+            tracing::warn!(
+                "SECURITY: RUSTYPODS_HTTP_INSECURE=1 — REST API will bind to {}. \
+                 Plain HTTP, root-equivalent token. Prefer SSH -L or gRPC --remote.",
+                args.http_addr
+            );
+        }
+    }
+    if matches!(args.cmd, Some(DaemonCmd::TeardownNet)) {
+        if euid() != 0 {
+            anyhow::bail!("teardown-net must run as root");
+        }
+        return rustypodsd::net::teardown_all();
     }
     if euid() != 0 {
         tracing::warn!("rustypodsd is not running as root — nspawn/btrfs/machined will fail");
@@ -114,6 +149,7 @@ async fn main() -> Result<()> {
         import_user,
         http_addr: args.http_addr,
         gc_interval_secs: args.gc_interval_secs,
+        notify,
     })
     .await
 }

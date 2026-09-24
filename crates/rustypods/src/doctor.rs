@@ -86,6 +86,36 @@ fn parse_positive_u64(s: &str) -> bool {
     s.trim().parse::<u64>().map(|v| v > 0).unwrap_or(false)
 }
 
+/// `/sys/fs/selinux/enforce` contents → a stable word for the doctor line.
+fn selinux_mode(enforce: Option<&str>) -> &'static str {
+    match enforce.map(str::trim) {
+        Some("1") => "enforcing",
+        Some("0") => "permissive",
+        _ => "disabled",
+    }
+}
+
+/// SELinux context of `path`, or a short reason it could not be read.
+/// `ls -Zd` prints `system_u:object_r:var_lib_t:s0 /path`.
+fn selinux_context(path: &Path) -> String {
+    if !path.exists() {
+        return format!("absent ({})", path.display());
+    }
+    let out = Command::new("ls")
+        .args(["-Zd", path.to_str().unwrap_or("")])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.split_whitespace()
+                .next()
+                .unwrap_or("unlabeled")
+                .to_string()
+        }
+        _ => "unreadable (ls -Zd failed)".into(),
+    }
+}
+
 /// Storage check verdict: btrfs only counts when btrfs-progs is installed —
 /// the driver shells out to `btrfs` for every subvolume op.
 fn storage_check(target: &Path, fs: Option<&str>, btrfs_progs: Option<&Path>) -> (Level, String) {
@@ -313,6 +343,49 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             "{s} present"
         );
     }
+    let fwd6 = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding")
+        .ok()
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    if fwd6 {
+        let mut stuck = Vec::new();
+        if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name == "lo" || name.starts_with("ve-") || name.starts_with("rp-mesh") {
+                    continue;
+                }
+                let p = format!("/proc/sys/net/ipv6/conf/{name}/accept_ra");
+                if std::fs::read_to_string(&p).ok().as_deref().map(str::trim) == Some("1") {
+                    stuck.push(name);
+                }
+            }
+        }
+        if stuck.is_empty() {
+            chk!(
+                Level::Pass,
+                "ipv6-ra",
+                "forwarding=1 and no non-pod iface is stuck at accept_ra=1"
+            );
+        } else {
+            chk!(
+                Level::Warn,
+                "ipv6-ra",
+                "forwarding=1 with accept_ra=1 on {} — the kernel ignores router advertisements there (set accept_ra=2). NetworkManager hosts learn RAs in userspace.",
+                stuck.join(", ")
+            );
+        }
+    }
+
+    match pod_pool_overlap() {
+        Ok(None) => chk!(
+            Level::Pass,
+            "pod-net",
+            "address pool does not overlap a host route"
+        ),
+        Ok(Some(detail)) => chk!(Level::Warn, "pod-net", "{detail}"),
+        Err(e) => chk!(Level::Warn, "pod-net", "{e:#}"),
+    }
 
     // ── WARN / info checks ─────────────────────────────────────────────
     let target = if Path::new("/var/lib/rustypods").exists() {
@@ -420,6 +493,32 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         }
     }
 
+    let ca = Path::new("/var/lib/rustypods/pki/ca.crt");
+    match std::fs::read_to_string(ca) {
+        Ok(pem) => {
+            if ca_pem_unconstrained(&pem) {
+                chk!(
+                    Level::Warn,
+                    "ingress-ca",
+                    "{} has no path-length or DNS name constraint — `rustypods ingress rotate-ca`, then re-import the CA",
+                    ca.display()
+                );
+            } else {
+                chk!(
+                    Level::Pass,
+                    "ingress-ca",
+                    "{} is path- and name-constrained",
+                    ca.display()
+                );
+            }
+        }
+        Err(_) => chk!(
+            Level::Pass,
+            "ingress-ca",
+            "no local CA yet (created by `rustypods ingress init`)"
+        ),
+    }
+
     let ver =
         cmd_stdout("systemd", &["--version"]).or_else(|_| cmd_stdout("systemctl", &["--version"]));
     match ver {
@@ -432,17 +531,16 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         Err(e) => chk!(Level::Warn, "systemd", "version probe failed: {e:#}"),
     }
 
-    let selinux = std::fs::read_to_string("/sys/fs/selinux/enforce")
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false);
-    if selinux {
-        chk!(
+    let enforce = std::fs::read_to_string("/sys/fs/selinux/enforce").ok();
+    let mode = selinux_mode(enforce.as_deref());
+    let ctx = selinux_context(Path::new("/var/lib/rustypods"));
+    match mode {
+        "enforcing" | "permissive" => chk!(
             Level::Warn,
             "selinux",
-            "enforcing; Fedora 44 validated — inspect AVCs on other SELinux policies"
-        );
-    } else {
-        chk!(Level::Pass, "selinux", "disabled or absent");
+            "{mode}; context of /var/lib/rustypods: {ctx}. Fedora 44 was validated enforcing — other policies are unverified. Opt in with `scripts/install-daemon.sh --selinux-label` (semanage fcontext var_lib_t + restorecon) and watch ausearch -m avc -ts recent"
+        ),
+        _ => chk!(Level::Pass, "selinux", "disabled or absent"),
     }
 
     // ── report ─────────────────────────────────────────────────────────
@@ -466,6 +564,76 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         bail!("doctor found {fails} required check(s) failing");
     }
     Ok(())
+}
+
+/// Same signal the daemon logs: a CA without the name-constraint OID
+/// (2.5.29.30) or without a pathLen INTEGER in BasicConstraints.
+fn ca_pem_unconstrained(pem: &str) -> bool {
+    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let Ok(der) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64.trim())
+    else {
+        return false;
+    };
+    let name_ok = der.windows(3).any(|w| w == [0x55, 0x1d, 0x1e]);
+    let oid = [0x55u8, 0x1d, 0x13];
+    let path_ok = der.windows(3).position(|w| w == oid).is_some_and(|at| {
+        let window = &der[at..der.len().min(at + 24)];
+        window.windows(3).any(|w| w[0] == 0x02 && w[1] == 0x01)
+    });
+    !name_ok || !path_ok
+}
+
+/// `Ok(None)` when the configured pod /16 does not collide with a host
+/// route. Default routes and routes that sit entirely inside the pool
+/// (the daemon's own /30s) are ignored.
+fn pod_pool_overlap() -> Result<Option<String>> {
+    let spec = std::env::var("RUSTYPODS_POD_NET4").unwrap_or_else(|_| "10.220.0.0/16".into());
+    let (addr, prefix) = spec
+        .split_once('/')
+        .context("RUSTYPODS_POD_NET4 must look like 10.220.0.0/16")?;
+    if prefix != "16" {
+        bail!("RUSTYPODS_POD_NET4 must be a /16");
+    }
+    let pool: std::net::Ipv4Addr = addr.parse().context("RUSTYPODS_POD_NET4 address")?;
+    let text = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    for line in text.lines().skip(1) {
+        let mut c = line.split_whitespace();
+        let iface = c.next().unwrap_or("");
+        let dest_hex = c.next().unwrap_or("");
+        let _gw = c.next();
+        let dest = match u32::from_str_radix(dest_hex, 16) {
+            Ok(v) => u32::from_le(v),
+            Err(_) => continue,
+        };
+        // Flags, RefCnt, Use, Metric, then Mask.
+        let mask_hex = c.nth(4).unwrap_or("");
+        let mask = match u32::from_str_radix(mask_hex, 16) {
+            Ok(v) => u32::from_le(v),
+            Err(_) => continue,
+        };
+        let plen = mask.count_ones();
+        if plen == 0 || plen > 32 {
+            continue;
+        }
+        if !v4_overlaps(u32::from(pool), 16, dest, plen) {
+            continue;
+        }
+        if plen >= 16 {
+            continue;
+        }
+        return Ok(Some(format!(
+            "RUSTYPODS_POD_NET4 {spec} overlaps {iface} route {}/{} — pick another /16",
+            std::net::Ipv4Addr::from(dest),
+            plen
+        )));
+    }
+    Ok(None)
+}
+
+fn v4_overlaps(a: u32, a_len: u32, b: u32, b_len: u32) -> bool {
+    let n = a_len.min(b_len);
+    let m = if n == 0 { 0 } else { u32::MAX << (32 - n) };
+    (a & m) == (b & m)
 }
 
 #[cfg(test)]
@@ -498,6 +666,14 @@ mod tests {
     }
 
     #[test]
+    fn selinux_mode_words() {
+        assert_eq!(selinux_mode(Some("1\n")), "enforcing");
+        assert_eq!(selinux_mode(Some("0")), "permissive");
+        assert_eq!(selinux_mode(Some("")), "disabled");
+        assert_eq!(selinux_mode(None), "disabled");
+    }
+
+    #[test]
     fn storage_level_selection() {
         let t = Path::new("/var/lib/rustypods");
         let progs = Path::new("/usr/sbin/btrfs");
@@ -524,5 +700,23 @@ mod tests {
         assert_eq!(find_executable_in("no-tool", &path), None);
         assert_eq!(find_executable_in("missing-tool", &path), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ca_pem_flags_missing_name_or_path_constraint() {
+        use base64::Engine;
+        let pem = |der: &[u8]| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+            format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n")
+        };
+        // 2.5.29.30 name constraints, 2.5.29.19 basic constraints, pathLen INTEGER.
+        let both = pem(&[0x55, 0x1d, 0x1e, 0x55, 0x1d, 0x13, 0x02, 0x01, 0x00]);
+        assert!(!ca_pem_unconstrained(&both));
+        assert!(ca_pem_unconstrained(&pem(&[
+            0x55, 0x1d, 0x13, 0x02, 0x01, 0x00
+        ])));
+        assert!(ca_pem_unconstrained(&pem(&[
+            0x55, 0x1d, 0x1e, 0x55, 0x1d, 0x13
+        ])));
     }
 }

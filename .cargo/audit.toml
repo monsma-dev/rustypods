@@ -1,0 +1,4 @@
+# Keep in sync with [advisories].ignore in deny.toml.
+
+[advisories]
+ignore = []

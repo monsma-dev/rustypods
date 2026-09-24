@@ -174,6 +174,9 @@ pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Re
             Value::from(u64::from(lim.cpu_quota_percent) * 10_000),
         ));
     }
+    if lim.tasks_max > 0 {
+        props.push(("TasksMax", Value::from(lim.tasks_max)));
+    }
     if props.is_empty() {
         return Ok(());
     }
@@ -185,12 +188,12 @@ pub async fn apply_limits(conn: &Connection, name: &str, lim: &LimitsSpec) -> Re
 }
 
 /// Clean shutdown (SIGRTMIN+3 → leader) → terminate → give up loudly.
-/// The poweroff grace is ~8s — long enough for systemd to unmount cleanly,
-/// short enough that `stop` doesn't stall a GUI click for 15s.
+/// `grace` is how long to wait for the poweroff signal before
+/// TerminateMachine. The hard-kill wait after that stays ~4s.
 ///
 /// "Stopped" means *unregistered* — a booting pod (leader 0) has no signal
 /// target but must still be terminated by name, not mistaken for stopped.
-pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
+pub async fn stop(conn: &Connection, name: &str, grace: Duration) -> Result<()> {
     if !registered(conn, name).await? {
         return Ok(());
     }
@@ -198,7 +201,8 @@ pub async fn stop(conn: &Connection, name: &str) -> Result<()> {
     // kill_machine("leader") fails on a leader-less booting pod — fine,
     // TerminateMachine below works by name either way.
     let _ = mgr.kill_machine(name, "leader", SIGRTMIN + 3).await;
-    for _ in 0..40 {
+    let polls = (grace.as_millis() / 200).min(u128::from(u32::MAX)) as u32;
+    for _ in 0..polls {
         if !registered(conn, name).await.unwrap_or(true) {
             return Ok(());
         }

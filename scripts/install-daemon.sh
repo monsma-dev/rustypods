@@ -2,7 +2,8 @@
 # Install rustypodsd as a root systemd service. Run with sudo from anywhere
 # after `bash scripts/build.sh` produced the release binaries.
 #
-# Usage: scripts/install-daemon.sh [--user NAME] [--skip-packages] [--install-polkit] [--dry-run]
+# Usage: scripts/install-daemon.sh [--user NAME] [--skip-packages] [--install-polkit]
+#          [--selinux-label] [--dry-run]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,6 +11,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 USER_NAME=""
 SKIP_PACKAGES=0
 INSTALL_POLKIT=0
+SELINUX_LABEL=0
 DRY_RUN=0
 TMP_FILES=()
 BACKUP_DIR=""
@@ -66,12 +68,15 @@ trap on_exit EXIT
 
 usage() {
   cat >&2 <<'EOF'
-Usage: scripts/install-daemon.sh [--user NAME] [--skip-packages] [--install-polkit] [--dry-run]
+Usage: scripts/install-daemon.sh [--user NAME] [--skip-packages] [--install-polkit] [--selinux-label] [--dry-run]
   --user NAME        host user allowed to drive the daemon (default: SUDO_USER,
                      else the single uid 1000-59999 account with a login shell)
   --skip-packages    do not touch the system package manager
   --install-polkit   install the optional polkit rule — only needed for direct
                      machinectl use; normal rustypods RPC does not need it
+  --selinux-label    opt-in: semanage fcontext + restorecon on /var/lib/rustypods
+                     (RHEL/Alma SELinux is otherwise unverified — doctor reports
+                     the mode and the directory context)
   --dry-run          print everything that would happen, change nothing
 EOF
 }
@@ -85,6 +90,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-packages) SKIP_PACKAGES=1; shift ;;
     --install-polkit) INSTALL_POLKIT=1; shift ;;
+    --selinux-label) SELINUX_LABEL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "unknown argument: $1" ;;
@@ -145,6 +151,38 @@ run_cmd() {
   fi
 }
 
+# True when dnf can see PKG in the enabled repos. A missing dnf (dry-run
+# on a non-RHEL host) or an empty cache counts as unavailable.
+dnf_available() {
+  command -v dnf >/dev/null 2>&1 || return 1
+  dnf info -q "$1" >/dev/null 2>&1
+}
+
+# RHEL 8/9 (and Alma/Rocky/Oracle) do not ship btrfs-progs. Installing it
+# in the same transaction as the required set makes `set -e` abort the
+# whole install. Required packages stay required; btrfs-progs is best-effort.
+# socat / systemd-container may live in CRB (RHEL 9) or PowerTools (RHEL 8)
+# plus EPEL — we do not enable those repos, we only say how if dnf fails.
+run_fedora_packages() {
+  local -a required=(systemd-container nftables iproute util-linux socat)
+  echo "    required:    ${required[*]}"
+  echo "    note:        if dnf cannot see socat or systemd-container, enable CRB (RHEL 9) or PowerTools (RHEL 8) and EPEL, then re-run:"
+  echo "                   dnf install -y epel-release"
+  echo "                   dnf config-manager --set-enabled crb || dnf config-manager --set-enabled powertools"
+  if ! run_cmd dnf install -y "${required[@]}"; then
+    echo "error: dnf could not install the required set (${required[*]})." >&2
+    echo "       On Alma/RHEL 8/9 that usually means CRB/PowerTools or EPEL is disabled. Enable them (commands above) and re-run; do not expect btrfs-progs in those repos." >&2
+    exit 1
+  fi
+  if dnf_available btrfs-progs; then
+    echo "    btrfs-progs: available in the enabled repos — installing"
+    run_cmd dnf install -y btrfs-progs
+  else
+    echo "    btrfs-progs: not in the enabled repos (expected on RHEL/Alma/Rocky 8 and 9)."
+    echo "                 the reflink fallback driver will be used (cp --reflink=auto). Quotas and btrfs send need btrfs-progs."
+  fi
+}
+
 # The package manager invocations for a detected family.
 run_package_steps() {
   case "$FAMILY" in
@@ -153,7 +191,7 @@ run_package_steps() {
       run_cmd apt-get install -y systemd-container nftables iproute2 util-linux btrfs-progs socat
       ;;
     fedora)
-      run_cmd dnf install -y systemd-container nftables iproute util-linux btrfs-progs socat
+      run_fedora_packages
       ;;
     arch)
       # -S --needed, never -Sy: a bare -Sy refreshes the db without syncing
@@ -162,6 +200,47 @@ run_package_steps() {
       ;;
     *) die "internal: no package steps for family '$FAMILY'" ;;
   esac
+}
+
+# Opt-in SELinux label for the data dir. Fedora 44 was live-tested without
+# a custom module; other RHEL policies are not. This only records the
+# policy default (var_lib_t, same as the rest of /var/lib) and restorecon's
+# it so a copied tree does not keep a mismatched context.
+apply_selinux_label() {
+  if [[ $SELINUX_LABEL -eq 0 ]]; then
+    echo "    selinux:       skipped (pass --selinux-label to restorecon /var/lib/rustypods)"
+    return 0
+  fi
+  local mode="absent"
+  if [[ -r /sys/fs/selinux/enforce ]]; then
+    mode="$(tr -d '[:space:]' < /sys/fs/selinux/enforce)"
+  fi
+  case "$mode" in
+    1) echo "    selinux:       enforcing — labeling /var/lib/rustypods as var_lib_t" ;;
+    0) echo "    selinux:       permissive — labeling /var/lib/rustypods as var_lib_t" ;;
+    *)
+      echo "    selinux:       disabled or no policy mounted — --selinux-label is a no-op"
+      return 0
+      ;;
+  esac
+  if ! command -v semanage >/dev/null 2>&1 || ! command -v restorecon >/dev/null 2>&1; then
+    echo "error: --selinux-label needs semanage and restorecon (policycoreutils-python-utils)." >&2
+    echo "       install that package, or re-run without --selinux-label. doctor still reports the context." >&2
+    exit 1
+  fi
+  # -a fails when the spec already exists; -m updates it. Dry-run prints both
+  # candidates and does not execute, so show the add form only.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    run_cmd semanage fcontext -a -t var_lib_t '/var/lib/rustypods(/.*)?'
+    run_cmd restorecon -RF /var/lib/rustypods
+    return 0
+  fi
+  if ! semanage fcontext -a -t var_lib_t '/var/lib/rustypods(/.*)?' >/dev/null 2>&1; then
+    run_cmd semanage fcontext -m -t var_lib_t '/var/lib/rustypods(/.*)?'
+  else
+    echo "    \$ semanage fcontext -a -t var_lib_t '/var/lib/rustypods(/.*)?'"
+  fi
+  run_cmd restorecon -RF /var/lib/rustypods
 }
 
 # ── target user resolution ───────────────────────────────────────────────
@@ -211,7 +290,7 @@ MISSING=()
 for b in rustypodsd rustypods rustypods-agent rustypods-ingress; do
   [[ -x "$REPO_ROOT/target/release/$b" ]] || MISSING+=("$b")
 done
-if [[ ${#MISSING[@]} -gt 0 ]]; then
+if [[ ${#MISSING[@]} -gt 0 && $DRY_RUN -eq 0 ]]; then
   die "missing build artifacts: ${MISSING[*]} — run scripts/build.sh first"
 fi
 
@@ -251,9 +330,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
     run_package_steps
   fi
   echo "    user:          $USER_NAME (uid $TARGET_UID)"
-  echo "    binaries:      install -Dm755 target/release/{rustypodsd,rustypods} → /usr/local/bin/"
+  if [[ ${#MISSING[@]} -gt 0 ]]; then
+    echo "    binaries:      MISSING ${MISSING[*]} — a real install would stop here (scripts/build.sh)"
+  else
+    echo "    binaries:      install -Dm755 target/release/{rustypodsd,rustypods} → /usr/local/bin/"
+  fi
   echo "                   install -Dm755 target/release/rustypods-{agent,ingress} → /var/lib/rustypods/bin/"
   printf '    data dirs:     %s\n' "${DATA_DIRS[*]}"
+  apply_selinux_label
   echo "    unit:          deploy/rustypodsd.service → $UNIT_DST"
   echo "    env file:      $ENV_DST → RUSTYPODS_ALLOWED_UID=$TARGET_UID"
   if [[ $INSTALL_POLKIT -eq 1 ]]; then
@@ -299,6 +383,13 @@ install -Dm755 "$REPO_ROOT/target/release/rustypods-ingress" /var/lib/rustypods/
 # ── data dirs ────────────────────────────────────────────────────────────
 echo "==> [3/6] data dirs (btrfs CoW lives here)"
 install -d -m0755 "${DATA_DIRS[@]}"
+# Rootfs trees (setuid binaries), confs (env), and the CA key stay
+# root-only; the daemon enforces the same modes at start.
+chmod 0700 /var/lib/rustypods/images /var/lib/rustypods/pods \
+           /var/lib/rustypods/snapshots /var/lib/rustypods/pki \
+           /var/lib/rustypods/conf /var/lib/rustypods/conf/pods \
+           /var/lib/rustypods/conf/images
+apply_selinux_label
 
 # ── unit + env ───────────────────────────────────────────────────────────
 echo "==> [4/6] systemd unit + daemon env (allowed uid $TARGET_UID = $USER_NAME)"

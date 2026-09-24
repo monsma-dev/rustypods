@@ -5,6 +5,7 @@ pub mod http;
 pub mod ingress;
 pub mod mesh;
 pub mod net;
+pub mod notify;
 pub mod oci;
 pub mod pki;
 pub mod rootfs;
@@ -32,6 +33,8 @@ pub struct Config {
     pub http_addr: String,
     /// Snapshot GC sweep interval.
     pub gc_interval_secs: u64,
+    /// systemd readiness channel; empty outside a `Type=notify` unit.
+    pub notify: notify::Notifier,
 }
 
 impl Config {
@@ -52,6 +55,11 @@ impl Config {
     }
     pub fn conf_dir(&self) -> PathBuf {
         rustypods_proto::conf_dir(&self.data_dir)
+    }
+    /// Daemon-owned resolv.conf files bound read-only into pods. Never
+    /// mounted as a directory the pod can write.
+    pub fn resolv_dir(&self) -> PathBuf {
+        self.data_dir.join("resolv")
     }
 }
 

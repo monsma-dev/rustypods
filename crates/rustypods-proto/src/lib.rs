@@ -1,5 +1,6 @@
 //! Shared API surface for RustyPods: generated gRPC code plus the few
 //! constants and validators both the daemon and the CLI need.
+#![forbid(unsafe_code)]
 
 use anyhow::Context as _;
 use std::path::PathBuf;
@@ -149,22 +150,116 @@ pub fn validate_unix_user(u: &str) -> anyhow::Result<&str> {
     }
 }
 
-/// Validate "hostPort:podPort[/proto]" — both ports must be 1..=65535.
-pub fn validate_port(spec: &str) -> anyhow::Result<()> {
-    let (ports, proto) = match spec.split_once('/') {
-        Some((p, pr)) => (p, Some(pr)),
-        None => (spec, None),
-    };
-    let ok = matches!(proto, None | Some("tcp") | Some("udp"))
-        && ports.split(':').count() == 2
-        && ports
-            .split(':')
-            .all(|s| s.parse::<u16>().map(|n| n > 0).unwrap_or(false));
-    if ok {
-        Ok(())
-    } else {
-        anyhow::bail!("invalid port mapping '{spec}' — expected hostPort:podPort[/tcp|/udp]")
+/// A published port. `host_ip == None` means the user omitted the address;
+/// the daemon then binds **127.0.0.1 only** (loopback). `0.0.0.0` / `::`
+/// are explicit "every address" binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortMapping {
+    pub host_ip: Option<std::net::IpAddr>,
+    pub host_port: u16,
+    pub pod_port: u16,
+    /// `"tcp"` or `"udp"`.
+    pub proto: &'static str,
+}
+
+impl PortMapping {
+    /// Address the rule actually matches. Implicit specs become 127.0.0.1.
+    pub fn bind_addr(&self) -> std::net::IpAddr {
+        self.host_ip
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
     }
+
+    pub fn implicit_loopback(&self) -> bool {
+        self.host_ip.is_none()
+    }
+}
+
+fn port_err(spec: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "invalid port mapping '{spec}' — expected [hostIp:]hostPort:podPort[/tcp|/udp] \
+         (IPv6 host in brackets, e.g. [2001:db8::1]:8080:80)"
+    )
+}
+
+fn parse_u16_port(spec: &str, s: &str) -> anyhow::Result<u16> {
+    let n: u16 = s.parse().map_err(|_| port_err(spec))?;
+    if n == 0 {
+        anyhow::bail!(port_err(spec));
+    }
+    Ok(n)
+}
+
+/// Parse `[hostIp:]hostPort:podPort[/tcp|/udp]`.
+///
+/// IPv4 host addresses are dotted literals. IPv6 host addresses must be in
+/// brackets. Omitting the host address is valid and means loopback
+/// (127.0.0.1). `::1` is rejected: the kernel drops IPv6 loopback tuples
+/// on a veth, so that publish can never complete.
+pub fn parse_port(spec: &str) -> anyhow::Result<PortMapping> {
+    let (body, proto) = match spec.rsplit_once('/') {
+        Some((b, p)) => {
+            let proto = match p {
+                "tcp" => "tcp",
+                "udp" => "udp",
+                _ => return Err(port_err(spec)),
+            };
+            (b, proto)
+        }
+        None => (spec, "tcp"),
+    };
+    if body.is_empty() {
+        return Err(port_err(spec));
+    }
+
+    if let Some(rest) = body.strip_prefix('[') {
+        let Some((ip_s, rest)) = rest.split_once("]:") else {
+            return Err(port_err(spec));
+        };
+        let ip: std::net::Ipv6Addr = ip_s.parse().map_err(|_| port_err(spec))?;
+        if ip.is_loopback() {
+            anyhow::bail!(
+                "invalid port mapping '{spec}' — ::1 cannot be published \
+                 (the kernel drops IPv6 loopback tuples on veths); use 127.0.0.1"
+            );
+        }
+        let mut it = rest.split(':');
+        let hp = parse_u16_port(spec, it.next().unwrap_or(""))?;
+        let pp = match it.next() {
+            Some(s) if it.next().is_none() => parse_u16_port(spec, s)?,
+            _ => return Err(port_err(spec)),
+        };
+        return Ok(PortMapping {
+            host_ip: Some(std::net::IpAddr::V6(ip)),
+            host_port: hp,
+            pod_port: pp,
+            proto,
+        });
+    }
+
+    let parts: Vec<&str> = body.split(':').collect();
+    match parts.as_slice() {
+        [hp, pp] => Ok(PortMapping {
+            host_ip: None,
+            host_port: parse_u16_port(spec, hp)?,
+            pod_port: parse_u16_port(spec, pp)?,
+            proto,
+        }),
+        [ip_s, hp, pp] => {
+            let ip: std::net::Ipv4Addr = ip_s.parse().map_err(|_| port_err(spec))?;
+            Ok(PortMapping {
+                host_ip: Some(std::net::IpAddr::V4(ip)),
+                host_port: parse_u16_port(spec, hp)?,
+                pod_port: parse_u16_port(spec, pp)?,
+                proto,
+            })
+        }
+        _ => Err(port_err(spec)),
+    }
+}
+
+/// Validate `[hostIp:]hostPort:podPort[/proto]` — both ports must be 1..=65535.
+pub fn validate_port(spec: &str) -> anyhow::Result<()> {
+    parse_port(spec).map(|_| ())
 }
 
 /// The domain suffix every ingress hostname must live under.
@@ -520,11 +615,18 @@ pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
     f64_to_u64(v, mult, "size", s)
 }
 
+/// Largest unit that divides `b` exactly. One-decimal rounding turned
+/// `1500M` into `1.5G`, which parses back as ~1.61GiB.
 pub fn fmt_bytes(b: u64) -> String {
-    if b >= 1 << 30 {
-        format!("{:.1}G", b as f64 / (1u64 << 30) as f64)
-    } else if b >= 1 << 20 {
-        format!("{:.1}M", b as f64 / (1u64 << 20) as f64)
+    const G: u64 = 1 << 30;
+    const M: u64 = 1 << 20;
+    const K: u64 = 1 << 10;
+    if b >= G && b.is_multiple_of(G) {
+        format!("{}G", b / G)
+    } else if b >= M && b.is_multiple_of(M) {
+        format!("{}M", b / M)
+    } else if b >= K && b.is_multiple_of(K) {
+        format!("{}K", b / K)
     } else {
         format!("{b}B")
     }
@@ -565,6 +667,28 @@ pub fn fmt_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_bytes_roundtrip_is_exact() {
+        for n in [
+            0u64,
+            1,
+            512,
+            1024,
+            1500,
+            1500 << 20,
+            1536 << 20,
+            2 << 30,
+            (1 << 30) + 1,
+        ] {
+            let s = fmt_bytes(n);
+            let back = parse_bytes(&s).unwrap();
+            assert_eq!(back, n, "{s}");
+        }
+        assert_eq!(fmt_bytes(1500 << 20), "1500M");
+        assert_eq!(fmt_bytes(2 << 30), "2G");
+        assert_eq!(fmt_bytes(1536), "1536B");
+    }
 
     #[test]
     fn name_validation() {
@@ -746,6 +870,18 @@ mod tests {
         assert!(validate_port("0:80").is_err());
         assert!(validate_port("8080").is_err());
         assert!(validate_port("1:2/sctp").is_err());
+        let implicit = parse_port("18080:80").unwrap();
+        assert!(implicit.implicit_loopback());
+        assert_eq!(implicit.bind_addr().to_string(), "127.0.0.1");
+        assert_eq!(implicit.proto, "tcp");
+        let any = parse_port("0.0.0.0:8080:80").unwrap();
+        assert_eq!(any.bind_addr().to_string(), "0.0.0.0");
+        assert_eq!(any.pod_port, 80);
+        let v6 = parse_port("[2001:db8::1]:9:9/udp").unwrap();
+        assert_eq!(v6.proto, "udp");
+        assert!(parse_port("[::]:443:443").is_ok());
+        assert!(parse_port("[::1]:80:80").is_err());
+        assert!(parse_port("10.1.1.1:1:1:1").is_err());
     }
 
     #[test]

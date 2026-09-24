@@ -58,7 +58,7 @@ service PodControl {
   // and reconstruct it on any host. Export streams the archive out;
   // Import consumes the archive as a client stream (first chunk may
   // carry ImportOptions for a rename).
-  rpc ExportPod(PodRef) returns (stream ExportChunk);
+  rpc ExportPod(ExportRequest) returns (stream ExportChunk);
   rpc ImportPod(stream ImportChunk) returns (Pod);
 
   // Multi-host mesh (Wave I): userspace WireGuard (BoringTun) between
@@ -80,6 +80,11 @@ service PodControl {
   // rustypods-ingress proxy), and report its health/route table.
   rpc InitIngress(InitIngressRequest) returns (IngressDeployment);
   rpc IngressGatewayStatus(IngressGatewayStatusRequest) returns (IngressGatewayStatusResponse);
+  // Remove the CA from the host trust store (the inverse of install_ca).
+  rpc UninstallIngressCa(Empty) returns (IngressCaResult);
+  // Replace an old CA. Trust stores that imported the previous CA must
+  // re-import; this does not edit the host trust store itself.
+  rpc RotateIngressCa(Empty) returns (IngressCaResult);
 }
 
 // In-pod agent → daemon, on the per-pod socket /run/rustypods/run/agent.sock.
@@ -126,6 +131,9 @@ message DaemonInfo {
   // lets clients (and a future GUI) show which capabilities are live.
   string storage_driver = 6;
   string runtime_engine = 7;
+  // Pod confs excluded from serving (parse error or invariant breach).
+  // Empty when every conf loaded.
+  repeated string quarantined = 8;
 }
 
 message Image {
@@ -162,6 +170,10 @@ message PullImageRequest {
   string reference = 1;
   // Optional image name; default = "<repo-basename>-<tag>" slug.
   string name = 2;
+  // Clear S_ISUID/S_ISGID while extracting layers. Default keeps them:
+  // images ship sudo/ping, and a user namespace contains that. Pods with
+  // private_users=false are trusted-images-only.
+  bool strip_setuid = 3;
 }
 
 enum PodState {
@@ -232,6 +244,11 @@ message Pod {
   // every peer host. "" when the mesh is not initialized or the pod
   // has no private netns.
   string mesh_ip = 24;
+  // Import response only: what sanitize stripped. Empty on every other RPC.
+  repeated string notes = 25;
+  // Conf opt-in: exec sessions run without NO_NEW_PRIVS (sudo works). In a
+  // pod without a user namespace that reaches host root.
+  bool allow_setuid = 26;
 }
 
 message PodList {
@@ -270,8 +287,21 @@ message VolumeInfoList {
 // One frame of a pod export archive (header+manifest in the first
 // chunk, then raw btrfs-send/tar payload bytes). The archive format is
 // opaque to the wire — the daemon owns it.
+message ExportRequest {
+  string name = 1;
+  // "" = auto (btrfs send on btrfs, tar elsewhere). "tar" forces tar
+  // even on a btrfs host. "btrfs" requires btrfs storage.
+  string format = 2;
+  // When cgroup freeze fails, still export (crash-consistent, like a
+  // power cut). Default is to abort so that failure is not silent.
+  bool allow_inconsistent = 3;
+}
+
 message ExportChunk {
   bytes data = 1;
+  // Operator notice (freeze skipped, …). Not archive bytes — clients
+  // print it and write only `data`.
+  string warning = 2;
 }
 
 // Client → daemon import stream: an optional leading options frame,
@@ -285,6 +315,9 @@ message ImportChunk {
 
 message ImportOptions {
   string rename = 1; // import under a different pod name ("" = keep)
+  // Keep exported binds, ports, env, autostart, restart, healthcheck
+  // and private_users=false. Default strips those host-root grants.
+  bool trust = 2;
 }
 
 // --- Multi-host mesh (Wave I) ---
@@ -321,6 +354,11 @@ message MeshStatus {
   uint64 tun_pkts = 8;
   // Mesh-DNS registry (Wave K): pod name → mesh addr, local + remote.
   map<string, string> names = 9;
+  // TUN writes that returned EAGAIN and were dropped.
+  uint64 tun_drops = 10;
+  // Set when conf/mesh.conf exists but failed to parse and the mesh
+  // was left down. Empty when the mesh is up or simply uninitialized.
+  string conf_error = 11;
 }
 
 message ListPodsRequest {}
@@ -367,6 +405,8 @@ message CreatePodRequest {
   // Named volumes "name:/pod/path[:ro]" — auto-created on first use,
   // survive pod destroy.
   repeated string volumes = 14;
+  // Seconds to wait for a clean poweroff before hard-kill. 0 = 8s.
+  uint64 stop_timeout_secs = 15;
 }
 
 message ClonePodRequest {
@@ -483,6 +523,8 @@ message UpdatePodConfigRequest {
   // Absent = keep; present (even empty) = replace volume mounts.
   // Takes effect on the next pod start.
   optional VolumeList volumes = 14;
+  // Absent = keep. 0 = the 8s default. Seconds before hard-kill on stop.
+  optional uint64 stop_timeout_secs = 15;
 }
 
 message StartPodRequest {
@@ -601,6 +643,11 @@ message IngressDeployment {
   string ca_cert_path = 2;
   // Whether the CA was also installed into the host trust store.
   bool ca_installed = 3;
+}
+
+message IngressCaResult {
+  string ca_cert_path = 1;
+  string detail = 2;
 }
 
 message IngressGatewayStatusRequest {}
