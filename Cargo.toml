@@ -55,7 +55,7 @@ oci-client = { version = "=0.18.0", default-features = false, features = ["rustl
 tar = "=0.4.46"
 flate2 = "=1.1.10"
 zstd = "=0.13.3"
-boringtun = "=0.6.0"
+boringtun = "=0.7.1"
 rand_core = "0.6"
 sha2 = "0.10"
 base64 = "0.22"

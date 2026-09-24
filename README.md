@@ -115,6 +115,16 @@ rustypods --remote user@server ps         # manage a remote daemon over SSH (nee
 Handy flags: `start --ephemeral` (throwaway run, `-x`) and
 `start --no-private-users` (drops the user namespace; persisted to the conf).
 
+### Mesh
+
+`rustypods mesh init` creates `conf/mesh.conf` (mode 0600, holds the
+WireGuard private key) and a stable ULA /48. Peers are added with
+`mesh add-peer`. There is no in-band key rotation: `mesh deinit` (or
+remove a corrupt `conf/mesh.conf` by hand) on every host, then `mesh
+init` and re-add peers with the new pubkeys. `mesh init` will not
+replace a file it cannot parse — that would mint a new /48 and break
+every peer. `mesh status` shows that parse error when the mesh is down.
+
 ## Bind mounts & sandboxing
 
 Pods get no host paths by default. Add explicit binds at create or later —

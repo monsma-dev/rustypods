@@ -500,13 +500,22 @@ impl Svc {
         if let Some(m) = self.mesh() {
             return Ok(m.status().await);
         }
-        let mut conf = state::load_mesh(&self.cfg.data_dir).unwrap_or_default();
+        let mut conf = match state::load_mesh(&self.cfg.data_dir) {
+            Ok(c) => c.unwrap_or_default(),
+            Err(e) => {
+                return Err(Status::failed_precondition(format!(
+                    "refusing to mesh init: {e:#}"
+                )));
+            }
+        };
         if conf.private_key.is_empty() {
             let (priv_, _pub) = mesh::keygen();
             conf.private_key = priv_;
         }
-        if listen_port != 0 {
-            conf.listen_port = listen_port as u16;
+        if let Some(port) =
+            mesh::checked_listen_port(listen_port).map_err(Status::invalid_argument)?
+        {
+            conf.listen_port = port;
         }
         state::save_mesh(&self.cfg.data_dir, &conf).map_err(int)?;
         let m = mesh::Mesh::start(&self.cfg.data_dir, conf)
@@ -1871,10 +1880,17 @@ impl PodControl for Svc {
     async fn get_mesh_status(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
         match self.mesh() {
             Some(m) => Ok(Response::new(m.status().await)),
-            None => Ok(Response::new(MeshStatus {
-                enabled: false,
-                ..Default::default()
-            })),
+            None => {
+                let conf_error = match state::load_mesh(&self.cfg.data_dir) {
+                    Err(e) => e.to_string(),
+                    Ok(_) => String::new(),
+                };
+                Ok(Response::new(MeshStatus {
+                    enabled: false,
+                    conf_error,
+                    ..Default::default()
+                }))
+            }
         }
     }
 
@@ -5044,15 +5060,19 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // daemon restart re-derives the same /48 and re-attaches the same
     // persistent rp-mesh0 — routes and pod addrs survive intact. Bring
     // it up BEFORE autostart so those pods get mesh addresses.
-    if let Some(conf) = state::load_mesh(&cfg.data_dir) {
-        match mesh::Mesh::start(&cfg.data_dir, conf).await {
+    match state::load_mesh(&cfg.data_dir) {
+        Ok(Some(conf)) => match mesh::Mesh::start(&cfg.data_dir, conf).await {
             Ok(m) => {
                 tracing::info!("mesh up: {} on [::]:{}", m.prefix, m.port);
                 *svc.mesh.write().unwrap() = Some(m);
                 svc.assign_mesh_addrs().await;
             }
             Err(e) => tracing::error!("mesh start failed (mesh disabled): {e:#}"),
-        }
+        },
+        Ok(None) => {}
+        Err(e) => tracing::error!(
+            "mesh.conf failed to load; mesh stays down (fix or remove the file — do not generate a new key): {e:#}"
+        ),
     }
 
     // Autostart: pods flagged `autostart = true` in their conf get booted

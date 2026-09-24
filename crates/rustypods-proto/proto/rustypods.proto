@@ -321,6 +321,11 @@ message MeshStatus {
   uint64 tun_pkts = 8;
   // Mesh-DNS registry (Wave K): pod name → mesh addr, local + remote.
   map<string, string> names = 9;
+  // TUN writes that returned EAGAIN and were dropped.
+  uint64 tun_drops = 10;
+  // Set when conf/mesh.conf exists but failed to parse and the mesh
+  // was left down. Empty when the mesh is up or simply uninitialized.
+  string conf_error = 11;
 }
 
 message ListPodsRequest {}

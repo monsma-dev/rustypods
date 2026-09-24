@@ -1,7 +1,8 @@
 //! Multi-host pod mesh (Wave I): userspace WireGuard via BoringTun.
 //!
 //! Each daemon derives a stable ULA /48 from its own WG pubkey —
-//! `fd<40 bits of sha256(pubkey)>` — so every pod mesh address is
+//! `fd` plus 40 bits of sha256(pubkey), with two Global-ID bits
+//! forced (see `prefix_of`) — so every pod mesh address is
 //! cryptographically bound to the host identity with zero
 //! coordination, and a peer's prefix is verified BY its pubkey rather
 //! than trusted from config.
@@ -41,6 +42,18 @@ use crate::state::{MeshConf, MeshPeerConf};
 
 pub const TUN_NAME: &str = "rp-mesh0";
 pub const DEFAULT_PORT: u16 = 51820;
+
+/// `0` means "keep the default". Anything outside `1..=65535` is an
+/// error — a bare `as u16` would wrap 70000 to 4464.
+pub fn checked_listen_port(listen_port: u32) -> Result<Option<u16>, &'static str> {
+    if listen_port == 0 {
+        return Ok(None);
+    }
+    match u16::try_from(listen_port) {
+        Ok(p) => Ok(Some(p)),
+        Err(_) => Err("listen_port must be 1..=65535"),
+    }
+}
 /// The host's own mesh address: `fd<host>::1/128` on rp-mesh0. Hosts
 /// speak host-to-host control protocols (gossip, DNS) at this addr;
 /// pods live at `:<idx>::2`.
@@ -49,6 +62,17 @@ pub const HOST_SUFFIX: u128 = 1;
 const GOSSIP_PORT: u16 = 5305;
 /// Pod-facing DNS on the host mesh addr.
 const DNS_PORT: u16 = 53;
+/// Concurrent UDP queries. Each may block up to 3s on upstream; the
+/// recv loop must not await them inline or one slow resolver stalls
+/// every pod.
+const DNS_UDP_INFLIGHT: usize = 64;
+/// Simultaneous DNS-over-TCP clients. Extra accepts are dropped.
+const DNS_TCP_MAX_CONNS: usize = 32;
+/// RFC 1035 length prefix cap. Matches the UDP buffer so a client
+/// can't force a 64KiB allocation per connection.
+const DNS_TCP_MAX_MSG: usize = 4096;
+/// Per-read idle timeout on a DNS TCP connection.
+const DNS_TCP_IDLE: Duration = Duration::from_secs(5);
 /// Announce cadence; remote registries expire after 3 intervals.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 const NAME_TTL: Duration = Duration::from_secs(95);
@@ -107,8 +131,13 @@ pub fn prefix_of(pubkey_b64: &str) -> Result<Ipv6Addr> {
     let pk = parse_pubkey(pubkey_b64)?;
     let h = Sha256::digest(pk);
     let mut s = h[0..5].to_vec();
+    // RFC 4193: fd00::/8 is fc00::/7 with the L bit already 1. The next
+    // 40 bits are the Global ID. This mask does NOT set L — the high
+    // byte is forced to 0xfd below. It clears two bits of the Global
+    // ID (and sets one). Kept as-is: changing it would move every
+    // existing host's /48 and break its peers.
     s[0] &= 0x3f;
-    s[0] |= 0x40; // L-bit set: locally assigned ULA (RFC 4193)
+    s[0] |= 0x40;
     Ok(Ipv6Addr::new(
         0xfd00 | s[0] as u16,
         (s[1] as u16) << 8 | s[2] as u16,
@@ -176,6 +205,8 @@ pub struct Mesh {
     pub udp_pkts: std::sync::atomic::AtomicU64,
     /// TUN packets the pump has consumed so far.
     pub tun_pkts: std::sync::atomic::AtomicU64,
+    /// TUN writes dropped because the device returned EAGAIN.
+    pub tun_drops: std::sync::atomic::AtomicU64,
     /// Where the pump is parked (diag): 0=in select, 1=tun read,
     /// 2=route_out, 3=udp recv, 4=handle_udp, 5=timers.
     pub pump_where: std::sync::atomic::AtomicU8,
@@ -240,7 +271,10 @@ fn open_tun(name: &str) -> Result<std::fs::File> {
     };
     let nb = name.as_bytes();
     req.name[..nb.len().min(15)].copy_from_slice(&nb[..nb.len().min(15)]);
-    if unsafe { libc::ioctl(f.as_raw_fd(), TUNSETIFF, &req) } < 0 {
+    // SAFETY: req is a valid IfReq we own, and TUNSETIFF writes the
+    // kernel's interface name back into req.name. It must be &mut —
+    // a shared reference would be UB once the kernel stores through it.
+    if unsafe { libc::ioctl(f.as_raw_fd(), TUNSETIFF, &mut req) } < 0 {
         return Err(std::io::Error::last_os_error()).context("TUNSETIFF rp-mesh0");
     }
     Ok(f)
@@ -357,6 +391,7 @@ impl Mesh {
             pump_ticks: Default::default(),
             udp_pkts: Default::default(),
             tun_pkts: Default::default(),
+            tun_drops: Default::default(),
             pump_where: Default::default(),
             shutdown_tx,
             supervisor: Mutex::new(None),
@@ -390,13 +425,47 @@ impl Mesh {
             }
         }));
         // Mesh-DNS tasks: registry gossip + pod-facing DNS responder.
-        // All subscribe to shutdown_tx and land in `tasks` so
-        // shutdown() can wait for a real teardown.
+        // Each runs under a supervisor (a panic would otherwise die on
+        // a dropped JoinHandle and take DNS or gossip down for good).
+        // shutdown() awaits these handles; the inner tasks exit when
+        // the watch channel flips.
         let mut tasks = mesh.tasks.lock().await;
-        tasks.push(tokio::spawn(mesh.clone().gossip_rx()));
-        tasks.push(tokio::spawn(mesh.clone().announcer()));
-        tasks.push(tokio::spawn(mesh.clone().dns_server()));
-        tasks.push(tokio::spawn(mesh.clone().dns_tcp_server()));
+        tasks.push(supervise_loop(
+            "gossip",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().gossip_rx())
+            },
+        ));
+        tasks.push(supervise_loop(
+            "announcer",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().announcer())
+            },
+        ));
+        tasks.push(supervise_loop(
+            "dns",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().dns_server())
+            },
+        ));
+        tasks.push(supervise_loop(
+            "dns-tcp",
+            mesh.shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+            {
+                let m = mesh.clone();
+                move || tokio::spawn(m.clone().dns_tcp_server())
+            },
+        ));
         drop(tasks);
         Ok(mesh)
     }
@@ -410,7 +479,10 @@ impl Mesh {
                 .with_context(|| format!("invalid endpoint '{endpoint}' — want ip:port"))?,
         );
         let priv_b64 = { self.conf.lock().await.private_key.clone() };
-        let priv_bytes: [u8; 32] = WG_B64.decode(priv_b64.trim())?.try_into().unwrap();
+        let priv_bytes: [u8; 32] = WG_B64
+            .decode(priv_b64.trim())?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("mesh private key must decode to 32 bytes"))?;
         let secret = StaticSecret::from(priv_bytes);
         let pc = MeshPeerConf {
             endpoint: endpoint.to_string(),
@@ -537,7 +609,9 @@ impl Mesh {
             pump_ticks: self.pump_ticks.load(std::sync::atomic::Ordering::Relaxed),
             udp_pkts: self.udp_pkts.load(std::sync::atomic::Ordering::Relaxed),
             tun_pkts: self.tun_pkts.load(std::sync::atomic::Ordering::Relaxed),
+            tun_drops: self.tun_drops.load(std::sync::atomic::Ordering::Relaxed),
             names: self.names().await.into_iter().collect(),
+            conf_error: String::new(),
         }
     }
 
@@ -597,6 +671,8 @@ impl Mesh {
                     self.pump_where.store(1, Relaxed);
                     let Ok(mut guard) = r else { continue };
                     if let Ok(Ok(n)) = guard.try_io(|fd| {
+                        // SAFETY: tun_buf is a live Vec we exclusively
+                        // borrow for this read; the fd is the TUN we opened.
                         let n = unsafe {
                             libc::read(fd.as_raw_fd(), tun_buf.as_mut_ptr() as *mut _, tun_buf.len())
                         };
@@ -620,13 +696,19 @@ impl Mesh {
     }
 
     async fn tun_write(&self, pkt: &[u8]) {
-        let _ = unsafe {
+        // SAFETY: pkt is a valid slice for this write; the fd is the
+        // nonblocking TUN opened above. A short write or EAGAIN drops
+        // the packet — the TUN queue is best-effort.
+        let n = unsafe {
             libc::write(
                 self.tun.get_ref().as_raw_fd(),
                 pkt.as_ptr() as *const _,
                 pkt.len(),
             )
         };
+        if n < 0 {
+            note_tun_io_err(&std::io::Error::last_os_error(), &self.tun_drops);
+        }
     }
 
     /// TUN → wire: find the peer owning the dst /48 and encapsulate.
@@ -886,7 +968,10 @@ impl Mesh {
     /// Pod-facing DNS on [fd<host>::1]:53. Mesh names answer locally
     /// (AAAA → addr, A → NODATA); everything else relays upstream so a
     /// pod's resolv.conf can point only at us without losing real DNS.
+    /// Queries run on spawned tasks behind `DNS_UDP_INFLIGHT` so a slow
+    /// upstream (dns_forward waits up to 3s) cannot stall the socket.
     async fn dns_server(self: Arc<Self>) {
+        let sem = Arc::new(tokio::sync::Semaphore::new(DNS_UDP_INFLIGHT));
         let mut buf = vec![0u8; 4096];
         let mut shutdown = self.shutdown_tx.subscribe();
         loop {
@@ -894,9 +979,18 @@ impl Mesh {
                 _ = shutdown.changed() => break,
                 r = self.dns.recv_from(&mut buf) => {
                     let Ok((n, src)) = r else { continue };
-                    if let Some(rep) = self.answer_query(&buf[..n]).await {
-                        let _ = self.dns.send_to(&rep, src).await;
-                    }
+                    let pkt = buf[..n].to_vec();
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        tracing::debug!("mesh dns: udp inflight cap, dropping {src}");
+                        continue;
+                    };
+                    let m = self.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Some(rep) = m.answer_query(&pkt).await {
+                            let _ = m.dns.send_to(&rep, src).await;
+                        }
+                    });
                 }
             }
         }
@@ -904,32 +998,24 @@ impl Mesh {
 
     /// DNS-over-TCP on the same addr — RFC requires it for truncated
     /// answers and some resolvers probe TCP first. 2-byte length
-    /// prefix framing per RFC 1035 §4.2.2.
+    /// prefix framing per RFC 1035 §4.2.2. Connections are capped and
+    /// each read is idle-bounded so a client can't pin an fd forever.
     async fn dns_tcp_server(self: Arc<Self>) {
+        let sem = Arc::new(tokio::sync::Semaphore::new(DNS_TCP_MAX_CONNS));
         let mut shutdown = self.shutdown_tx.subscribe();
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
                 r = self.dns_tcp.accept() => {
-                    let Ok((mut s, _)) = r else { continue };
+                    let Ok((s, peer)) = r else { continue };
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        tracing::debug!("mesh dns: tcp conn cap, dropping {peer}");
+                        continue;
+                    };
                     let m = self.clone();
                     tokio::spawn(async move {
-                        let mut len = [0u8; 2];
-                        while s.read_exact(&mut len).await.is_ok() {
-                            let n = u16::from_be_bytes(len) as usize;
-                            let mut q = vec![0u8; n];
-                            if s.read_exact(&mut q).await.is_err() {
-                                return;
-                            }
-                            if let Some(rep) = m.answer_query(&q).await {
-                                let l = (rep.len() as u16).to_be_bytes();
-                                if s.write_all(&l).await.is_err()
-                                    || s.write_all(&rep).await.is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
+                        let _permit = permit;
+                        dns_tcp_conn(m, s).await;
                     });
                 }
             }
@@ -941,8 +1027,8 @@ impl Mesh {
     async fn answer_query(&self, pkt: &[u8]) -> Option<Vec<u8>> {
         let (qname, qtype) = dns_query_name(pkt)?;
         match self.resolve(&qname).await {
-            Some(addr) if qtype == 28 => Some(dns_answer_aaaa(pkt, addr)),
-            Some(_) => Some(dns_nodata(pkt)),
+            Some(addr) if qtype == 28 => dns_answer_aaaa(pkt, addr),
+            Some(_) => dns_nodata(pkt),
             None => self.dns_forward(pkt).await,
         }
     }
@@ -962,32 +1048,109 @@ impl Mesh {
     }
 }
 
+/// Accept a DNS-over-TCP length prefix, or None when it is empty or
+/// above `DNS_TCP_MAX_MSG`.
+fn dns_tcp_payload_len(n: u16) -> Option<usize> {
+    let n = n as usize;
+    if n == 0 || n > DNS_TCP_MAX_MSG {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// One DNS TCP client. Returns on idle timeout, a short read, or an
+/// oversize length prefix — the connection is then dropped.
+async fn dns_tcp_conn(m: Arc<Mesh>, mut s: tokio::net::TcpStream) {
+    let mut len = [0u8; 2];
+    loop {
+        if tokio::time::timeout(DNS_TCP_IDLE, s.read_exact(&mut len))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_none()
+        {
+            return;
+        }
+        let Some(n) = dns_tcp_payload_len(u16::from_be_bytes(len)) else {
+            return;
+        };
+        let mut q = vec![0u8; n];
+        if tokio::time::timeout(DNS_TCP_IDLE, s.read_exact(&mut q))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .is_none()
+        {
+            return;
+        }
+        if let Some(rep) = m.answer_query(&q).await {
+            if rep.len() > u16::MAX as usize {
+                return;
+            }
+            let l = (rep.len() as u16).to_be_bytes();
+            let write = async {
+                s.write_all(&l).await?;
+                s.write_all(&rep).await?;
+                Ok::<(), std::io::Error>(())
+            };
+            if tokio::time::timeout(DNS_TCP_IDLE, write)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .is_none()
+            {
+                return;
+            }
+        }
+    }
+}
+
 /// Extract (single-label name, qtype) from a DNS query. Recognizes a
 /// bare `db`, `db.rp`, `db.pods` or `db.local` — the zone suffixes a
-/// pod's `search` line or a typed FQDN produces.
+/// pod's `search` line or a typed FQDN produces. Every index is
+/// bounds-checked: a truncated question (missing qclass, cut-off
+/// label) returns None instead of panicking the DNS task.
 fn dns_query_name(pkt: &[u8]) -> Option<(String, u16)> {
     if pkt.len() < 12 || pkt[2] & 0x80 != 0 {
         return None; // not a query
     }
+    // One question only — qd=0 has nothing to answer, qd>1 is not
+    // something the mesh resolver owns.
+    let qd = u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]);
+    if qd != 1 {
+        return None;
+    }
     let mut qname = String::new();
     let mut i = 12;
+    let mut labels = 0usize;
     loop {
         let len = *pkt.get(i)? as usize;
         if len == 0 {
             break;
         }
-        if len & 0xc0 != 0 {
-            return None; // compression in a question — refuse
+        // Compression pointer or an over-long label — refuse rather
+        // than walk off the buffer (a 0xC0 length used to be added
+        // unchecked and the following slice panicked).
+        if len & 0xc0 != 0 || len > 63 {
+            return None;
         }
-        i += 1;
-        let label = std::str::from_utf8(pkt.get(i..i + len)?).ok()?;
+        i = i.checked_add(1)?;
+        let label = std::str::from_utf8(pkt.get(i..i.checked_add(len)?)?).ok()?;
         if !qname.is_empty() {
             qname.push('.');
         }
         qname.push_str(&label.to_lowercase());
-        i += len;
+        i = i.checked_add(len)?;
+        labels += 1;
+        if labels > 128 {
+            return None;
+        }
     }
-    let qtype = u16::from_be_bytes([*pkt.get(i + 1)?, *pkt.get(i + 2)?]);
+    // qtype AND qclass — an 18-byte `db` query has the type but not
+    // the class; answering it used to panic in dns_response_base.
+    let qtype = u16::from_be_bytes([*pkt.get(i.checked_add(1)?)?, *pkt.get(i.checked_add(2)?)?]);
+    let _qclass = u16::from_be_bytes([*pkt.get(i.checked_add(3)?)?, *pkt.get(i.checked_add(4)?)?]);
     for zone in [".rp", ".pods", ".local", ".rustypods"] {
         if let Some(stripped) = qname.strip_suffix(zone) {
             qname = stripped.to_string();
@@ -1000,18 +1163,48 @@ fn dns_query_name(pkt: &[u8]) -> Option<(String, u16)> {
     Some((qname, qtype))
 }
 
-/// Flip the query header into a response (QR|RA, rcode NOERROR), keep
-/// the question section, and truncate any prior answers.
+/// Walk one uncompressed DNS name starting at `i`. Returns the index
+/// just past the root label. Compression pointers and labels >63 are
+/// rejected — the builders only echo a question they fully own.
+fn dns_skip_name(pkt: &[u8], mut i: usize) -> Option<usize> {
+    let mut labels = 0usize;
+    loop {
+        let len = *pkt.get(i)? as usize;
+        if len == 0 {
+            return i.checked_add(1);
+        }
+        if len & 0xc0 != 0 || len > 63 {
+            return None;
+        }
+        i = i.checked_add(1)?.checked_add(len)?;
+        pkt.get(i)?;
+        labels += 1;
+        if labels > 128 {
+            return None;
+        }
+    }
+}
+
+/// Flip the query header into a response (QR|AA|RA, rcode NOERROR),
+/// keep the single question, and drop any prior answers. None when
+/// the packet is truncated, compressed, or not exactly one question —
+/// callers must not slice past `pkt.len()`.
 fn dns_response_base(pkt: &[u8]) -> Option<Vec<u8>> {
+    pkt.get(..12)?;
     let qd = u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]) as usize;
+    if qd != 1 {
+        return None;
+    }
     let mut i = 12;
     for _ in 0..qd {
-        while *pkt.get(i)? != 0 {
-            i += 1 + *pkt.get(i)? as usize;
+        i = dns_skip_name(pkt, i)?;
+        // qtype + qclass
+        if pkt.get(i..i.checked_add(4)?)?.len() != 4 {
+            return None;
         }
-        i += 5; // root label + qtype + qclass
+        i += 4;
     }
-    let mut out = pkt[..i].to_vec();
+    let mut out = pkt.get(..i)?.to_vec();
     out[2] |= 0x84; // QR + AA
     out[3] = 0x80; // RA
     out[6..8].copy_from_slice(&[0, 0]); // ancount
@@ -1021,15 +1214,13 @@ fn dns_response_base(pkt: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// NOERROR with zero answers — correct for `A podname` on a v6 mesh.
-fn dns_nodata(pkt: &[u8]) -> Vec<u8> {
-    dns_response_base(pkt).unwrap_or_else(|| pkt.to_vec())
+fn dns_nodata(pkt: &[u8]) -> Option<Vec<u8>> {
+    dns_response_base(pkt)
 }
 
 /// AAAA answer for a resolved mesh name: name compressed to 0xC00C.
-fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Vec<u8> {
-    let Some(mut out) = dns_response_base(pkt) else {
-        return pkt.to_vec();
-    };
+fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Option<Vec<u8>> {
+    let mut out = dns_response_base(pkt)?;
     out[6..8].copy_from_slice(&[0, 1]); // ancount = 1
     out.extend_from_slice(&[0xc0, 0x0c]); // name → question
     out.extend_from_slice(&28u16.to_be_bytes()); // AAAA
@@ -1037,7 +1228,7 @@ fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Vec<u8> {
     out.extend_from_slice(&5u32.to_be_bytes()); // TTL 5s
     out.extend_from_slice(&16u16.to_be_bytes()); // rdlength
     out.extend_from_slice(&addr.octets());
-    out
+    Some(out)
 }
 
 /// Registry values must stay inside the announcer's own /48 — never
@@ -1063,6 +1254,47 @@ fn valid_dns_label(n: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Count a failed TUN write. EAGAIN/EWOULDBLOCK is expected on a
+/// nonblocking device and is surfaced via `MeshStatus.tun_drops`;
+/// the log is power-of-two so a full queue doesn't flood the journal.
+fn note_tun_io_err(err: &std::io::Error, drops: &std::sync::atomic::AtomicU64) {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        let n = drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            tracing::warn!("mesh tun write EAGAIN, dropped {n} packet(s)");
+        }
+    } else {
+        tracing::debug!("mesh tun write: {err}");
+    }
+}
+
+/// Restart `spawn` until it returns normally or `shutdown` is set.
+/// A panic sleeps `backoff` (doubled each time, capped at 30s) and
+/// tries again — the same idea as the pump supervisor, so a DNS or
+/// gossip panic does not stay dead until the daemon restarts.
+fn supervise_loop(
+    name: &'static str,
+    shutdown: watch::Receiver<bool>,
+    mut backoff: Duration,
+    spawn: impl Fn() -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            match spawn().await {
+                Ok(()) => break,
+                Err(e) => {
+                    tracing::error!("mesh {name} panicked: {e}; restarting in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    })
+}
+
 /// Build one boringtun session for a peer conf.
 fn build_peer(secret: &StaticSecret, pc: &MeshPeerConf, index: u32) -> Result<(Peer, SocketAddr)> {
     let pk = parse_pubkey(&pc.pubkey)?;
@@ -1078,8 +1310,7 @@ fn build_peer(secret: &StaticSecret, pc: &MeshPeerConf, index: u32) -> Result<(P
         Some(25), // keepalive: NAT'd peers stay mapped
         index,
         None, // per-peer rate limiter
-    )
-    .map_err(|e| anyhow::anyhow!("boringtun peer init: {e}"))?;
+    );
     Ok((
         Peer {
             tunn,
@@ -1146,6 +1377,27 @@ mod tests {
         assert!(pubkey_of("not-b64!!!").is_err());
     }
 
+    #[test]
+    fn listen_port_rejects_overflow() {
+        assert_eq!(checked_listen_port(0).unwrap(), None);
+        assert_eq!(checked_listen_port(51820).unwrap(), Some(51820));
+        assert_eq!(checked_listen_port(65535).unwrap(), Some(65535));
+        assert!(checked_listen_port(70000).is_err());
+        assert!(checked_listen_port(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn tun_eagain_is_counted() {
+        let drops = std::sync::atomic::AtomicU64::new(0);
+        let err = std::io::Error::from_raw_os_error(libc::EAGAIN);
+        note_tun_io_err(&err, &drops);
+        note_tun_io_err(&err, &drops);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let other = std::io::Error::from_raw_os_error(libc::EIO);
+        note_tun_io_err(&other, &drops);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
     /// Minimal DNS query packet: id, flags, qdcount=1, one qname.
     fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
         let mut p = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -1193,7 +1445,7 @@ mod tests {
     fn dns_aaaa_answer_roundtrips() {
         let q = dns_query("db", 28);
         let addr = Ipv6Addr::new(0xfd41, 0x85b6, 0xa9dd, 4, 0, 0, 0, 2);
-        let ans = dns_answer_aaaa(&q, addr);
+        let ans = dns_answer_aaaa(&q, addr).unwrap();
         // Header: QR set, ancount=1.
         assert_eq!(ans[2] & 0x80, 0x80);
         assert_eq!(&ans[6..8], &[0, 1]);
@@ -1207,10 +1459,124 @@ mod tests {
 
     #[test]
     fn dns_nodata_has_zero_answers() {
-        let ans = dns_nodata(&dns_query("db", 1));
+        let ans = dns_nodata(&dns_query("db", 1)).unwrap();
         assert_eq!(ans[2] & 0x80, 0x80); // still a valid response
         assert_eq!(&ans[6..8], &[0, 0]); // ancount = 0 → NODATA
         assert_eq!(ans[3] & 0x0f, 0); // rcode NOERROR, not NXDOMAIN
+    }
+
+    /// The 18-byte `db` query that killed the DNS task: header + label
+    /// + root + qtype, qclass truncated. Builders must return None.
+    #[test]
+    fn dns_truncated_question_does_not_panic() {
+        let mut q = dns_query("db", 28);
+        assert!(q.len() > 18);
+        q.truncate(18);
+        assert_eq!(dns_query_name(&q), None);
+        assert_eq!(dns_response_base(&q), None);
+        assert_eq!(dns_nodata(&q), None);
+        assert_eq!(dns_answer_aaaa(&q, Ipv6Addr::LOCALHOST), None);
+
+        assert_eq!(dns_query_name(&[0u8; 11]), None); // truncated header
+        assert_eq!(dns_response_base(&[0u8; 11]), None);
+
+        let mut qd0 = dns_query("db", 28);
+        qd0[4] = 0;
+        qd0[5] = 0;
+        assert_eq!(dns_query_name(&qd0), None);
+        assert_eq!(dns_response_base(&qd0), None);
+
+        let mut qd2 = dns_query("db", 28);
+        qd2[5] = 2;
+        assert_eq!(dns_query_name(&qd2), None);
+        assert_eq!(dns_response_base(&qd2), None);
+
+        // Compression pointer where a label length should be.
+        let mut comp = dns_query("db", 28);
+        comp[12] = 0xc0;
+        comp[13] = 0x0c;
+        assert_eq!(dns_query_name(&comp), None);
+        assert_eq!(dns_response_base(&comp), None);
+
+        // Label length 64 (illegal) and a length that would walk past
+        // the buffer if added unchecked.
+        let mut big = vec![0u8; 20];
+        big[5] = 1; // qdcount
+        big[12] = 64;
+        assert_eq!(dns_query_name(&big), None);
+        assert_eq!(dns_answer_aaaa(&big, Ipv6Addr::LOCALHOST), None);
+        big[12] = 200;
+        assert_eq!(dns_response_base(&big), None);
+    }
+
+    /// Every parser/builder must survive arbitrary input. xorshift so
+    /// the sequence is deterministic and dependency-free.
+    #[test]
+    fn dns_tcp_rejects_empty_and_oversize_lengths() {
+        assert_eq!(dns_tcp_payload_len(0), None);
+        assert_eq!(dns_tcp_payload_len(1), Some(1));
+        assert_eq!(
+            dns_tcp_payload_len(DNS_TCP_MAX_MSG as u16),
+            Some(DNS_TCP_MAX_MSG)
+        );
+        assert_eq!(
+            dns_tcp_payload_len((DNS_TCP_MAX_MSG as u16).saturating_add(1)),
+            None
+        );
+        assert_eq!(DNS_UDP_INFLIGHT, 64);
+        const _: () = assert!(DNS_TCP_MAX_CONNS > 0 && DNS_TCP_MAX_CONNS <= DNS_UDP_INFLIGHT);
+        assert_eq!(DNS_TCP_IDLE, Duration::from_secs(5));
+    }
+
+    /// A panicked background task is restarted; a clean return ends the
+    /// supervisor. Shutdown set before the next spawn also ends it.
+    #[tokio::test]
+    async fn supervisor_restarts_then_stops() {
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runs2 = runs.clone();
+        let (_tx, rx) = watch::channel(false);
+        let h = supervise_loop("test", rx, Duration::from_millis(20), move || {
+            let runs = runs2.clone();
+            tokio::spawn(async move {
+                if runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    panic!("mesh task boom");
+                }
+            })
+        });
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("supervisor hung")
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let (_tx2, rx2) = watch::channel(true);
+        let h = supervise_loop("test-stop", rx2, Duration::from_secs(30), || {
+            tokio::spawn(async { panic!("should not run") })
+        });
+        tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("shutdown did not stop supervisor")
+            .unwrap();
+    }
+
+    #[test]
+    fn dns_random_bytes_never_panic() {
+        let mut state = 0xA5A5_1234u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for _ in 0..4_000 {
+            let len = (next() % 80) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let _ = dns_query_name(&buf);
+            let _ = dns_response_base(&buf);
+            let _ = dns_nodata(&buf);
+            let _ = dns_answer_aaaa(&buf, Ipv6Addr::LOCALHOST);
+            let _ = dns_skip_name(&buf, (next() as usize) % (len.max(1)));
+        }
     }
 
     #[test]

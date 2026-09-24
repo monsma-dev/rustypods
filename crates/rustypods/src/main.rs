@@ -1093,9 +1093,12 @@ fn print_mesh_status(st: &MeshStatus) {
     println!("listen:  {}", st.listen);
     println!("prefix:  {}", st.prefix);
     println!(
-        "pump:    ticks={} udp={} tun={}",
-        st.pump_ticks, st.udp_pkts, st.tun_pkts
+        "pump:    ticks={} udp={} tun={} tun_drops={}",
+        st.pump_ticks, st.udp_pkts, st.tun_pkts, st.tun_drops
     );
+    if !st.conf_error.is_empty() {
+        println!("error:   {}", st.conf_error);
+    }
     if st.peers.is_empty() {
         println!("peers:   none — `rustypods mesh add-peer <ip:port> <pubkey>`");
     }

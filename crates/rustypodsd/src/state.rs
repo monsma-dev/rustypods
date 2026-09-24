@@ -464,7 +464,7 @@ pub fn save_pod(data_dir: &Path, m: &PodMeta) -> Result<()> {
 /// Multi-host mesh config (Wave I): the host's WG identity + static
 /// peers. One TOML file — not per-entity confs — because it's a single
 /// daemon-scoped object, not a registry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct MeshConf {
     #[serde(default = "default_format")]
     pub format: u32,
@@ -490,18 +490,44 @@ fn default_mesh_port() -> u16 {
     51820
 }
 
+impl std::fmt::Debug for MeshConf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshConf")
+            .field("format", &self.format)
+            .field("private_key", &"<redacted>")
+            .field("listen_port", &self.listen_port)
+            .field("peers", &self.peers)
+            .finish()
+    }
+}
+
 fn mesh_conf_path(data_dir: &Path) -> std::path::PathBuf {
     rustypods_proto::conf_dir(data_dir).join("mesh.conf")
 }
 
-pub fn load_mesh(data_dir: &Path) -> Option<MeshConf> {
+/// Load the host mesh identity.
+///
+/// `Ok(None)` — no file, or a parsed file with an empty key (never
+/// initialized). `Err` — the file exists but cannot be read or parsed.
+/// Callers must not treat that as "no mesh" and mint a new key: the
+/// /48 is sha256(pubkey), so a fresh key silently breaks every peer.
+pub fn load_mesh(data_dir: &Path) -> Result<Option<MeshConf>> {
     let p = mesh_conf_path(data_dir);
-    let s = std::fs::read_to_string(p).ok()?;
-    let m: MeshConf = toml::from_str(&s).ok()?;
+    let s = match std::fs::read_to_string(&p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
+    };
+    let m: MeshConf = toml::from_str(&s).with_context(|| {
+        format!(
+            "{} is corrupt; fix or remove it before mesh init (a new key would change this host's /48 and break every peer)",
+            p.display()
+        )
+    })?;
     if m.private_key.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(m)
+    Ok(Some(m))
 }
 
 pub fn save_mesh(data_dir: &Path, m: &MeshConf) -> Result<()> {
@@ -1139,7 +1165,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rp-mesh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Absent file → None (mesh never initialized).
-        assert!(load_mesh(&dir).is_none());
+        assert!(load_mesh(&dir).unwrap().is_none());
         let conf = MeshConf {
             format: CONF_FORMAT,
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
@@ -1157,13 +1183,21 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "mesh.conf holds a private key");
-        let back = load_mesh(&dir).unwrap();
+        let back = load_mesh(&dir).unwrap().unwrap();
         assert_eq!(back.private_key, conf.private_key);
         assert_eq!(back.peers.len(), 1);
         assert_eq!(back.peers[0].endpoint, "192.0.2.1:51820");
         // Empty key = uninitialized even if the file exists.
         save_mesh(&dir, &MeshConf::default()).unwrap();
-        assert!(load_mesh(&dir).is_none());
+        assert!(load_mesh(&dir).unwrap().is_none());
+        // Debug must not leak the private key.
+        let shown = format!("{:?}", conf);
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains(&conf.private_key));
+        // A truncated file is an error, not "uninitialized".
+        std::fs::write(dir.join("conf/mesh.conf"), "private_key = \"abc\n").unwrap();
+        let err = load_mesh(&dir).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
