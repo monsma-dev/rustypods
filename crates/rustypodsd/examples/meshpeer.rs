@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let fake_pod = std::env::args().any(|a| a == "--fake-pod");
     let tun = "rp-mesh1";
     let conf = state::load_mesh(std::path::Path::new(&data_dir))
+        .expect("conf/mesh.conf failed to parse — fix or remove it, do not mint a new key")
         .expect("no conf/mesh.conf (or empty private_key) in data_dir");
     let m = mesh::Mesh::start_named(std::path::Path::new(&data_dir), conf, tun).await?;
     println!(

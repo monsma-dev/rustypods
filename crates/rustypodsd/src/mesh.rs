@@ -1,7 +1,8 @@
 //! Multi-host pod mesh (Wave I): userspace WireGuard via BoringTun.
 //!
 //! Each daemon derives a stable ULA /48 from its own WG pubkey —
-//! `fd<40 bits of sha256(pubkey)>` — so every pod mesh address is
+//! `fd` plus 40 bits of sha256(pubkey), with two Global-ID bits
+//! forced (see `prefix_of`) — so every pod mesh address is
 //! cryptographically bound to the host identity with zero
 //! coordination, and a peer's prefix is verified BY its pubkey rather
 //! than trusted from config.
@@ -41,6 +42,18 @@ use crate::state::{MeshConf, MeshPeerConf};
 
 pub const TUN_NAME: &str = "rp-mesh0";
 pub const DEFAULT_PORT: u16 = 51820;
+
+/// `0` means "keep the default". Anything outside `1..=65535` is an
+/// error — a bare `as u16` would wrap 70000 to 4464.
+pub fn checked_listen_port(listen_port: u32) -> Result<Option<u16>, &'static str> {
+    if listen_port == 0 {
+        return Ok(None);
+    }
+    match u16::try_from(listen_port) {
+        Ok(p) => Ok(Some(p)),
+        Err(_) => Err("listen_port must be 1..=65535"),
+    }
+}
 /// The host's own mesh address: `fd<host>::1/128` on rp-mesh0. Hosts
 /// speak host-to-host control protocols (gossip, DNS) at this addr;
 /// pods live at `:<idx>::2`.
@@ -118,8 +131,13 @@ pub fn prefix_of(pubkey_b64: &str) -> Result<Ipv6Addr> {
     let pk = parse_pubkey(pubkey_b64)?;
     let h = Sha256::digest(pk);
     let mut s = h[0..5].to_vec();
+    // RFC 4193: fd00::/8 is fc00::/7 with the L bit already 1. The next
+    // 40 bits are the Global ID. This mask does NOT set L — the high
+    // byte is forced to 0xfd below. It clears two bits of the Global
+    // ID (and sets one). Kept as-is: changing it would move every
+    // existing host's /48 and break its peers.
     s[0] &= 0x3f;
-    s[0] |= 0x40; // L-bit set: locally assigned ULA (RFC 4193)
+    s[0] |= 0x40;
     Ok(Ipv6Addr::new(
         0xfd00 | s[0] as u16,
         (s[1] as u16) << 8 | s[2] as u16,
@@ -187,6 +205,8 @@ pub struct Mesh {
     pub udp_pkts: std::sync::atomic::AtomicU64,
     /// TUN packets the pump has consumed so far.
     pub tun_pkts: std::sync::atomic::AtomicU64,
+    /// TUN writes dropped because the device returned EAGAIN.
+    pub tun_drops: std::sync::atomic::AtomicU64,
     /// Where the pump is parked (diag): 0=in select, 1=tun read,
     /// 2=route_out, 3=udp recv, 4=handle_udp, 5=timers.
     pub pump_where: std::sync::atomic::AtomicU8,
@@ -251,7 +271,10 @@ fn open_tun(name: &str) -> Result<std::fs::File> {
     };
     let nb = name.as_bytes();
     req.name[..nb.len().min(15)].copy_from_slice(&nb[..nb.len().min(15)]);
-    if unsafe { libc::ioctl(f.as_raw_fd(), TUNSETIFF, &req) } < 0 {
+    // SAFETY: req is a valid IfReq we own, and TUNSETIFF writes the
+    // kernel's interface name back into req.name. It must be &mut —
+    // a shared reference would be UB once the kernel stores through it.
+    if unsafe { libc::ioctl(f.as_raw_fd(), TUNSETIFF, &mut req) } < 0 {
         return Err(std::io::Error::last_os_error()).context("TUNSETIFF rp-mesh0");
     }
     Ok(f)
@@ -368,6 +391,7 @@ impl Mesh {
             pump_ticks: Default::default(),
             udp_pkts: Default::default(),
             tun_pkts: Default::default(),
+            tun_drops: Default::default(),
             pump_where: Default::default(),
             shutdown_tx,
             supervisor: Mutex::new(None),
@@ -455,7 +479,10 @@ impl Mesh {
                 .with_context(|| format!("invalid endpoint '{endpoint}' — want ip:port"))?,
         );
         let priv_b64 = { self.conf.lock().await.private_key.clone() };
-        let priv_bytes: [u8; 32] = WG_B64.decode(priv_b64.trim())?.try_into().unwrap();
+        let priv_bytes: [u8; 32] = WG_B64
+            .decode(priv_b64.trim())?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("mesh private key must decode to 32 bytes"))?;
         let secret = StaticSecret::from(priv_bytes);
         let pc = MeshPeerConf {
             endpoint: endpoint.to_string(),
@@ -582,7 +609,9 @@ impl Mesh {
             pump_ticks: self.pump_ticks.load(std::sync::atomic::Ordering::Relaxed),
             udp_pkts: self.udp_pkts.load(std::sync::atomic::Ordering::Relaxed),
             tun_pkts: self.tun_pkts.load(std::sync::atomic::Ordering::Relaxed),
+            tun_drops: self.tun_drops.load(std::sync::atomic::Ordering::Relaxed),
             names: self.names().await.into_iter().collect(),
+            conf_error: String::new(),
         }
     }
 
@@ -642,6 +671,8 @@ impl Mesh {
                     self.pump_where.store(1, Relaxed);
                     let Ok(mut guard) = r else { continue };
                     if let Ok(Ok(n)) = guard.try_io(|fd| {
+                        // SAFETY: tun_buf is a live Vec we exclusively
+                        // borrow for this read; the fd is the TUN we opened.
                         let n = unsafe {
                             libc::read(fd.as_raw_fd(), tun_buf.as_mut_ptr() as *mut _, tun_buf.len())
                         };
@@ -665,13 +696,19 @@ impl Mesh {
     }
 
     async fn tun_write(&self, pkt: &[u8]) {
-        let _ = unsafe {
+        // SAFETY: pkt is a valid slice for this write; the fd is the
+        // nonblocking TUN opened above. A short write or EAGAIN drops
+        // the packet — the TUN queue is best-effort.
+        let n = unsafe {
             libc::write(
                 self.tun.get_ref().as_raw_fd(),
                 pkt.as_ptr() as *const _,
                 pkt.len(),
             )
         };
+        if n < 0 {
+            note_tun_io_err(&std::io::Error::last_os_error(), &self.tun_drops);
+        }
     }
 
     /// TUN → wire: find the peer owning the dst /48 and encapsulate.
@@ -1140,9 +1177,7 @@ fn dns_skip_name(pkt: &[u8], mut i: usize) -> Option<usize> {
             return None;
         }
         i = i.checked_add(1)?.checked_add(len)?;
-        if pkt.get(i).is_none() {
-            return None;
-        }
+        pkt.get(i)?;
         labels += 1;
         if labels > 128 {
             return None;
@@ -1155,9 +1190,7 @@ fn dns_skip_name(pkt: &[u8], mut i: usize) -> Option<usize> {
 /// the packet is truncated, compressed, or not exactly one question —
 /// callers must not slice past `pkt.len()`.
 fn dns_response_base(pkt: &[u8]) -> Option<Vec<u8>> {
-    if pkt.get(..12).is_none() {
-        return None;
-    }
+    pkt.get(..12)?;
     let qd = u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]) as usize;
     if qd != 1 {
         return None;
@@ -1219,6 +1252,20 @@ fn valid_dns_label(n: &str) -> bool {
         && n.len() <= 63
         && n.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Count a failed TUN write. EAGAIN/EWOULDBLOCK is expected on a
+/// nonblocking device and is surfaced via `MeshStatus.tun_drops`;
+/// the log is power-of-two so a full queue doesn't flood the journal.
+fn note_tun_io_err(err: &std::io::Error, drops: &std::sync::atomic::AtomicU64) {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        let n = drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            tracing::warn!("mesh tun write EAGAIN, dropped {n} packet(s)");
+        }
+    } else {
+        tracing::debug!("mesh tun write: {err}");
+    }
 }
 
 /// Restart `spawn` until it returns normally or `shutdown` is set.
@@ -1329,6 +1376,27 @@ mod tests {
         let (priv_, pub_) = keygen();
         assert_eq!(pubkey_of(&priv_).unwrap(), pub_);
         assert!(pubkey_of("not-b64!!!").is_err());
+    }
+
+    #[test]
+    fn listen_port_rejects_overflow() {
+        assert_eq!(checked_listen_port(0).unwrap(), None);
+        assert_eq!(checked_listen_port(51820).unwrap(), Some(51820));
+        assert_eq!(checked_listen_port(65535).unwrap(), Some(65535));
+        assert!(checked_listen_port(70000).is_err());
+        assert!(checked_listen_port(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn tun_eagain_is_counted() {
+        let drops = std::sync::atomic::AtomicU64::new(0);
+        let err = std::io::Error::from_raw_os_error(libc::EAGAIN);
+        note_tun_io_err(&err, &drops);
+        note_tun_io_err(&err, &drops);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let other = std::io::Error::from_raw_os_error(libc::EIO);
+        note_tun_io_err(&other, &drops);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     /// Minimal DNS query packet: id, flags, qdcount=1, one qname.
@@ -1457,7 +1525,7 @@ mod tests {
             None
         );
         assert_eq!(DNS_UDP_INFLIGHT, 64);
-        assert!(DNS_TCP_MAX_CONNS > 0 && DNS_TCP_MAX_CONNS <= DNS_UDP_INFLIGHT);
+        const _: () = assert!(DNS_TCP_MAX_CONNS > 0 && DNS_TCP_MAX_CONNS <= DNS_UDP_INFLIGHT);
         assert_eq!(DNS_TCP_IDLE, Duration::from_secs(5));
     }
 
