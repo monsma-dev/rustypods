@@ -20,6 +20,10 @@ struct Cli {
     /// Print this CLI's version and, when the daemon answers, its version too.
     #[arg(short = 'V', long = "version", global = true, action = clap::ArgAction::SetTrue)]
     show_version: bool,
+
+    /// Skip the confirmation prompt on destroy, rmi, rmsnap, and volume rm.
+    #[arg(short = 'y', long = "yes", global = true, action = clap::ArgAction::SetTrue)]
+    yes: bool,
     /// Path to the daemon socket (remote path when --remote is used).
     #[arg(long, global = true, default_value = SOCKET_PATH)]
     socket: PathBuf,
@@ -468,6 +472,28 @@ enum ShmCmd {
     Ls { pod: String },
     /// Remove a segment.
     Rm { pod: String, name: String },
+}
+
+/// Whether a destructive command should proceed.
+/// Non-TTY (scripts) and `-y` proceed. A TTY proceeds only on `y`/`Y`.
+fn proceed_destructive(tty: bool, yes: bool, answer: &str) -> bool {
+    if yes || !tty {
+        true
+    } else {
+        matches!(answer.trim(), "y" | "Y")
+    }
+}
+
+fn confirm_destructive(yes: bool, prompt: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || yes {
+        return Ok(true);
+    }
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(proceed_destructive(true, false, &line))
 }
 
 fn limits_proto(high: Option<&str>, max: Option<&str>, cpu: Option<u32>) -> Result<Option<Limits>> {
@@ -1321,6 +1347,10 @@ async fn main() -> Result<()> {
                     );
                 }
                 VolumeCmd::Rm { name } => {
+                    if !confirm_destructive(cli.yes, &format!("Delete volume {name}?"))? {
+                        println!("aborted");
+                        return Ok(());
+                    }
                     c.remove_volume(VolumeRef { name: name.clone() }).await?;
                     println!("volume {name} removed");
                 }
@@ -1514,6 +1544,10 @@ async fn main() -> Result<()> {
             println!("image {} → {}", img.name, img.path);
         }
         Cmd::Rmi { name } => {
+            if !confirm_destructive(cli.yes, &format!("Remove image {name}?"))? {
+                println!("aborted");
+                return Ok(());
+            }
             connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .remove_image(ImageRef { name: name.clone() })
@@ -1653,10 +1687,25 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Destroy { name } => {
-            connect(cli.socket.clone(), cli.remote.clone())
-                .await?
-                .destroy_pod(PodRef { name: name.clone() })
-                .await?;
+            use std::io::IsTerminal;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let n = if std::io::stdin().is_terminal() && !cli.yes {
+                c.list_snapshots(PodRef { name: name.clone() })
+                    .await?
+                    .into_inner()
+                    .snapshots
+                    .len()
+            } else {
+                0
+            };
+            if !confirm_destructive(
+                cli.yes,
+                &format!("Destroy pod {name} and its {n} snapshots?"),
+            )? {
+                println!("aborted");
+                return Ok(());
+            }
+            c.destroy_pod(PodRef { name: name.clone() }).await?;
             println!("pod {name} destroyed");
         }
         Cmd::Clone { source, dest } => {
@@ -1798,6 +1847,10 @@ async fn main() -> Result<()> {
             eprintln!("\rimported {} ({})", pod.name, pod.rootfs);
         }
         Cmd::Rmsnap { pod, id } => {
+            if !confirm_destructive(cli.yes, &format!("Delete snapshot {id} of pod {pod}?"))? {
+                println!("aborted");
+                return Ok(());
+            }
             connect(cli.socket.clone(), cli.remote.clone())
                 .await?
                 .delete_snapshot(SnapshotRef {
@@ -1836,6 +1889,13 @@ async fn main() -> Result<()> {
             };
             match sub {
                 StackCmd::Destroy { name } => {
+                    if !confirm_destructive(
+                        cli.yes,
+                        &format!("Destroy stack {name} and its pods?"),
+                    )? {
+                        println!("aborted");
+                        return Ok(());
+                    }
                     c.destroy_stack(PodRef { name: name.clone() }).await?;
                     println!("stack {name} destroyed");
                 }
@@ -2191,6 +2251,18 @@ mod tests {
 
     // --cmd takes hyphen-leading argv (regression: `--cmd sh -c '...'` used
     // to be rejected, breaking payload scripts like busybox httpd setups).
+    #[test]
+    fn destructive_prompt_only_on_a_tty_without_yes() {
+        assert!(proceed_destructive(false, false, ""));
+        assert!(proceed_destructive(false, false, "n"));
+        assert!(proceed_destructive(true, true, "n"));
+        assert!(proceed_destructive(true, false, "y"));
+        assert!(proceed_destructive(true, false, "Y\n"));
+        assert!(!proceed_destructive(true, false, ""));
+        assert!(!proceed_destructive(true, false, "n"));
+        assert!(!proceed_destructive(true, false, "yes"));
+    }
+
     #[test]
     fn version_flag_does_not_need_a_subcommand() {
         let cli = Cli::try_parse_from(["rustypods", "--version"]).unwrap();
