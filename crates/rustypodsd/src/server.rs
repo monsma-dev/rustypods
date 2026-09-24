@@ -4270,11 +4270,19 @@ impl PodControl for Svc {
         };
         let mut out = Vec::new();
         for m in &pods {
+            let leader = self.engine.running_pid(&m.name).await;
+            // The supervisor keeps its last verdict after a stop; only
+            // "dead" (gave up restarting) still means something then.
+            let health = hmap
+                .get(&m.name)
+                .map(String::as_str)
+                .filter(|s| leader.is_some() || *s == "dead")
+                .unwrap_or("");
             out.push(to_pod(
                 m,
                 &self.pod_rootfs(&m.name),
-                self.engine.running_pid(&m.name).await,
-                hmap.get(&m.name).map(String::as_str).unwrap_or(""),
+                leader,
+                health,
                 self.mesh_prefix(),
             ));
         }
