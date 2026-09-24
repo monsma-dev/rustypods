@@ -75,7 +75,11 @@ pub struct HttpAuth {
 /// path — same variable, same default. Non-numeric or zero falls back.
 pub fn import_max_bytes() -> u64 {
     match std::env::var("RUSTYPODS_IMPORT_MAX_BYTES") {
-        Ok(s) => s.parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(IMPORT_MAX_DEFAULT),
+        Ok(s) => s
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(IMPORT_MAX_DEFAULT),
         Err(_) => IMPORT_MAX_DEFAULT,
     }
 }
@@ -263,9 +267,10 @@ async fn update_pod(
     // calling update_pod_config let two PATCHes each snapshot the same
     // pod and the later write drop the earlier field change.
     let _op = s.pod_op(&name).await;
-    let (cur_lim, storage_max) = s.pod_limit_snapshot(&name).await.ok_or_else(|| {
-        api_err(Status::not_found(format!("pod {name} not found")))
-    })?;
+    let (cur_lim, storage_max) = s
+        .pod_limit_snapshot(&name)
+        .await
+        .ok_or_else(|| api_err(Status::not_found(format!("pod {name} not found"))))?;
     let p = s
         .apply_pod_config(UpdatePodConfigRequest {
             name,
@@ -687,9 +692,11 @@ fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
 }
 
 /// Bearer auth + browser-header rejection for /v1/*.
+///
 /// 1. `Origin` or `Sec-Fetch-Site` → 403.
 /// 2. Read-write token → any method. Read-only token → GET only.
 /// 3. Anything else → 401.
+///
 /// Both tokens are always compared so a match on the first doesn't
 /// skip the second.
 async fn require_token(
@@ -813,7 +820,9 @@ pub async fn listen_with(
         let permit = match sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                tracing::warn!("http connection cap ({max_connections}) reached; dropping connection");
+                tracing::warn!(
+                    "http connection cap ({max_connections}) reached; dropping connection"
+                );
                 continue;
             }
         };
@@ -821,13 +830,14 @@ pub async fn listen_with(
         tokio::spawn(async move {
             let _permit = permit;
             let io = TokioIo::new(sock);
-            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                let app = app.clone();
-                async move {
-                    let req = req.map(Body::new);
-                    app.oneshot(req).await
-                }
-            });
+            let svc =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    async move {
+                        let req = req.map(Body::new);
+                        app.oneshot(req).await
+                    }
+                });
             let mut builder = Builder::new(TokioExecutor::new());
             builder
                 .http1()
@@ -985,8 +995,14 @@ mod tests {
         assert_eq!(&*a.ro, &*b.ro);
         assert_ne!(&*a.rw, &*a.ro);
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&rw).unwrap().permissions().mode() & 0o777, 0o400);
-        assert_eq!(std::fs::metadata(&ro).unwrap().permissions().mode() & 0o777, 0o400);
+        assert_eq!(
+            std::fs::metadata(&rw).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            std::fs::metadata(&ro).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
         let (c, _, _) = ensure_http_tokens(&sock, 1000, true).unwrap();
         assert_ne!(&*a.rw, &*c.rw);
         assert_ne!(&*a.ro, &*c.ro);
@@ -997,7 +1013,10 @@ mod tests {
     async fn auth_gates_and_healthz() {
         let res = call(
             app(),
-            Request::builder().uri("/healthz").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
@@ -1104,7 +1123,9 @@ mod tests {
         });
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         use tokio::io::AsyncWriteExt;
-        sock.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
+        sock.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         let mut buf = [0u8; 64];
         use tokio::io::AsyncReadExt;
@@ -1128,4 +1149,3 @@ mod tests {
         assert_eq!(request_budget("/v1/pods"), Some(REQUEST_TIMEOUT));
     }
 }
-
