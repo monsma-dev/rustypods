@@ -994,6 +994,7 @@ mod tests {
             ephemeral: false,
             private_users: true,
             started: false,
+            stopped_by_user: false,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![],

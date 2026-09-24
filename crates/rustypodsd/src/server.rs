@@ -73,11 +73,9 @@ pub struct Svc {
     /// up, back to None after `mesh deinit`. std RwLock — mesh_prefix
     /// feeds the sync to_pod path, so a tokio lock won't do.
     mesh: Arc<std::sync::RwLock<Option<Arc<mesh::Mesh>>>>,
-    /// Pods stopped on purpose via stop_pod — the supervisor must not
-    /// restart these. PodMeta.started means "was ever started" (display
-    /// state), not "should be running", so intent lives here. In-memory:
-    /// a daemon restart clears it, matching Docker's "always" semantics
-    /// (a dead should-be-running pod comes back).
+    /// In-memory mirror of `PodMeta.stopped_by_user`, set before the conf
+    /// write so a racing supervisor tick cannot restart a pod mid-stop.
+    /// The conf is the source of truth across daemon restarts.
     stop_intent: Arc<Mutex<BTreeSet<String>>>,
 }
 
@@ -303,6 +301,14 @@ fn restart_policy(m: &PodMeta) -> &str {
 /// probe, or the managed gateway.
 fn supervised(m: &PodMeta) -> bool {
     restart_policy(m) != "no" || !m.healthcheck.kind.is_empty()
+}
+
+/// Death-watch stays idle when the pod was never started, or the user
+/// stopped it. `stop_intent` covers the window before the conf write is
+/// visible to a tick that already cloned its meta. A crash or a daemon
+/// restart with `stopped_by_user == false` is still a restart candidate.
+pub(crate) fn supervisor_idle(started: bool, stopped_by_user: bool, stop_intent: bool) -> bool {
+    !started || stopped_by_user || stop_intent
 }
 
 /// ":port" or a bare "port" → the pod's own veth address; "host:port"
@@ -1477,7 +1483,8 @@ impl Svc {
         let running = self.engine.running_pid(&m.name).await.is_some();
         let act = {
             let mut map = self.health.lock().await;
-            if !running && (!m.started || self.stop_intent.lock().await.contains(&m.name)) {
+            let user_stopped = self.stop_intent.lock().await.contains(&m.name);
+            if !running && supervisor_idle(m.started, m.stopped_by_user, user_stopped) {
                 // Never booted, or stopped on purpose — nothing to watch
                 // until a start (re)arms the death-watch.
                 map.remove(&m.name);
@@ -1577,12 +1584,9 @@ impl Svc {
             restart_policy(m)
         );
         if self.engine.running_pid(&m.name).await.is_some() {
-            if let Err(e) = self
-                .stop_pod(Request::new(PodRef {
-                    name: m.name.clone(),
-                }))
-                .await
-            {
+            // Not a user stop — leave stopped_by_user clear so a crash
+            // between this halt and the following start still restarts.
+            if let Err(e) = self.halt_pod(&m.name, false).await {
                 tracing::warn!("{}: pre-restart stop failed: {e}", m.name);
             }
         }
@@ -1844,6 +1848,116 @@ impl Svc {
                 }
             }
         }
+    }
+
+    async fn halt_pod(&self, name: &str, user_intent: bool) -> Result<Response<Pod>, Status> {
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(name) {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            }
+        }
+        let _op = self.pod_op(name).await;
+        let meta = {
+            let st = self.st.lock().await;
+            st.pods.get(name).cloned()
+        };
+        let ingress_gateway = meta.as_ref().is_some_and(|m| m.ingress_gateway);
+        let has_ingress = meta.as_ref().is_some_and(|m| !m.ingress.is_empty());
+        if ingress_gateway {
+            // Draining the gateway while a backend still depends on it
+            // would leave dead hostnames pointed at live IPs — refuse.
+            let running = self.running_set().await;
+            let dependent = {
+                let st = self.st.lock().await;
+                st.pods
+                    .values()
+                    .any(|m| m.name != name && !m.ingress.is_empty() && running.contains(&m.name))
+            };
+            if dependent {
+                return Err(Status::failed_precondition(
+                    "running pods still have ingress rules — stop them or clear their rules before stopping the gateway",
+                ));
+            }
+            // Nobody needs routes anymore — clear the dataplane so nothing
+            // lingers while the gateway is down. Best-effort: the stop
+            // itself must still proceed.
+            let gen = self.ingress_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            match ingress::push_snapshot(
+                &self.cfg.data_dir,
+                RouteSnapshot {
+                    generation: gen,
+                    routes: vec![],
+                },
+            )
+            .await
+            {
+                Ok(_) => {
+                    *self.ingress_last_push.lock().await = Some((gen, vec![]));
+                }
+                Err(e) => {
+                    tracing::warn!("empty ingress snapshot before gateway stop: {e:#}");
+                }
+            }
+        } else if has_ingress {
+            // Drain this pod's routes BEFORE it stops so clients never hit
+            // a dead backend. Best-effort — the stop must proceed.
+            if let Err(e) = self.sync_ingress(Some(name), false).await {
+                tracing::warn!("ingress drain before {name} stop: {e}");
+            }
+        }
+        // Record intent immediately before the engine stop, after
+        // precondition checks: a refused gateway stop must not stick,
+        // and a racing supervisor tick must not see "dead + no intent".
+        // Supervisor-driven halts do not persist user intent.
+        if user_intent {
+            self.stop_intent.lock().await.insert(name.to_string());
+            self.persist_stop_intent(name, true).await?;
+        }
+        self.engine.stop(name).await.map_err(int)?;
+        agent::stop_listener(&self.listeners, &self.metrics, name).await;
+        let st = self.st.lock().await;
+        let Some(m) = st.pods.get(name) else {
+            return Err(Status::not_found(format!("pod {name} not found")));
+        };
+        let p = to_pod(
+            m,
+            &self.pod_rootfs(name),
+            None,
+            &self.health_view(name).await,
+            self.mesh_prefix(),
+        );
+        drop(st);
+        if let Err(e) = self.sync_nat().await {
+            tracing::warn!("nft rebuild after {name} stop failed: {e}");
+        }
+        // Second drain pass: the pod is confirmed down now, so the
+        // post-stop snapshot can't race its next start (pod_op held).
+        if has_ingress {
+            if let Err(e) = self.sync_ingress(None, false).await {
+                tracing::warn!("ingress resync after {name} stop: {e}");
+            }
+        }
+        self.sync_mesh_names().await;
+        Ok(Response::new(p))
+    }
+
+    /// Write `stopped_by_user` through to the conf. The in-memory
+    /// `stop_intent` set is updated by the caller (it must be visible
+    /// before this await, so a tick cannot miss it).
+    async fn persist_stop_intent(&self, name: &str, stopped: bool) -> Result<(), Status> {
+        let meta = {
+            let mut st = self.st.lock().await;
+            let Some(m) = st.pods.get_mut(name) else {
+                return Ok(());
+            };
+            if m.stopped_by_user == stopped {
+                return Ok(());
+            }
+            m.stopped_by_user = stopped;
+            m.clone()
+        };
+        self.save_pod(&meta).map_err(int)
     }
 }
 
@@ -2128,6 +2242,7 @@ impl PodControl for Svc {
             // host-uid identity, so they opt out.
             private_users: !req.desktop,
             started: false,
+            stopped_by_user: false,
             storage_max_bytes: req.storage_max_bytes,
             ports: req.ports.clone(),
             ingress: ingress_from_proto(&req.ingress),
@@ -2237,6 +2352,7 @@ impl PodControl for Svc {
             name: dest.clone(),
             created_unix: state::now_unix(),
             started: false,
+            stopped_by_user: false,
             // Fresh identity: net_index is reallocated on first start so two
             // clones can run side by side. Ports are kept — running BOTH
             // clones with identical host ports is a user-visible conflict.
@@ -2651,6 +2767,7 @@ impl PodControl for Svc {
                         // userns. Standalone `create` pods do get it.
                         private_users: false,
                         started: false,
+                        stopped_by_user: false,
                         storage_max_bytes: sp.storage_max_bytes,
                         ports: sp.ports.clone(),
                         ingress: ingress_from_proto(&member_ingress[&pname]),
@@ -2828,8 +2945,11 @@ impl PodControl for Svc {
         }
         let _op = self.pod_op(&name).await;
         // Any start — manual, autostart or supervised — clears the
-        // intentional-stop marker for the death-watch.
+        // intentional-stop marker before the engine runs, so a failed
+        // start still counts as "user wants this up" and the supervisor
+        // retries. Persisted so a daemon restart mid-start does the same.
         self.stop_intent.lock().await.remove(&name);
+        self.persist_stop_intent(&name, false).await?;
         if self.engine.running_pid(&name).await.is_some() {
             return Err(Status::failed_precondition(format!(
                 "pod {name} is already running"
@@ -3188,90 +3308,7 @@ impl PodControl for Svc {
         let name = proto::validate_name(&req.into_inner().name)
             .map_err(bad)?
             .to_string();
-        {
-            let st = self.st.lock().await;
-            if !st.pods.contains_key(&name) {
-                return Err(Status::not_found(format!("pod {name} not found")));
-            }
-        }
-        let _op = self.pod_op(&name).await;
-        // Record intent before stopping: a racing supervisor tick must
-        // not see "dead + no intent" mid-stop and restart the pod.
-        self.stop_intent.lock().await.insert(name.clone());
-        let meta = {
-            let st = self.st.lock().await;
-            st.pods.get(&name).cloned()
-        };
-        let ingress_gateway = meta.as_ref().is_some_and(|m| m.ingress_gateway);
-        let has_ingress = meta.as_ref().is_some_and(|m| !m.ingress.is_empty());
-        if ingress_gateway {
-            // Draining the gateway while a backend still depends on it
-            // would leave dead hostnames pointed at live IPs — refuse.
-            let running = self.running_set().await;
-            let dependent = {
-                let st = self.st.lock().await;
-                st.pods
-                    .values()
-                    .any(|m| m.name != name && !m.ingress.is_empty() && running.contains(&m.name))
-            };
-            if dependent {
-                return Err(Status::failed_precondition(
-                    "running pods still have ingress rules — stop them or clear their rules before stopping the gateway",
-                ));
-            }
-            // Nobody needs routes anymore — clear the dataplane so nothing
-            // lingers while the gateway is down. Best-effort: the stop
-            // itself must still proceed.
-            let gen = self.ingress_generation.fetch_add(1, Ordering::SeqCst) + 1;
-            match ingress::push_snapshot(
-                &self.cfg.data_dir,
-                RouteSnapshot {
-                    generation: gen,
-                    routes: vec![],
-                },
-            )
-            .await
-            {
-                Ok(_) => {
-                    *self.ingress_last_push.lock().await = Some((gen, vec![]));
-                }
-                Err(e) => {
-                    tracing::warn!("empty ingress snapshot before gateway stop: {e:#}");
-                }
-            }
-        } else if has_ingress {
-            // Drain this pod's routes BEFORE it stops so clients never hit
-            // a dead backend. Best-effort — the stop must proceed.
-            if let Err(e) = self.sync_ingress(Some(&name), false).await {
-                tracing::warn!("ingress drain before {name} stop: {e}");
-            }
-        }
-        self.engine.stop(&name).await.map_err(int)?;
-        agent::stop_listener(&self.listeners, &self.metrics, &name).await;
-        let st = self.st.lock().await;
-        let Some(m) = st.pods.get(&name) else {
-            return Err(Status::not_found(format!("pod {name} not found")));
-        };
-        let p = to_pod(
-            m,
-            &self.pod_rootfs(&name),
-            None,
-            &self.health_view(&name).await,
-            self.mesh_prefix(),
-        );
-        drop(st);
-        if let Err(e) = self.sync_nat().await {
-            tracing::warn!("nft rebuild after {name} stop failed: {e}");
-        }
-        // Second drain pass: the pod is confirmed down now, so the
-        // post-stop snapshot can't race its next start (pod_op held).
-        if has_ingress {
-            if let Err(e) = self.sync_ingress(None, false).await {
-                tracing::warn!("ingress resync after {name} stop: {e}");
-            }
-        }
-        self.sync_mesh_names().await;
-        Ok(Response::new(p))
+        self.halt_pod(&name, true).await
     }
 
     async fn list_pods(&self, _req: Request<ListPodsRequest>) -> Result<Response<PodList>, Status> {
@@ -3632,6 +3669,13 @@ impl PodControl for Svc {
             validate_ingress_conflicts(&st, &name, &ingress_to_proto(&meta.ingress))?;
             st.pods.insert(name.clone(), meta.clone());
         }
+        // A hand edit of stopped_by_user must reach the supervisor's
+        // in-memory mirror; the conf remains the source of truth.
+        if meta.stopped_by_user {
+            self.stop_intent.lock().await.insert(name.clone());
+        } else {
+            self.stop_intent.lock().await.remove(&name);
+        }
         if self.engine.running_pid(&name).await.is_some() {
             self.engine
                 .apply_limits(&name, &meta.limits)
@@ -3729,6 +3773,7 @@ impl PodControl for Svc {
             ephemeral: false,
             private_users: true,
             started: prev.map(|m| m.started).unwrap_or(false),
+            stopped_by_user: prev.map(|m| m.stopped_by_user).unwrap_or(false),
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![],
@@ -4775,6 +4820,20 @@ pub async fn serve(cfg: Config) -> Result<()> {
         mesh: Default::default(),
     };
 
+    // Restore unless-stopped intent from conf so the in-memory set matches
+    // disk before the supervisor's first tick.
+    {
+        let names: Vec<String> = {
+            let st = svc.st.lock().await;
+            st.pods
+                .values()
+                .filter(|m| m.stopped_by_user)
+                .map(|m| m.name.clone())
+                .collect()
+        };
+        *svc.stop_intent.lock().await = names.into_iter().collect();
+    }
+
     // Daemon restarted while pods kept running → rebind their agent channels.
     let running: Vec<(String, bool)> = {
         let guard = st.lock().await;
@@ -4847,7 +4906,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 let st = svc.st.lock().await;
                 st.pods
                     .values()
-                    .filter(|m| m.autostart)
+                    .filter(|m| m.autostart && !m.stopped_by_user)
                     .map(|m| m.name.clone())
                     .collect()
             };
@@ -5018,8 +5077,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        probe_addr, restart_policy, snapshot_expired, supervised, validate_ingress_conflicts,
-        validate_ingress_conflicts_excluding,
+        probe_addr, restart_policy, snapshot_expired, supervised, supervisor_idle,
+        validate_ingress_conflicts, validate_ingress_conflicts_excluding,
     };
     use crate::state::{IngressSpec, LimitsSpec, PodMeta, State};
     use rustypods_proto::rpc::IngressRule;
@@ -5034,6 +5093,7 @@ mod tests {
             ephemeral: false,
             private_users: true,
             started: false,
+            stopped_by_user: false,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: hosts
@@ -5060,6 +5120,17 @@ mod tests {
 
     fn meta_plain(name: &str) -> PodMeta {
         meta_with_ingress(name, &[])
+    }
+
+    #[test]
+    fn supervisor_idle_unless_stopped() {
+        // Never started: nothing to restart.
+        assert!(supervisor_idle(false, false, false));
+        // User stop, including the in-memory mirror before the conf write.
+        assert!(supervisor_idle(true, true, false));
+        assert!(supervisor_idle(true, false, true));
+        // Crash or daemon restart with no user stop: death-watch may restart.
+        assert!(!supervisor_idle(true, false, false));
     }
 
     #[test]

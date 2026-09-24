@@ -177,10 +177,17 @@ rustypodsd does it itself:
 
 - Per-second `supervise_once` tick over pods with a restart policy, a
   configured probe, or `ingress_gateway` (managed ⇒ always "always").
-- Death-watch keys on the in-memory `stop_intent` set — `PodMeta.started`
-  means "was ever started" (drives Created/Stopped display), NOT "should
-  be running". stop_pod records intent before engine.stop; start_pod
-  clears it; a daemon restart loses intent (Docker-"always"-like).
+- Death-watch keys on `PodMeta.stopped_by_user` (persisted in the pod
+  conf, serde default false) plus an in-memory `stop_intent` mirror for
+  the tick that races the conf write. `PodMeta.started` means "was ever
+  started" (drives Created/Stopped display), NOT "should be running".
+  A user stop sets the flag before engine.stop; start clears it before
+  the engine runs. Supervisor restarts and autostart both leave a
+  user-stopped pod down across daemon restart/upgrade/reboot
+  (unless-stopped). A crash with the flag clear still restarts.
+  Supervisor-driven halts do not set the flag. Confs written before
+  this field existed load as not user-stopped, so the first restart
+  after upgrade still brings those pods back once.
 - Exec probes reuse `exec_argv` — the payload ends with an
   `exec 0<&200` stdin-restore wrapper that ONLY works with
   `pre_exec(exec::preserve_stdin)` on the spawn (util-linux ≤2.42

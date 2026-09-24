@@ -215,6 +215,13 @@ pub struct PodMeta {
     pub private_users: bool,
     #[serde(default)]
     pub started: bool,
+    /// User asked the pod to stay down (`rustypods stop`). Distinct from
+    /// `started`, which only means "was ever started" and drives the
+    /// Created/Stopped display. Survives daemon restart: the supervisor
+    /// and autostart leave the pod stopped until an explicit start
+    /// (unless-stopped). Absent in older confs → false.
+    #[serde(default)]
+    pub stopped_by_user: bool,
     /// Btrfs qgroup cap on the pod rootfs; 0 = none.
     /// Serialized as `storage_max = "20G"`.
     #[serde(default, with = "bytes_field")]
@@ -720,6 +727,7 @@ fn migrate_json(data_dir: &Path) {
             private_users: p.private_users,
             // started is volatile; running state comes from machined live.
             started: false,
+            stopped_by_user: false,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![],
@@ -776,7 +784,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // A minimal legacy conf (pre-Wave-E) must load with env/volumes
         // defaulting to empty.
-        let pod = PodMeta {
+        let mut pod = PodMeta {
             name: "legacy".into(),
             image: "img".into(),
             created_unix: 0,
@@ -793,6 +801,7 @@ mod tests {
             autostart: false,
             cmd: vec![],
             started: false,
+            stopped_by_user: false,
             ingress: vec![],
             ingress_gateway: false,
             restart: String::new(),
@@ -825,6 +834,11 @@ mod tests {
         let st = load(&dir).unwrap();
         assert!(st.pods["old"].env.is_empty());
         assert!(st.pods["old"].volumes.is_empty());
+        assert!(!st.pods["old"].stopped_by_user);
+        pod.stopped_by_user = true;
+        save_pod(&dir, &pod).unwrap();
+        let st = load(&dir).unwrap();
+        assert!(st.pods["legacy"].stopped_by_user);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -839,6 +853,7 @@ mod tests {
             ephemeral: false,
             private_users: true,
             started: false,
+            stopped_by_user: false,
             storage_max_bytes: 0,
             ports: vec![],
             ingress: vec![IngressSpec {
