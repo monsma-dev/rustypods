@@ -12,6 +12,22 @@ members = [
 # and would slow every workspace build/test. It has its own lockfile.
 exclude = ["gui"]
 
+# A panicking background task must take the daemon down so systemd
+# restarts it (`Restart=on-failure`). Pods are nspawn children that
+# reparent to PID 1, so they survive that restart. `catch_unwind` /
+# `JoinError::is_panic` are not used anywhere, so abort does not hide
+# a recovery path. overflow-checks stay on in release: a wrapping
+# length in the archive/nft paths is worse than a restart. thin LTO +
+# one codegen unit is worth the extra compile for a long-lived root
+# daemon. `strip = "debuginfo"` drops DWARF (large) and keeps the
+# symbol table so a journal backtrace still names functions.
+[profile.release]
+panic = "abort"
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
