@@ -13,6 +13,34 @@ use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
 use rustypods_proto::rpc::pod_control_client::PodControlClient;
+use rustypods_proto::rpc::PingRequest;
+
+/// `major.minor` of a Cargo version (`0.1.0` → `(0, 1)`). Patch is ignored.
+pub fn major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Same major.minor means the CLI and daemon speak the same RPC generation.
+pub fn versions_compatible(cli: &str, daemon: &str) -> bool {
+    match (major_minor(cli), major_minor(daemon)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn warn_version_mismatch(daemon_version: &str, remote: bool) {
+    let ours = env!("CARGO_PKG_VERSION");
+    if versions_compatible(ours, daemon_version) {
+        return;
+    }
+    let where_ = if remote { "remote daemon" } else { "local daemon" };
+    eprintln!(
+        "warning: this CLI is {ours} but the {where_} is {daemon_version} (major.minor differ) — upgrade both before relying on this session"
+    );
+}
 
 /// Transport: local Unix socket, or an SSH subprocess whose stdio is
 /// bridged to the remote daemon socket via socat.
@@ -115,6 +143,7 @@ pub async fn connect_timeout(
     remote: Option<String>,
     timeout: std::time::Duration,
 ) -> Result<PodControlClient<Channel>> {
+    let is_remote = remote.is_some();
     let err_hint = match &remote {
         Some(d) => format!("connecting to rustypodsd via {d} — ssh up? socat installed remotely?"),
         None => {
@@ -140,5 +169,34 @@ pub async fn connect_timeout(
         }))
         .await
         .context(err_hint)?;
-    Ok(PodControlClient::new(ch))
+    let mut client = PodControlClient::new(ch);
+    // Once per process, not once per RPC. A later connect in the same
+    // invocation (start after stop, export then load) reuses the result.
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        match client.ping(PingRequest {}).await {
+            Ok(info) => warn_version_mismatch(&info.into_inner().version, is_remote),
+            Err(_) => {
+                // Don't cache a failed probe — the next command should try again.
+                CHECKED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn major_minor_ignores_patch() {
+        assert_eq!(major_minor("0.1.0"), Some((0, 1)));
+        assert_eq!(major_minor("1.2.3-dev"), Some((1, 2)));
+        assert!(major_minor("nope").is_none());
+        assert!(versions_compatible("0.1.9", "0.1.0"));
+        assert!(!versions_compatible("0.2.0", "0.1.0"));
+        assert!(!versions_compatible("1.0.0", "0.1.0"));
+        assert!(!versions_compatible("garbage", "0.1.0"));
+    }
 }

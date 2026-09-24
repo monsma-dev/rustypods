@@ -1,7 +1,7 @@
 mod doctor;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 use rustypods_client::{connect, connect_timeout};
@@ -12,10 +12,14 @@ use tokio_stream::StreamExt;
 #[derive(Parser)]
 #[command(
     name = "rustypods",
-    version,
+    disable_version_flag = true,
+    arg_required_else_help = true,
     about = "nspawn pods on Btrfs — podman/distrobox-light"
 )]
 struct Cli {
+    /// Print this CLI's version and, when the daemon answers, its version too.
+    #[arg(short = 'V', long = "version", global = true, action = clap::ArgAction::SetTrue)]
+    show_version: bool,
     /// Path to the daemon socket (remote path when --remote is used).
     #[arg(long, global = true, default_value = SOCKET_PATH)]
     socket: PathBuf,
@@ -28,7 +32,7 @@ struct Cli {
     remote: Option<String>,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -1199,10 +1203,30 @@ fn collect_env(env_file: Option<&PathBuf>, env: Vec<String>) -> Result<Vec<Strin
     Ok(out)
 }
 
+async fn print_versions(cli: &Cli) -> Result<()> {
+    println!("rustypods {}", env!("CARGO_PKG_VERSION"));
+    match connect(cli.socket.clone(), cli.remote.clone()).await {
+        Ok(mut c) => match c.ping(PingRequest {}).await {
+            Ok(info) => println!("rustypodsd {}", info.into_inner().version),
+            Err(e) => println!("rustypodsd unreachable ({e})"),
+        },
+        Err(_) => println!("rustypodsd unreachable"),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
+    if cli.show_version {
+        print_versions(&cli).await?;
+        return Ok(());
+    }
+    let Some(cmd) = cli.cmd else {
+        Cli::command().print_long_help()?;
+        std::process::exit(2);
+    };
+    match cmd {
         Cmd::Doctor => {
             if cli.remote.is_some() {
                 anyhow::bail!(
@@ -2144,6 +2168,16 @@ mod tests {
     // --cmd takes hyphen-leading argv (regression: `--cmd sh -c '...'` used
     // to be rejected, breaking payload scripts like busybox httpd setups).
     #[test]
+    fn version_flag_does_not_need_a_subcommand() {
+        let cli = Cli::try_parse_from(["rustypods", "--version"]).unwrap();
+        assert!(cli.show_version);
+        assert!(cli.cmd.is_none());
+        let cli = Cli::try_parse_from(["rustypods", "-V", "--remote", "user@host"]).unwrap();
+        assert!(cli.show_version);
+        assert_eq!(cli.remote.as_deref(), Some("user@host"));
+    }
+
+    #[test]
     fn create_cmd_accepts_hyphen_argv() {
         let cli = Cli::try_parse_from([
             "rustypods",
@@ -2158,7 +2192,7 @@ mod tests {
             "echo ok",
         ])
         .unwrap();
-        let Cmd::Create { autostart, cmd, .. } = cli.cmd else {
+        let Some(Cmd::Create { autostart, cmd, .. }) = cli.cmd else {
             panic!("expected Cmd::Create");
         };
         assert!(autostart);
@@ -2179,7 +2213,7 @@ mod tests {
             "echo ok",
         ])
         .unwrap();
-        let Cmd::Config { autostart, cmd, .. } = cli.cmd else {
+        let Some(Cmd::Config { autostart, cmd, .. }) = cli.cmd else {
             panic!("expected Cmd::Config");
         };
         assert_eq!(autostart, Some(true));
