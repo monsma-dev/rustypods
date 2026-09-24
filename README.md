@@ -248,7 +248,24 @@ rustypods ingress status
 `--install-ca` writes the generated CA (`/var/lib/rustypods/pki/ca.crt`)
 into the host's system trust store (`update-ca-certificates` /
 `update-ca-trust`) — it **mutates system trust**; skip it and import the
-CA into your browser/store yourself if you prefer. Host loopback
+CA into your browser/store yourself if you prefer. New CAs are
+path-length constrained (`pathLen=0`) and name-constrained to
+`rustypods.localhost`. An older unconstrained CA is left in place (replacing
+it would drop existing trust) and `rustypods doctor` warns.
+`rustypods ingress rotate-ca` mints a new constrained CA — re-import it.
+`rustypods ingress uninstall-ca` removes the CA from the host trust store.
+The leaf is renewed automatically when fewer than 30 days remain; a running
+gateway is restarted so it loads the new pair, and the gateway also reloads
+the files when they change. The public proxy
+caps request bodies (`RUSTYPODS_INGRESS_MAX_BODY`, default 32 MiB),
+waits `RUSTYPODS_INGRESS_UPSTREAM_TIMEOUT_SECS` (default 30) for upstream
+response headers, drops a silent WebSocket after
+`RUSTYPODS_INGRESS_WS_IDLE_SECS` (default 60), and admits
+`RUSTYPODS_INGRESS_MAX_CONNS` in-flight requests (default 1024). TLS
+handshakes and HTTP/1 header reads time out after
+`RUSTYPODS_INGRESS_TLS_HANDSHAKE_SECS` and
+`RUSTYPODS_INGRESS_HEADER_TIMEOUT_SECS` (both default 10). HTTP/2 is
+capped at 100 concurrent streams with a 20s keepalive. Host loopback
 `127.0.0.0/8` and `::1` ports 80/443 are redirected to the gateway via
 nft OUTPUT rules only — nothing on the LAN can reach it, and init/start
 refuses if either port is already bound.
@@ -427,13 +444,31 @@ by `RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB).
 The same PodControl surface is exposed as REST/JSON for automation and
 agents: `rustypodsd --http-addr 127.0.0.1:9180` (the default; `--http-addr ""`
 disables it). Every `/v1/*` request needs
-`Authorization: Bearer <token>` — the daemon generates the token at startup
-and writes it to `/run/rustypods/http-token` (mode `0400`, owned by the
-allowed uid). Requests carrying `Origin`/`Sec-Fetch-Site` headers are
-rejected (no browser-driven calls); `/healthz` stays open. The bind is
-loopback-only — a non-loopback `--http-addr` is refused unless
-`RUSTYPODS_HTTP_INSECURE=1` is set. Request bodies are snake_case;
-responses are the proto messages in camelCase JSON:
+`Authorization: Bearer <token>`. The daemon writes two tokens, mode `0400`,
+owned by the allowed uid, and **reuses them across restarts**:
+
+- `/run/rustypods/http-token` — full access (root-equivalent)
+- `/run/rustypods/http-token-ro` — GET only (list, stats, logs, export)
+
+Set `RUSTYPODS_HTTP_TOKEN_ROTATE=1` to mint new tokens at the next start.
+Requests carrying `Origin`/`Sec-Fetch-Site` are rejected (no browser-driven
+calls). `/healthz` stays open and returns 503 when the daemon cannot lock
+its state or reach machined. The bind is loopback-only. A non-loopback
+`--http-addr` is refused unless `RUSTYPODS_HTTP_INSECURE=1` is set; that
+flag logs a warning on every start and is **not** a supported remote path.
+Use SSH forwarding or the gRPC client instead:
+
+```bash
+ssh -L 9180:127.0.0.1:9180 host
+rustypods --remote host exec dev -- true
+```
+
+JSON bodies are limited to 1 MiB. `POST /v1/import` streams up to
+`RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB). Other handlers time out
+after 60s; `exec` may run up to 900s. Export, import, and logs are not
+cut by that deadline. The listener caps connections at 256 and drops
+HTTP/1 clients that don't finish their headers within 10s. Request bodies
+are snake_case; responses are the proto messages in camelCase JSON:
 
 ```
 GET    /healthz                      GET    /v1/daemon

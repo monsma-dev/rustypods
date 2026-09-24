@@ -76,10 +76,19 @@ async fn main() -> Result<()> {
             .parse::<std::net::SocketAddr>()
             .map(|a| a.ip().is_loopback())
             .unwrap_or(false);
-        if !loopback && std::env::var_os("RUSTYPODS_HTTP_INSECURE").is_none() {
+        if !loopback && !rustypodsd::server::http_insecure_enabled() {
             anyhow::bail!(
                 "refusing to bind the REST API to non-loopback '{}' — \
-                 set RUSTYPODS_HTTP_INSECURE=1 to override",
+                 set RUSTYPODS_HTTP_INSECURE=1 to override. The supported \
+                 remote path is SSH forwarding (ssh -L 9180:127.0.0.1:9180 host) \
+                 or the gRPC client --remote mode",
+                args.http_addr
+            );
+        }
+        if !loopback {
+            tracing::warn!(
+                "SECURITY: RUSTYPODS_HTTP_INSECURE=1 — REST API will bind to {}. \
+                 Plain HTTP, root-equivalent token. Prefer SSH -L or gRPC --remote.",
                 args.http_addr
             );
         }

@@ -38,22 +38,149 @@ const HOP_HEADERS: [HeaderName; 8] = [
     header::PROXY_AUTHORIZATION,
 ];
 
+/// Knobs for the public edge. Defaults are conservative; each can be
+/// overridden with an env var so a large upload doesn't need a rebuild.
+#[derive(Clone, Debug)]
+pub struct ProxyLimits {
+    /// Request body cap. `RUSTYPODS_INGRESS_MAX_BODY` (bytes), default 32 MiB.
+    pub body_max: u64,
+    /// How long to wait for upstream response headers.
+    /// `RUSTYPODS_INGRESS_UPSTREAM_TIMEOUT_SECS`, default 30.
+    pub upstream_headers: Duration,
+    /// Idle timeout on a WebSocket/upgrade splice.
+    /// `RUSTYPODS_INGRESS_WS_IDLE_SECS`, default 60.
+    pub ws_idle: Duration,
+    /// In-flight proxied requests. `RUSTYPODS_INGRESS_MAX_CONNS`, default 1024.
+    pub max_inflight: usize,
+    /// TLS handshake. `RUSTYPODS_INGRESS_TLS_HANDSHAKE_SECS`, default 10.
+    pub tls_handshake: Duration,
+    /// HTTP/1 header read on the public listeners.
+    /// `RUSTYPODS_INGRESS_HEADER_TIMEOUT_SECS`, default 10.
+    pub header_read: Duration,
+}
+
+impl Default for ProxyLimits {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+impl ProxyLimits {
+    pub fn from_env() -> Self {
+        Self {
+            body_max: env_u64("RUSTYPODS_INGRESS_MAX_BODY", 32 << 20),
+            upstream_headers: Duration::from_secs(env_u64(
+                "RUSTYPODS_INGRESS_UPSTREAM_TIMEOUT_SECS",
+                30,
+            )),
+            ws_idle: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_WS_IDLE_SECS", 60)),
+            max_inflight: env_u64("RUSTYPODS_INGRESS_MAX_CONNS", 1024) as usize,
+            tls_handshake: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_TLS_HANDSHAKE_SECS", 10)),
+            header_read: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_HEADER_TIMEOUT_SECS", 10)),
+        }
+    }
+}
+
 /// Everything the proxy needs: the shared route table + one pooled
-/// upstream client (connect timeout 5s, idle pool 60s/32-per-host).
+/// upstream client (connect timeout 5s, idle pool 60s/32-per-host,
+/// response-header timeout from [`ProxyLimits`]).
 pub struct ProxyState {
     routes: Arc<RouteState>,
     client: Client<HttpConnector, Body>,
+    limits: ProxyLimits,
+    inflight: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn proxy_state(routes: Arc<RouteState>) -> Arc<ProxyState> {
+    proxy_state_with(routes, ProxyLimits::from_env())
+}
+
+pub fn proxy_state_with(routes: Arc<RouteState>, limits: ProxyLimits) -> Arc<ProxyState> {
     let mut connector = HttpConnector::new();
     connector.set_connect_timeout(Some(Duration::from_secs(5)));
     connector.enforce_http(true);
     let client = Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(32)
+        .pool_timer(hyper_util::rt::TokioTimer::new())
         .build(connector);
-    Arc::new(ProxyState { routes, client })
+    let inflight = Arc::new(tokio::sync::Semaphore::new(limits.max_inflight));
+    Arc::new(ProxyState {
+        routes,
+        client,
+        limits,
+        inflight,
+    })
+}
+
+/// Apply the public-listener HTTP/1 header timeout and HTTP/2 stream cap
+/// plus keepalive. The header timeout panics unless a timer is set.
+/// Plain-HTTP accept loop with a connection cap and header-read timeout.
+/// axum's `serve` exposes neither.
+pub async fn serve_capped(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    limits: ProxyLimits,
+) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::ServiceExt;
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(limits.max_inflight.max(1)));
+    let header_limits = limits;
+    loop {
+        let (sock, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("ingress http accept: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = sem.clone().try_acquire_owned() else {
+            tracing::warn!("ingress connection cap reached; dropping connection");
+            continue;
+        };
+        let app = app.clone();
+        let header_limits = header_limits.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let io = TokioIo::new(sock);
+            let svc =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    async move { app.oneshot(req.map(Body::new)).await }
+                });
+            let mut builder = Builder::new(TokioExecutor::new());
+            configure_public_http(&mut builder, &header_limits);
+            if let Err(e) = builder.serve_connection(io, svc).await {
+                tracing::debug!("ingress http: {e}");
+            }
+        });
+    }
+}
+
+pub fn configure_public_http(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    limits: &ProxyLimits,
+) {
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(limits.header_read);
+    builder
+        .http2()
+        .max_concurrent_streams(100u32)
+        .keep_alive_interval(Duration::from_secs(20))
+        .keep_alive_timeout(Duration::from_secs(10));
 }
 
 /// Plain-HTTP app: health only; everything else 308s to HTTPS.
@@ -204,6 +331,10 @@ async fn proxy_request(st: &ProxyState, mut req: Request) -> Response {
     if req.method() == Method::CONNECT {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
+    let Ok(permit) = st.inflight.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let _permit = permit;
     let host = match canonical_host(&req) {
         Ok(h) => h,
         Err(e) => return bad_request(e),
@@ -236,12 +367,31 @@ async fn proxy_request(st: &ProxyState, mut req: Request) -> Response {
     }
     strip_hop_headers(req.headers_mut(), ws);
     sanitize_forward_headers(req.headers_mut(), &host, "https");
+    if let Some(len) = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if len > st.limits.body_max {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    }
+    let max = st.limits.body_max;
+    let (parts, body) = req.into_parts();
+    let limited = http_body_util::Limited::new(body, max as usize);
+    let req = Request::from_parts(parts, Body::new(limited));
 
-    let mut resp = match st.client.request(req).await {
-        Ok(r) => r,
-        Err(e) => {
+    let upstream = st.limits.upstream_headers;
+    let mut resp = match tokio::time::timeout(upstream, st.client.request(req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             tracing::debug!("upstream {host}: {e}");
             return StatusCode::BAD_GATEWAY.into_response();
+        }
+        Err(_) => {
+            tracing::debug!("upstream {host}: response headers timed out");
+            return StatusCode::GATEWAY_TIMEOUT.into_response();
         }
     };
 
@@ -253,12 +403,13 @@ async fn proxy_request(st: &ProxyState, mut req: Request) -> Response {
         strip_hop_headers(resp.headers_mut(), true);
         let up_upgrade = hyper::upgrade::on(&mut resp);
         let host = host.clone();
+        let st_idle = st.limits.ws_idle;
         tokio::spawn(async move {
             match (down_upgrade.expect("ws checked").await, up_upgrade.await) {
                 (Ok(down), Ok(up)) => {
-                    let mut down = TokioIo::new(down);
-                    let mut up = TokioIo::new(up);
-                    match tokio::io::copy_bidirectional(&mut down, &mut up).await {
+                    let down = TokioIo::new(down);
+                    let up = TokioIo::new(up);
+                    match copy_idle(down, up, st_idle).await {
                         Ok((a, b)) => {
                             tracing::debug!("websocket {host}: closed ({a} up, {b} down)")
                         }
@@ -276,6 +427,47 @@ async fn proxy_request(st: &ProxyState, mut req: Request) -> Response {
 
     let (parts, body) = resp.into_parts();
     Response::from_parts(parts, Body::new(body))
+}
+
+/// Bidirectional copy that fails when either direction is idle.
+async fn copy_idle<A, B>(a: A, b: B, idle: Duration) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+    let up = copy_one_way(&mut ar, &mut bw, idle);
+    let down = copy_one_way(&mut br, &mut aw, idle);
+    let (u, d) = tokio::try_join!(up, down)?;
+    Ok((u, d))
+}
+
+async fn copy_one_way(
+    r: &mut (impl tokio::io::AsyncRead + Unpin),
+    w: &mut (impl tokio::io::AsyncWrite + Unpin),
+    idle: Duration,
+) -> std::io::Result<u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 8192];
+    let mut n = 0u64;
+    loop {
+        let read = match tokio::time::timeout(idle, r.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(k)) => k,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "websocket idle timeout",
+                ))
+            }
+        };
+        w.write_all(&buf[..read]).await?;
+        n += read as u64;
+    }
+    let _ = w.shutdown().await;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -566,6 +758,73 @@ mod tests {
         assert!(!h.contains_key("keep-alive"));
         assert!(!h.contains_key("proxy-authenticate"));
         assert!(!h.contains_key("transfer-encoding"));
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_413_and_silent_upstream_is_504() {
+        let routes = Arc::new(RouteState::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let mut m = Routes::new();
+        m.insert(
+            "web.rustypods.localhost".into(),
+            Backend {
+                ip: Ipv4Addr::LOCALHOST,
+                port,
+            },
+        );
+        routes.commit(1, m);
+        let limits = ProxyLimits {
+            body_max: 8,
+            upstream_headers: Duration::from_millis(200),
+            ws_idle: Duration::from_secs(60),
+            max_inflight: 4,
+            tls_handshake: Duration::from_secs(10),
+            header_read: Duration::from_secs(10),
+        };
+        let st = proxy_state_with(routes, limits);
+        let app = https_app(st);
+        let big = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "web.rustypods.localhost")
+                    .header("content-length", "100")
+                    .body(Body::from("0123456789abcdef"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(big.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let slow = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "web.rustypods.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slow.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn websocket_idle_timeout_ends_a_silent_splice() {
+        let (a, b) = tokio::io::duplex(64);
+        let (c, _d) = tokio::io::duplex(64);
+        let err = copy_idle(a, c, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        drop(b);
     }
 
     /// Real WebSocket through the whole path: client → ingress app

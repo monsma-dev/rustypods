@@ -591,7 +591,28 @@ rides inside the encrypted tunnel.
   endpoint→key map entry — a stale mapping would misattribute future
   datagrams arriving from the old address.
 
+## Ingress CA and gateway
+
+Ingress CAs created from here on are `pathLen=0` and name-constrained to
+`rustypods.localhost`. Older unconstrained CAs are kept and warned about
+(`doctor`, daemon log). `ingress rotate-ca` replaces one; `ingress uninstall-ca`
+removes it from the host trust store. The leaf renews with under 30 days
+left; the daemon copies the new pair into the gateway rootfs and restarts
+the pod, and the gateway also reloads the files when their mtime changes.
+The gateway control socket is opened `O_PATH|O_NOFOLLOW` and must be a
+socket owned by the run-directory uid — a pod-planted symlink is refused.
+
 ## REST API surface (Wave G)
+
+Tokens persist in `<socket-dir>/http-token` (read-write) and
+`http-token-ro` (GET only) across daemon restarts. `RUSTYPODS_HTTP_TOKEN_ROTATE=1`
+replaces both. `RUSTYPODS_HTTP_INSECURE=1` allows a non-loopback bind and
+warns on every start — the supported remote path is `ssh -L` or gRPC
+`--remote`, not plain HTTP on a LAN address. JSON bodies are 1 MiB;
+import uses `RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB). Non-streaming
+handlers have a 60s deadline (exec ≤900s). `/healthz` is open and reports
+whether the state lock and machined are reachable. PATCH merges under the
+per-pod op lock.
 
 `/v1/pods/{name}` GET · `/v1/pods/{name}/stats` GET (live cgroup-v2:
 memory.current, cpu.stat usage_usec, pids.current, memory.peak — read

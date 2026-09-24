@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 axum.workspace = true
 http.workspace = true
+hyper.workspace = true
 hyper-util.workspace = true
 clap.workspace = true
 libc.workspace = true
@@ -23,7 +24,7 @@ tokio.workspace = true
 toml.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
-tower = { workspace = true, features = ["limit"] }
+tower = { workspace = true, features = ["limit", "util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 oci-client.workspace = true
@@ -35,5 +36,5 @@ boringtun.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
 base64.workspace = true
-rcgen = "=0.14.8"
+rcgen = { version = "=0.14.8", features = ["x509-parser"] }
 time = "0.3.55"

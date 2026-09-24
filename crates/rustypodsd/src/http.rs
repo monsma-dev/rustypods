@@ -3,21 +3,30 @@
 //! serialize camelCase, so responses match the protobuf field names.
 //!
 //! **Bearer-token auth.** Every `/v1/*` request needs
-//! `Authorization: Bearer <token>`; the token is generated at daemon start
-//! and written to /run/rustypods/http-token (mode 0400, owned by the
-//! allowed uid). Requests carrying `Origin` or `Sec-Fetch-Site` headers are
-//! rejected outright — browsers have no business here (CSRF/drive-by).
-//! `/healthz` stays open. The bind address is loopback-only unless the
-//! operator sets RUSTYPODS_HTTP_INSECURE=1.
+//! `Authorization: Bearer <token>`. The read-write token lives in
+//! `<socket-dir>/http-token` and a second read-only token in
+//! `http-token-ro` (both mode 0400, owned by the allowed uid). They are
+//! created once and reused across restarts; `RUSTYPODS_HTTP_TOKEN_ROTATE=1`
+//! mints new ones. The read-only token may only call GET. Requests carrying
+//! `Origin` or `Sec-Fetch-Site` are rejected — browsers have no business
+//! here. `/healthz` stays open and reports whether daemon state can be
+//! locked. The bind is loopback-only unless `RUSTYPODS_HTTP_INSECURE=1`;
+//! that flag is not a supported remote path (use SSH `-L` or gRPC
+//! `--remote`). JSON bodies are capped at 1 MiB. `POST /v1/import` streams
+//! up to `RUSTYPODS_IMPORT_MAX_BYTES` (default 64 GiB).
 
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, Request as AxumRequest, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, Request as AxumRequest, State},
     http::{header, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -38,9 +47,41 @@ fn api_err(s: Status) -> ApiErr {
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
         tonic::Code::AlreadyExists => StatusCode::CONFLICT,
         tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
+        tonic::Code::ResourceExhausted => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, Json(serde_json::json!({ "error": s.message() })))
+}
+
+/// Buffered JSON/text bodies (create, patch, exec, stack.toml).
+pub const JSON_BODY_MAX: usize = 1 << 20;
+/// Non-streaming handlers. Exec is capped by its own timeout (≤900s).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const EXEC_REQUEST_TIMEOUT: Duration = Duration::from_secs(910);
+/// Slowloris: drop a connection that hasn't finished its headers.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Matches the gRPC server's global in-flight cap.
+pub const MAX_CONNECTIONS: usize = 256;
+const IMPORT_MAX_DEFAULT: u64 = 64 << 30;
+
+/// Read-write plus optional read-only bearer tokens.
+#[derive(Clone)]
+pub struct HttpAuth {
+    pub rw: Arc<str>,
+    pub ro: Arc<str>,
+}
+
+/// `RUSTYPODS_IMPORT_MAX_BYTES`, default 64 GiB. Shared with the transfer
+/// path — same variable, same default. Non-numeric or zero falls back.
+pub fn import_max_bytes() -> u64 {
+    match std::env::var("RUSTYPODS_IMPORT_MAX_BYTES") {
+        Ok(s) => s
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(IMPORT_MAX_DEFAULT),
+        Err(_) => IMPORT_MAX_DEFAULT,
+    }
 }
 
 /// `POST /v1/pods` body — local request struct (proto types are
@@ -122,8 +163,18 @@ fn parse_ingress(specs: &[String]) -> Result<Vec<IngressRule>, ApiErr> {
         .map_err(|e| api_err(Status::invalid_argument(format!("{e:#}"))))
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+/// Unauthenticated and minimal: only whether the daemon can take its state
+/// lock quickly. A stuck lock (or a wedged runtime) is not "ok".
+async fn healthz(State(s): State<Svc>) -> Response {
+    if s.http_ready().await {
+        (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false })),
+        )
+            .into_response()
+    }
 }
 
 async fn daemon_info(State(s): State<Svc>) -> Result<Json<DaemonInfo>, ApiErr> {
@@ -213,27 +264,23 @@ async fn update_pod(
     Path(name): Path<String>,
     Json(b): Json<UpdatePodIn>,
 ) -> Result<Json<Pod>, ApiErr> {
-    // The RPC takes concrete limits — merge over the current pod so absent
-    // JSON fields keep their values (same rule as `rustypods config`).
-    let cur = s
-        .list_pods(Request::new(ListPodsRequest {}))
+    // Merge under the per-pod op lock. Reading via list_pods and then
+    // calling update_pod_config let two PATCHes each snapshot the same
+    // pod and the later write drop the earlier field change.
+    let _op = s.pod_op(&name).await;
+    let (cur_lim, storage_max) = s
+        .pod_limit_snapshot(&name)
         .await
-        .map_err(api_err)?
-        .into_inner()
-        .pods
-        .into_iter()
-        .find(|p| p.name == name)
         .ok_or_else(|| api_err(Status::not_found(format!("pod {name} not found"))))?;
-    let cur_lim = cur.limits.unwrap_or_default();
     let p = s
-        .update_pod_config(Request::new(UpdatePodConfigRequest {
+        .apply_pod_config(UpdatePodConfigRequest {
             name,
             limits: Some(Limits {
                 memory_high_bytes: b.memory_high_bytes.unwrap_or(cur_lim.memory_high_bytes),
                 memory_max_bytes: b.memory_max_bytes.unwrap_or(cur_lim.memory_max_bytes),
                 cpu_quota_percent: b.cpu_quota_percent.unwrap_or(cur_lim.cpu_quota_percent),
             }),
-            storage_max_bytes: b.storage_max_bytes.unwrap_or(cur.storage_max_bytes),
+            storage_max_bytes: b.storage_max_bytes.unwrap_or(storage_max),
             ports: b.ports.map(|ports| PortMappings { ports }),
             binds: b.binds.map(|binds| BindList { binds }),
             snap_keep_last: b.snap_keep_last,
@@ -251,10 +298,9 @@ async fn update_pod(
             env: b.env.map(|entries| EnvList { entries }),
             volumes: b.volumes.map(|specs| VolumeList { specs }),
             stop_timeout_secs: None,
-        }))
+        })
         .await
-        .map_err(api_err)?
-        .into_inner();
+        .map_err(api_err)?;
     Ok(Json(p))
 }
 
@@ -477,10 +523,23 @@ struct ImportQuery {
 
 async fn import_pod_http(
     State(s): State<Svc>,
+    Extension(max): Extension<u64>,
     Query(q): Query<ImportQuery>,
     req: AxumRequest,
 ) -> Result<Json<Pod>, ApiErr> {
     use rustypods_proto::rpc::import_chunk::Kind;
+    if let Some(len) = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if len > max {
+            return Err(api_err(Status::resource_exhausted(format!(
+                "import body {len} bytes exceeds limit {max}"
+            ))));
+        }
+    }
     let rename = q.name.filter(|n| !n.is_empty());
     let trust = q.trust.unwrap_or(false);
     let options = if rename.is_some() || trust {
@@ -493,11 +552,21 @@ async fn import_pod_http(
     } else {
         None
     };
-    let data = req.into_body().into_data_stream().map(|b| {
-        b.map(|b| ImportChunk {
-            kind: Some(Kind::Data(b.to_vec())),
-        })
-        .map_err(|e| Status::internal(format!("body read: {e}")))
+    let mut seen = 0u64;
+    let data = req.into_body().into_data_stream().map(move |b| {
+        b.map_err(|e| Status::internal(format!("body read: {e}")))
+            .and_then(|b| {
+                seen = seen.saturating_add(b.len() as u64);
+                if seen > max {
+                    Err(Status::resource_exhausted(format!(
+                        "import body exceeds limit {max} bytes"
+                    )))
+                } else {
+                    Ok(ImportChunk {
+                        kind: Some(Kind::Data(b.to_vec())),
+                    })
+                }
+            })
     });
     let stream = tokio_stream::iter(options.map(Ok::<_, Status>)).chain(data);
     let pod = s.import_archive(stream).await.map_err(api_err)?;
@@ -630,32 +699,93 @@ async fn mesh_rm_peer_http(
     .map_err(api_err)
 }
 
-/// Bearer auth + browser-header rejection for /v1/*. Two gates:
-/// 1. Any `Origin` or `Sec-Fetch-Site` header → 403. Browsers attach those
-///    to cross-origin requests; a local web page must never drive the API.
-/// 2. Missing/wrong `Authorization: Bearer <token>` → 401.
+/// Constant-time equality. Length is part of the compare so a short
+/// guess doesn't return early; both sides are hashed to a fixed width
+/// first so the loop count doesn't depend on the attacker-controlled
+/// input length.
+fn token_eq(presented: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let a = Sha256::digest(presented.as_bytes());
+    let b = Sha256::digest(expected.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Bearer auth + browser-header rejection for /v1/*.
+///
+/// 1. `Origin` or `Sec-Fetch-Site` → 403.
+/// 2. Read-write token → any method. Read-only token → GET only.
+/// 3. Anything else → 401.
+///
+/// Both tokens are always compared so a match on the first doesn't
+/// skip the second.
 async fn require_token(
-    State(expected): State<Arc<str>>,
+    State(auth): State<HttpAuth>,
     req: AxumRequest,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let h = req.headers();
-    if h.contains_key(axum::http::header::ORIGIN) || h.contains_key("sec-fetch-site") {
+    if h.contains_key(header::ORIGIN) || h.contains_key("sec-fetch-site") {
         return Err(StatusCode::FORBIDDEN);
     }
-    let want = format!("Bearer {expected}");
-    let ok = h
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == want)
-        .unwrap_or(false);
-    if !ok {
-        return Err(StatusCode::UNAUTHORIZED);
+    let presented = bearer(h).unwrap_or("");
+    let rw = token_eq(presented, &auth.rw);
+    let ro = token_eq(presented, &auth.ro);
+    if rw {
+        return Ok(next.run(req).await);
     }
-    Ok(next.run(req).await)
+    if ro && req.method() == axum::http::Method::GET {
+        return Ok(next.run(req).await);
+    }
+    if ro {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Err(StatusCode::UNAUTHORIZED)
 }
 
-pub fn router(svc: Svc, token: Arc<str>) -> Router {
+/// Streaming transfers aren't bound by the 60s handler timeout — an
+/// archive or a log tail can legitimately run longer. Exec keeps its
+/// own ≤900s cap; the HTTP deadline sits just above that.
+fn request_budget(path: &str) -> Option<Duration> {
+    if path.ends_with("/export") || path.ends_with("/logs") || path == "/v1/import" {
+        None
+    } else if path.ends_with("/exec") {
+        Some(EXEC_REQUEST_TIMEOUT)
+    } else {
+        Some(REQUEST_TIMEOUT)
+    }
+}
+
+async fn limit_request_time(req: AxumRequest, next: Next) -> Response {
+    let budget = request_budget(req.uri().path());
+    match budget {
+        None => next.run(req).await,
+        Some(d) => match tokio::time::timeout(d, next.run(req)).await {
+            Ok(r) => r,
+            Err(_) => (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({ "error": "request timed out" })),
+            )
+                .into_response(),
+        },
+    }
+}
+
+pub fn router(svc: Svc, auth: HttpAuth) -> Router {
+    router_with(svc, auth, import_max_bytes())
+}
+
+pub fn router_with(svc: Svc, auth: HttpAuth, import_max: u64) -> Router {
     let v1 = Router::new()
         .route("/v1/daemon", get(daemon_info))
         .route("/v1/pods", get(list_pods).post(create_pod))
@@ -680,9 +810,372 @@ pub fn router(svc: Svc, token: Arc<str>) -> Router {
         .route("/v1/mesh/init", post(mesh_init_http))
         .route("/v1/mesh/peers", post(mesh_add_peer_http))
         .route("/v1/mesh/peers/{*pubkey}", delete(mesh_rm_peer_http))
-        .route_layer(axum::middleware::from_fn_with_state(token, require_token));
+        .route_layer(axum::middleware::from_fn_with_state(auth, require_token));
     Router::new()
         .route("/healthz", get(healthz))
         .merge(v1)
+        .layer(DefaultBodyLimit::max(JSON_BODY_MAX))
+        .layer(axum::middleware::from_fn(limit_request_time))
+        .layer(Extension(import_max))
         .with_state(svc)
+}
+
+/// Accept loop with a connection cap and an HTTP/1 header-read timeout.
+/// `axum::serve` doesn't expose either. Hyper's header timeout needs a
+/// timer or it panics.
+pub async fn listen(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
+    listen_with(listener, app, HEADER_READ_TIMEOUT, MAX_CONNECTIONS).await
+}
+
+pub async fn listen_with(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_timeout: Duration,
+    max_connections: usize,
+) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::ServiceExt;
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    loop {
+        let (sock, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("http accept: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let permit = match sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "http connection cap ({max_connections}) reached; dropping connection"
+                );
+                continue;
+            }
+        };
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let io = TokioIo::new(sock);
+            let svc =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    async move {
+                        let req = req.map(Body::new);
+                        app.oneshot(req).await
+                    }
+                });
+            let mut builder = Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_timeout);
+            builder.http2().max_concurrent_streams(32);
+            if let Err(e) = builder.serve_connection(io, svc).await {
+                tracing::debug!("http connection: {e}");
+            }
+        });
+    }
+}
+
+/// 32 bytes from /dev/urandom, hex. Empty or unreadable files are replaced.
+fn mint_token() -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .context("reading /dev/urandom")?;
+    let mut token = String::with_capacity(64);
+    for b in buf {
+        token.push_str(&format!("{b:02x}"));
+    }
+    Ok(token)
+}
+
+fn read_token_file(path: &FsPath) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() || s.len() > 256 {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn store_token(path: &FsPath, token: &str, allowed_uid: u32) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        f.write_all(token.as_bytes())?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
+    if crate::euid() == 0 {
+        std::os::unix::fs::chown(path, Some(allowed_uid), Some(allowed_uid))
+            .with_context(|| format!("chown {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Load or create the read-write and read-only token files. Existing
+/// files are kept so a daemon restart doesn't invalidate automation.
+/// `rotate` (RUSTYPODS_HTTP_TOKEN_ROTATE=1) replaces both.
+pub fn ensure_http_tokens(
+    socket: &FsPath,
+    allowed_uid: u32,
+    rotate: bool,
+) -> anyhow::Result<(HttpAuth, PathBuf, PathBuf)> {
+    let dir = socket
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/run/rustypods"));
+    std::fs::create_dir_all(&dir)?;
+    let rw_path = dir.join("http-token");
+    let ro_path = dir.join("http-token-ro");
+    let load = |path: &FsPath| -> anyhow::Result<String> {
+        if !rotate {
+            if let Some(existing) = read_token_file(path) {
+                // Owner can't open a 0400 file for write — only re-assert mode.
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
+                return Ok(existing);
+            }
+        }
+        // A previous 0400 file is not writable even by its owner.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        let token = mint_token()?;
+        store_token(path, &token, allowed_uid)?;
+        Ok(token)
+    };
+    let rw = load(&rw_path)?;
+    let ro = load(&ro_path)?;
+    Ok((
+        HttpAuth {
+            rw: Arc::from(rw),
+            ro: Arc::from(ro),
+        },
+        rw_path,
+        ro_path,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn auth() -> HttpAuth {
+        HttpAuth {
+            rw: Arc::from("rw-token"),
+            ro: Arc::from("ro-token"),
+        }
+    }
+
+    fn app() -> Router {
+        let dir = std::env::temp_dir().join(format!("rp-http-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        router_with(crate::server::Svc::stub(dir), auth(), 64)
+    }
+
+    async fn call(app: Router, req: Request<Body>) -> Response {
+        app.oneshot(req).await.unwrap()
+    }
+
+    #[test]
+    fn token_eq_rejects_mismatch_and_prefix() {
+        assert!(token_eq("rw-token", "rw-token"));
+        assert!(!token_eq("rw-token", "ro-token"));
+        assert!(!token_eq("rw-token-extra", "rw-token"));
+        assert!(!token_eq("", "rw-token"));
+    }
+
+    #[test]
+    fn tokens_persist_until_rotate() {
+        let dir = std::env::temp_dir().join(format!(
+            "rp-tok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("rustypods.sock");
+        let (a, rw, ro) = ensure_http_tokens(&sock, 1000, false).unwrap();
+        let (b, _, _) = ensure_http_tokens(&sock, 1000, false).unwrap();
+        assert_eq!(&*a.rw, &*b.rw);
+        assert_eq!(&*a.ro, &*b.ro);
+        assert_ne!(&*a.rw, &*a.ro);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&rw).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            std::fs::metadata(&ro).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        let (c, _, _) = ensure_http_tokens(&sock, 1000, true).unwrap();
+        assert_ne!(&*a.rw, &*c.rw);
+        assert_ne!(&*a.ro, &*c.ro);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_gates_and_healthz() {
+        let res = call(
+            app(),
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = call(
+            app(),
+            Request::builder()
+                .uri("/v1/pods")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = call(
+            app(),
+            Request::builder()
+                .uri("/v1/pods")
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = call(
+            app(),
+            Request::builder()
+                .uri("/v1/pods")
+                .header("authorization", "Bearer rw-token")
+                .header("origin", "http://evil")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let res = call(
+            app(),
+            Request::builder()
+                .uri("/v1/pods")
+                .header("authorization", "Bearer ro-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = call(
+            app(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/pods")
+                .header("authorization", "Bearer ro-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"a","image":"img"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn json_body_over_1mib_is_413() {
+        let big = "x".repeat(JSON_BODY_MAX + 8);
+        let body = format!(r#"{{"name":"a","image":"{big}"}}"#);
+        let res = call(
+            app(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/pods")
+                .header("authorization", "Bearer rw-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn import_content_length_over_cap_is_413() {
+        let res = call(
+            app(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/import")
+                .header("authorization", "Bearer rw-token")
+                .header("content-length", "1000")
+                .body(Body::from("nope"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn header_read_timeout_drops_a_slow_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = app();
+        tokio::spawn(async move {
+            let _ = listen_with(listener, app, Duration::from_millis(200), 8).await;
+        });
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        sock.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut buf = [0u8; 64];
+        use tokio::io::AsyncReadExt;
+        let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf))
+            .await
+            .expect("read")
+            .unwrap_or(0);
+        // Connection closed before a response (header never finished).
+        assert_eq!(n, 0, "slow header should be dropped, got {:?}", &buf[..n]);
+    }
+
+    #[test]
+    fn streaming_paths_skip_the_short_deadline() {
+        assert!(request_budget("/v1/import").is_none());
+        assert!(request_budget("/v1/pods/dev/export").is_none());
+        assert!(request_budget("/v1/pods/dev/logs").is_none());
+        assert_eq!(
+            request_budget("/v1/pods/dev/exec"),
+            Some(EXEC_REQUEST_TIMEOUT)
+        );
+        assert_eq!(request_budget("/v1/pods"), Some(REQUEST_TIMEOUT));
+    }
 }

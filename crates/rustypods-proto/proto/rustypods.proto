@@ -80,6 +80,11 @@ service PodControl {
   // rustypods-ingress proxy), and report its health/route table.
   rpc InitIngress(InitIngressRequest) returns (IngressDeployment);
   rpc IngressGatewayStatus(IngressGatewayStatusRequest) returns (IngressGatewayStatusResponse);
+  // Remove the CA from the host trust store (the inverse of install_ca).
+  rpc UninstallIngressCa(Empty) returns (IngressCaResult);
+  // Replace an old CA. Trust stores that imported the previous CA must
+  // re-import; this does not edit the host trust store itself.
+  rpc RotateIngressCa(Empty) returns (IngressCaResult);
 }
 
 // In-pod agent → daemon, on the per-pod socket /run/rustypods/run/agent.sock.
@@ -635,6 +640,11 @@ message IngressDeployment {
   string ca_cert_path = 2;
   // Whether the CA was also installed into the host trust store.
   bool ca_installed = 3;
+}
+
+message IngressCaResult {
+  string ca_cert_path = 1;
+  string detail = 2;
 }
 
 message IngressGatewayStatusRequest {}

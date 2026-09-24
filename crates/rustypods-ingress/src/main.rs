@@ -61,19 +61,48 @@ async fn main() -> Result<()> {
         })?;
 
     let routes = Arc::new(control::RouteState::new());
-    let http = axum::serve(
-        net::dual_stack_listener(cli.http_addr)
-            .with_context(|| format!("bind http {}", cli.http_addr))?,
-        proxy::http_app(),
-    );
-    let https = axum_server::from_tcp_rustls(
-        net::dual_stack_listener(cli.https_addr)
-            .with_context(|| format!("bind https {}", cli.https_addr))?
-            .into_std()
-            .context("https listener to std")?,
-        tls,
-    )?
-    .serve(proxy::https_app(proxy::proxy_state(routes.clone())).into_make_service());
+    let limits = proxy::ProxyLimits::from_env();
+    let state = proxy::proxy_state_with(routes.clone(), limits.clone());
+    let http_listener = net::dual_stack_listener(cli.http_addr)
+        .with_context(|| format!("bind http {}", cli.http_addr))?;
+    let http_limits = limits.clone();
+    let http =
+        async move { proxy::serve_capped(http_listener, proxy::http_app(), http_limits).await };
+    let https_std = net::dual_stack_listener(cli.https_addr)
+        .with_context(|| format!("bind https {}", cli.https_addr))?
+        .into_std()
+        .context("https listener to std")?;
+    let tls_watch = tls.clone();
+    let acceptor =
+        axum_server::tls_rustls::RustlsAcceptor::new(tls).handshake_timeout(limits.tls_handshake);
+    let mut https = axum_server::from_tcp(https_std)?.acceptor(acceptor);
+    proxy::configure_public_http(https.http_builder(), &limits);
+    let https = https.serve(proxy::https_app(state).into_make_service());
+    let watch_cert = cli.tls_cert.clone();
+    let watch_key = cli.tls_key.clone();
+    tokio::spawn(async move {
+        let mut seen = std::fs::metadata(&watch_cert)
+            .and_then(|m| m.modified())
+            .ok();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let now = std::fs::metadata(&watch_cert)
+                .and_then(|m| m.modified())
+                .ok();
+            if now.is_some() && now != seen {
+                match tls_watch
+                    .reload_from_pem_file(&watch_cert, &watch_key)
+                    .await
+                {
+                    Ok(()) => {
+                        seen = now;
+                        tracing::info!("reloaded ingress TLS certificate");
+                    }
+                    Err(e) => tracing::warn!("tls reload: {e}"),
+                }
+            }
+        }
+    });
     let ctrl = {
         let sock = cli.control_socket.clone();
         async move { control::serve(&sock, routes, std::future::pending()).await }

@@ -881,7 +881,7 @@ impl Svc {
 
     /// Per-pod op lock, held for the whole duration of a stateful op on
     /// `name`. `stack:<name>` keys serialize stack-level apply/destroy.
-    async fn pod_op(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(crate) async fn pod_op(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let m = {
             let mut ops = self.ops.lock().await;
             ops.entry(name.to_string())
@@ -889,6 +889,287 @@ impl Svc {
                 .clone()
         };
         m.lock_owned().await
+    }
+
+    /// Limits + storage cap as stored, for a REST PATCH merge. Caller
+    /// holds `pod_op` so the snapshot and the following write are one
+    /// critical section.
+    pub(crate) async fn pod_limit_snapshot(&self, name: &str) -> Option<(Limits, u64)> {
+        let st = self.st.lock().await;
+        let m = st.pods.get(name)?;
+        Some((
+            Limits {
+                memory_high_bytes: m.limits.memory_high_bytes,
+                memory_max_bytes: m.limits.memory_max_bytes,
+                cpu_quota_percent: m.limits.cpu_quota_percent,
+            },
+            m.storage_max_bytes,
+        ))
+    }
+
+    /// `/healthz`: state lock must be acquirable. A wedged critical
+    /// section is an unhealthy daemon even if the process is up.
+    pub(crate) async fn http_ready(&self) -> bool {
+        if tokio::time::timeout(Duration::from_millis(200), self.st.lock())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        tokio::time::timeout(Duration::from_millis(200), self.engine.healthy())
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Renew a near-expiry leaf and, when the bytes change, put them in
+    /// the gateway rootfs; the gateway hot-reloads on the cert's mtime.
+    /// Runs from the 2s ingress tick but does real work at most hourly —
+    /// renewal has a 30-day window, and the unconstrained-CA warning
+    /// would otherwise flood the journal.
+    async fn maintain_ingress_pki(&self) -> Result<(), Status> {
+        static LAST_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = state::now_unix();
+        let last = LAST_RUN.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < 3600 {
+            return Ok(());
+        }
+        LAST_RUN.store(now, Ordering::Relaxed);
+        let crt = self.cfg.data_dir.join("pki").join("ca.crt");
+        if !crt.exists() {
+            return Ok(());
+        }
+        let data = self.cfg.data_dir.clone();
+        let before = self.cfg.data_dir.join("pki").join("tls.crt");
+        let old = std::fs::read(&before).ok();
+        let paths = Self::blocking(move || pki::ensure(&data)).await?;
+        pki::warn_if_unconstrained(&paths);
+        let new = std::fs::read(&paths.tls_crt).ok();
+        if old.is_some() && old != new {
+            self.install_gateway_leaf().await?;
+            tracing::info!("ingress leaf renewed; gateway reloads it within 30s");
+        }
+        Ok(())
+    }
+
+    /// Copy the current leaf into the gateway rootfs. No restart: stopping
+    /// the gateway is refused while backends have routes, and the gateway
+    /// reloads the pair when tls.crt's mtime changes.
+    async fn install_gateway_leaf(&self) -> Result<(), Status> {
+        let configured = {
+            let st = self.st.lock().await;
+            st.pods
+                .get(proto::INGRESS_POD)
+                .is_some_and(|m| m.ingress_gateway)
+        };
+        if !configured {
+            return Ok(());
+        }
+        let rootfs = self.pod_rootfs(proto::INGRESS_POD);
+        if !rootfs.exists() {
+            return Ok(());
+        }
+        let crt = std::fs::read(self.cfg.data_dir.join("pki").join("tls.crt")).map_err(int)?;
+        let key = std::fs::read(self.cfg.data_dir.join("pki").join("tls.key")).map_err(int)?;
+        Self::blocking(move || {
+            crate::rootfs::mkdir_in_rootfs(&rootfs, "etc/rustypods-ingress")?;
+            // Key first: the gateway's reload triggers on tls.crt's mtime,
+            // so the matching key must already be in place.
+            crate::rootfs::write_in_rootfs(
+                &rootfs,
+                "etc/rustypods-ingress/tls.key",
+                &key,
+                Some(0o600),
+            )?;
+            crate::rootfs::write_in_rootfs(
+                &rootfs,
+                "etc/rustypods-ingress/tls.crt",
+                &crt,
+                Some(0o644),
+            )?;
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Body of `update_pod_config`. Does not take `pod_op` — the caller
+    /// holds it, so a REST read-modify-write can merge under the same lock.
+    pub(crate) async fn apply_pod_config(
+        &self,
+        req: UpdatePodConfigRequest,
+    ) -> Result<Pod, Status> {
+        let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
+        {
+            let st = self.st.lock().await;
+            if !st.pods.contains_key(&name) {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            }
+        }
+        // The gateway's identity is daemon-managed — its cmd, ports,
+        // binds, ingress rules and supervision are provisioned by
+        // InitIngress and must not be rewritable through the ordinary
+        // config path. Resource limits and autostart stay tunable.
+        {
+            let st = self.st.lock().await;
+            if st.pods.get(&name).is_some_and(|m| m.ingress_gateway)
+                && (req.ports.is_some()
+                    || req.binds.is_some()
+                    || req.cmd.is_some()
+                    || req.ingress.is_some()
+                    || req.restart.is_some()
+                    || req.healthcheck.is_some()
+                    || req.env.is_some()
+                    || req.volumes.is_some())
+            {
+                return Err(Status::failed_precondition(
+                    "the ingress gateway is managed — cmd/ports/binds/ingress/restart/env/volumes are not configurable; re-run `rustypods ingress init`",
+                ));
+            }
+        }
+        let lim = limits_from(req.limits);
+        if let Some(r) = &req.restart {
+            proto::validate_restart(r).map_err(bad)?;
+        }
+        let new_hc = req
+            .healthcheck
+            .as_ref()
+            .map(health_from_proto)
+            .transpose()
+            .map_err(bad)?;
+        if let Some(el) = &req.env {
+            proto::validate_env(&el.entries).map_err(bad)?;
+        }
+        if let Some(vl) = &req.volumes {
+            for spec in &vl.specs {
+                proto::parse_volume_spec(spec).map_err(bad)?;
+            }
+        }
+        if let Some(pm) = &req.ports {
+            for spec in &pm.ports {
+                proto::validate_port(spec).map_err(bad)?;
+            }
+            let st = self.st.lock().await;
+            let stack = st
+                .pods
+                .get(&name)
+                .map(|m| m.stack.clone())
+                .unwrap_or_default();
+            validate_host_ports(&st, &name, &stack, &pm.ports)?;
+        }
+        if let Some(bl) = &req.binds {
+            for spec in &bl.binds {
+                proto::validate_bind(spec).map_err(bad)?;
+            }
+        }
+        if let Some(cl) = &req.cmd {
+            if !cl.argv.is_empty() {
+                proto::validate_argv(&cl.argv).map_err(bad)?;
+            }
+        }
+        // Ingress changes the pod's private-network identity — applying it
+        // to a live pod would split persisted state from runtime state, so
+        // it's only accepted on a stopped pod (takes effect next start).
+        if req.ingress.is_some() && self.engine.running_pid(&name).await.is_some() {
+            return Err(Status::failed_precondition(format!(
+                "pod {name} is running — stop the pod before changing ingress"
+            )));
+        }
+        let ports_changed = req.ports.is_some();
+        let meta = {
+            let mut st = self.st.lock().await;
+            // Race-safe ingress policy: global hostname check happens under
+            // THIS lock, immediately before the update below.
+            if let Some(il) = &req.ingress {
+                validate_ingress_conflicts(&st, &name, &il.rules)?;
+            }
+            let Some(m) = st.pods.get_mut(&name) else {
+                return Err(Status::not_found(format!("pod {name} not found")));
+            };
+            m.limits = lim;
+            m.storage_max_bytes = req.storage_max_bytes;
+            if let Some(pm) = req.ports {
+                m.ports = pm.ports;
+            }
+            // Applied at the next start, not live.
+            if let Some(bl) = req.binds {
+                m.binds = bl.binds;
+            }
+            // Same: payload override takes effect on the next start;
+            // present-but-empty clears it.
+            if let Some(cl) = req.cmd {
+                m.cmd = cl.argv;
+            }
+            // Ingress: present (even empty) replaces the whole set.
+            if let Some(il) = req.ingress {
+                m.ingress = ingress_from_proto(&il.rules);
+            }
+            // Snapshot retention: persisted only — the GC sweep applies it.
+            // Absent = keep, 0 clears.
+            if let Some(k) = req.snap_keep_last {
+                m.snap_keep_last = k;
+            }
+            if let Some(a) = req.snap_max_age_secs {
+                m.snap_max_age_secs = a;
+            }
+            // Absent = keep the current boot flag.
+            if let Some(a) = req.autostart {
+                m.autostart = a;
+            }
+            // Restart policy + probe: applied by the supervisor's next
+            // tick — no pod restart needed.
+            if let Some(r) = req.restart {
+                m.restart = r;
+            }
+            if let Some(t) = req.stop_timeout_secs {
+                if t > 600 {
+                    return Err(Status::invalid_argument(
+                        "stop_timeout_secs must be 0 (default 8s) or 1..=600",
+                    ));
+                }
+                m.stop_timeout_secs = t;
+            }
+            if let Some(mut h) = new_hc {
+                // healthcheck.user is conf-only — keep it across proto updates.
+                h.user = std::mem::take(&mut m.healthcheck.user);
+                m.healthcheck = h;
+            }
+            if let Some(el) = req.env {
+                m.env = el.entries;
+            }
+            if let Some(vl) = req.volumes {
+                m.volumes = vl.specs;
+            }
+            let m = m.clone();
+            self.save_pod(&m).map_err(int)?;
+            m
+        };
+        // Volume mounts reference named subvols — create missing ones so
+        // `volume ls` reflects the pod's config immediately.
+        for spec in &meta.volumes {
+            let v = proto::parse_volume_spec(spec).map_err(bad)?;
+            self.ensure_volume(&v.name).await.map_err(int)?;
+        }
+        // Hot-apply while the pod runs — no restart needed.
+        if self.engine.running_pid(&name).await.is_some() {
+            self.engine
+                .apply_limits(&name, &meta.limits)
+                .await
+                .map_err(int)?;
+        }
+        self.apply_storage_cap(&meta).await.map_err(int)?;
+        if ports_changed {
+            if let Err(e) = self.sync_nat().await {
+                tracing::warn!("nft rebuild after {name} config failed: {e}");
+            }
+        }
+        let leader = self.engine.running_pid(&name).await;
+        Ok(to_pod(
+            &meta,
+            &self.pod_rootfs(&name),
+            leader,
+            &self.health_view(&name).await,
+            self.mesh_prefix(),
+        ))
     }
 
     /// Non-blocking pod_op — None while another op holds the lock. For GC:
@@ -3554,178 +3835,8 @@ impl Svc {
     ) -> Result<Response<Pod>, Status> {
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
-        {
-            let st = self.st.lock().await;
-            if !st.pods.contains_key(&name) {
-                return Err(Status::not_found(format!("pod {name} not found")));
-            }
-        }
         let _op = self.pod_op(&name).await;
-        // The gateway's identity is daemon-managed — its cmd, ports,
-        // binds, ingress rules and supervision are provisioned by
-        // InitIngress and must not be rewritable through the ordinary
-        // config path. Resource limits and autostart stay tunable.
-        {
-            let st = self.st.lock().await;
-            if st.pods.get(&name).is_some_and(|m| m.ingress_gateway)
-                && (req.ports.is_some()
-                    || req.binds.is_some()
-                    || req.cmd.is_some()
-                    || req.ingress.is_some()
-                    || req.restart.is_some()
-                    || req.healthcheck.is_some()
-                    || req.env.is_some()
-                    || req.volumes.is_some())
-            {
-                return Err(Status::failed_precondition(
-                    "the ingress gateway is managed — cmd/ports/binds/ingress/restart/env/volumes are not configurable; re-run `rustypods ingress init`",
-                ));
-            }
-        }
-        let lim = limits_from(req.limits);
-        if let Some(r) = &req.restart {
-            proto::validate_restart(r).map_err(bad)?;
-        }
-        let new_hc = req
-            .healthcheck
-            .as_ref()
-            .map(health_from_proto)
-            .transpose()
-            .map_err(bad)?;
-        if let Some(el) = &req.env {
-            proto::validate_env(&el.entries).map_err(bad)?;
-        }
-        if let Some(vl) = &req.volumes {
-            for spec in &vl.specs {
-                proto::parse_volume_spec(spec).map_err(bad)?;
-            }
-        }
-        if let Some(pm) = &req.ports {
-            for spec in &pm.ports {
-                proto::validate_port(spec).map_err(bad)?;
-            }
-            let st = self.st.lock().await;
-            let stack = st
-                .pods
-                .get(&name)
-                .map(|m| m.stack.clone())
-                .unwrap_or_default();
-            validate_host_ports(&st, &name, &stack, &pm.ports)?;
-        }
-        if let Some(bl) = &req.binds {
-            for spec in &bl.binds {
-                proto::validate_bind(spec).map_err(bad)?;
-            }
-        }
-        if let Some(cl) = &req.cmd {
-            if !cl.argv.is_empty() {
-                proto::validate_argv(&cl.argv).map_err(bad)?;
-            }
-        }
-        // Ingress changes the pod's private-network identity — applying it
-        // to a live pod would split persisted state from runtime state, so
-        // it's only accepted on a stopped pod (takes effect next start).
-        if req.ingress.is_some() && self.engine.running_pid(&name).await.is_some() {
-            return Err(Status::failed_precondition(format!(
-                "pod {name} is running — stop the pod before changing ingress"
-            )));
-        }
-        let ports_changed = req.ports.is_some();
-        let meta = {
-            let mut st = self.st.lock().await;
-            // Race-safe ingress policy: global hostname check happens under
-            // THIS lock, immediately before the update below.
-            if let Some(il) = &req.ingress {
-                validate_ingress_conflicts(&st, &name, &il.rules)?;
-            }
-            let Some(m) = st.pods.get_mut(&name) else {
-                return Err(Status::not_found(format!("pod {name} not found")));
-            };
-            m.limits = lim;
-            m.storage_max_bytes = req.storage_max_bytes;
-            if let Some(pm) = req.ports {
-                m.ports = pm.ports;
-            }
-            // Applied at the next start, not live.
-            if let Some(bl) = req.binds {
-                m.binds = bl.binds;
-            }
-            // Same: payload override takes effect on the next start;
-            // present-but-empty clears it.
-            if let Some(cl) = req.cmd {
-                m.cmd = cl.argv;
-            }
-            // Ingress: present (even empty) replaces the whole set.
-            if let Some(il) = req.ingress {
-                m.ingress = ingress_from_proto(&il.rules);
-            }
-            // Snapshot retention: persisted only — the GC sweep applies it.
-            // Absent = keep, 0 clears.
-            if let Some(k) = req.snap_keep_last {
-                m.snap_keep_last = k;
-            }
-            if let Some(a) = req.snap_max_age_secs {
-                m.snap_max_age_secs = a;
-            }
-            // Absent = keep the current boot flag.
-            if let Some(a) = req.autostart {
-                m.autostart = a;
-            }
-            if let Some(t) = req.stop_timeout_secs {
-                if t > 600 {
-                    return Err(Status::invalid_argument(
-                        "stop_timeout_secs must be 0 (default 8s) or 1..=600",
-                    ));
-                }
-                m.stop_timeout_secs = t;
-            }
-            // Restart policy + probe: applied by the supervisor's next
-            // tick — no pod restart needed.
-            if let Some(r) = req.restart {
-                m.restart = r;
-            }
-            if let Some(mut h) = new_hc {
-                // healthcheck.user is conf-only — keep it across proto updates.
-                h.user = std::mem::take(&mut m.healthcheck.user);
-                m.healthcheck = h;
-            }
-            if let Some(el) = req.env {
-                m.env = el.entries;
-            }
-            if let Some(vl) = req.volumes {
-                m.volumes = vl.specs;
-            }
-            let m = m.clone();
-            self.save_pod(&m).map_err(int)?;
-            m
-        };
-        // Volume mounts reference named subvols — create missing ones so
-        // `volume ls` reflects the pod's config immediately.
-        for spec in &meta.volumes {
-            let v = proto::parse_volume_spec(spec).map_err(bad)?;
-            self.ensure_volume(&v.name).await.map_err(int)?;
-        }
-        // Hot-apply while the pod runs — no restart needed.
-        if self.engine.running_pid(&name).await.is_some() {
-            self.engine
-                .apply_limits(&name, &meta.limits)
-                .await
-                .map_err(int)?;
-        }
-        self.apply_storage_cap(&meta).await.map_err(int)?;
-        if ports_changed {
-            if let Err(e) = self.sync_nat().await {
-                tracing::warn!("nft rebuild after {name} config failed: {e}");
-            }
-        }
-        let leader = self.engine.running_pid(&name).await;
-        Ok(Response::new(to_pod(
-            &meta,
-            &self.pod_rootfs(&name),
-            leader,
-            &self.health_view(&name).await,
-            self.mesh_prefix(),
-        )))
+        self.apply_pod_config(req).await.map(Response::new)
     }
 }
 
@@ -4543,6 +4654,30 @@ impl PodControl for Svc {
         }))
     }
 
+    async fn uninstall_ingress_ca(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<IngressCaResult>, Status> {
+        let dest = Self::blocking(pki::uninstall_host_trust).await?;
+        Ok(Response::new(IngressCaResult {
+            ca_cert_path: dest.display().to_string(),
+            detail: "removed from the host trust store".into(),
+        }))
+    }
+
+    async fn rotate_ingress_ca(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<IngressCaResult>, Status> {
+        let data = self.cfg.data_dir.clone();
+        let paths = Self::blocking(move || pki::rotate(&data)).await?;
+        self.install_gateway_leaf().await?;
+        Ok(Response::new(IngressCaResult {
+            ca_cert_path: paths.ca_crt.display().to_string(),
+            detail: "replaced the CA; re-import it into browsers and the host trust store".into(),
+        }))
+    }
+
     async fn create_shm(&self, req: Request<ShmRequest>) -> Result<Response<ShmSegment>, Status> {
         let req = req.into_inner();
         let pod = proto::validate_name(&req.pod).map_err(bad)?.to_string();
@@ -5218,47 +5353,13 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Generate the REST bearer token (32 bytes from /dev/urandom, hex) and
-/// write it to <socket-dir>/http-token, mode 0400, owned by allowed_uid
-/// when running as root — the same uid that may already drive the unix
-/// socket. Non-root daemon → owned by the daemon's euid.
-fn write_http_token(cfg: &Config) -> Result<(Arc<str>, std::path::PathBuf)> {
-    use std::io::Read;
-    let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .context("reading /dev/urandom")?;
-    let mut token = String::with_capacity(64);
-    for b in buf {
-        token.push_str(&format!("{b:02x}"));
-    }
-    let dir = cfg
-        .socket
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/run/rustypods"));
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("http-token");
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o400)
-            .open(&path)
-            .with_context(|| format!("create {}", path.display()))?;
-        f.write_all(token.as_bytes())?;
-    }
-    // Pre-existing file keeps its old mode — force 0400 either way.
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))?;
-    if crate::euid() == 0 {
-        std::os::unix::fs::chown(&path, Some(cfg.allowed_uid), Some(cfg.allowed_uid))
-            .with_context(|| format!("chown {}", path.display()))?;
-    }
-    Ok((Arc::from(token.as_str()), path))
+/// True when the operator explicitly allowed a non-loopback REST bind.
+pub fn http_insecure_enabled() -> bool {
+    std::env::var_os("RUSTYPODS_HTTP_INSECURE").is_some()
+}
+
+pub fn http_token_rotate() -> bool {
+    std::env::var_os("RUSTYPODS_HTTP_TOKEN_ROTATE").is_some()
 }
 
 /// Snapshot GC predicate: `snaps` is newest-first; a snapshot is collected
@@ -5568,6 +5669,82 @@ async fn reconcile_pod_dirs(cfg: &Config, storage: &Arc<dyn StorageDriver>, st: 
     }
 }
 
+#[cfg(test)]
+impl Svc {
+    pub(crate) fn stub(data_dir: std::path::PathBuf) -> Self {
+        struct NopEngine;
+        #[tonic::async_trait]
+        impl RuntimeEngine for NopEngine {
+            fn name(&self) -> &'static str {
+                "nop"
+            }
+            async fn start(&self, _: &crate::runtime::StartSpec, _: &LimitsSpec) -> Result<u32> {
+                Ok(1)
+            }
+            async fn stop(&self, _: &str, _: Duration) -> Result<()> {
+                Ok(())
+            }
+            async fn running_pid(&self, _: &str) -> Option<u32> {
+                None
+            }
+            async fn registered(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn apply_limits(&self, _: &str, _: &LimitsSpec) -> Result<()> {
+                Ok(())
+            }
+            async fn healthy(&self) -> bool {
+                true
+            }
+        }
+        struct NopStore;
+        impl StorageDriver for NopStore {
+            fn name(&self) -> &'static str {
+                "nop"
+            }
+            fn supports_quota(&self) -> bool {
+                false
+            }
+            fn create_rootfs(&self, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            fn clone_rootfs(&self, _: &Path, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            fn delete_rootfs(&self, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            fn apply_quota(&self, _: &Path, _: u64) -> Result<()> {
+                Ok(())
+            }
+        }
+        Svc {
+            cfg: Config {
+                data_dir,
+                socket: std::path::PathBuf::from("/tmp/rustypods-test.sock"),
+                allowed_uid: 1000,
+                import_user: "test".into(),
+                http_addr: String::new(),
+                gc_interval_secs: 300,
+            },
+            st: Arc::new(Mutex::new(State::default())),
+            metrics: Default::default(),
+            listeners: Default::default(),
+            engine: Arc::new(NopEngine),
+            storage: Arc::new(NopStore),
+            ops: Default::default(),
+            ingress_generation: Arc::new(AtomicU64::new(0)),
+            ingress_mu: Arc::new(Mutex::new(())),
+            ingress_last_err: Arc::new(Mutex::new(None)),
+            ingress_last_push: Arc::new(Mutex::new(None)),
+            health: Default::default(),
+            stop_intent: Default::default(),
+            mesh: Default::default(),
+            inflight: Inflight::new(),
+        }
+    }
+}
+
 pub async fn serve(cfg: Config) -> Result<()> {
     net::load_pool().context("pod address pool")?;
     for d in [
@@ -5843,6 +6020,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
                     if !configured || !gw_running {
                         continue;
                     }
+                    if let Err(e) = svc.maintain_ingress_pki().await {
+                        tracing::warn!("ingress pki: {e}");
+                    }
                     match svc.sync_ingress(None, false).await {
                         Ok(()) => {
                             let mut last = svc.ingress_last_err.lock().await;
@@ -5905,17 +6085,36 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // localhost-only; empty --http-addr disables it. If the token file
     // can't be written, the listener stays OFF — never serve unauth'd.
     if !cfg.http_addr.is_empty() {
+        let loopback = cfg
+            .http_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false);
+        if !loopback {
+            tracing::warn!(
+                "SECURITY: REST API bound to non-loopback {} over plain HTTP with a \
+                 root-equivalent bearer token. This is not a supported remote path. \
+                 Use SSH forwarding (`ssh -L 9180:127.0.0.1:9180 host`) or the gRPC \
+                 client `--remote` mode. Unset RUSTYPODS_HTTP_INSECURE to refuse this bind.",
+                cfg.http_addr
+            );
+        }
         match tokio::net::TcpListener::bind(&cfg.http_addr).await {
-            Ok(l) => match write_http_token(&cfg) {
-                Ok((token, token_path)) => {
+            Ok(l) => match crate::http::ensure_http_tokens(
+                &cfg.socket,
+                cfg.allowed_uid,
+                http_token_rotate(),
+            ) {
+                Ok((auth, token_path, ro_path)) => {
                     tracing::info!(
-                        "http api listening on http://{} — bearer token in {}",
+                        "http api listening on http://{} — bearer token in {} (read-only {})",
                         cfg.http_addr,
-                        token_path.display()
+                        token_path.display(),
+                        ro_path.display()
                     );
-                    let router = crate::http::router(svc.clone(), token);
+                    let router = crate::http::router(svc.clone(), auth);
                     spawn_critical("http server", async move {
-                        if let Err(e) = axum::serve(l, router).await {
+                        if let Err(e) = crate::http::listen(l, router).await {
                             tracing::error!("http api: {e}");
                         }
                     });
@@ -6098,7 +6297,7 @@ mod tests {
     use super::{
         op_slot_unreferenced, probe_addr, read_log_tail_file, restart_policy, snapshot_expired,
         split_log_tail, supervised, supervisor_idle, validate_ingress_conflicts,
-        validate_ingress_conflicts_excluding, volume_refs, write_daemon_file, LOG_LINE_MAX,
+        validate_ingress_conflicts_excluding, volume_refs, write_daemon_file, Svc, LOG_LINE_MAX,
         LOG_TAIL_MAX,
     };
     use crate::state::{IngressSpec, LimitsSpec, PodMeta, State};
@@ -6145,6 +6344,49 @@ mod tests {
 
     fn meta_plain(name: &str) -> PodMeta {
         meta_with_ingress(name, &[])
+    }
+
+    #[tokio::test]
+    async fn concurrent_patches_do_not_drop_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "rp-patch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let svc = Svc::stub(dir.clone());
+        {
+            let mut st = svc.st.lock().await;
+            st.pods.insert("web".into(), meta_plain("web"));
+        }
+        let bump = |svc: Svc, field: u8| async move {
+            let _op = svc.pod_op("web").await;
+            let (lim, storage) = svc.pod_limit_snapshot("web").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let mut limits = lim;
+            if field == 0 {
+                limits.memory_high_bytes = limits.memory_high_bytes.saturating_add(1);
+            } else {
+                limits.memory_max_bytes = limits.memory_max_bytes.saturating_add(1);
+            }
+            svc.apply_pod_config(rustypods_proto::rpc::UpdatePodConfigRequest {
+                name: "web".into(),
+                limits: Some(limits),
+                storage_max_bytes: storage,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        };
+        let (a, b) = tokio::join!(bump(svc.clone(), 0), bump(svc.clone(), 1));
+        let _ = (a, b);
+        let (lim, _) = svc.pod_limit_snapshot("web").await.unwrap();
+        assert_eq!(lim.memory_high_bytes, 1);
+        assert_eq!(lim.memory_max_bytes, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
