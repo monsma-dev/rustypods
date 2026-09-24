@@ -10,9 +10,11 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustypods_proto::rpc::{exec_chunk::Kind, ExecChunk, ExecExit, ExecStart};
+use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
@@ -39,7 +41,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// pre_exec hook: stash the real stdin on a high fd that survives nsenter's
 /// fd-0 clobber (dup2 clears CLOEXEC, so it propagates through the
 /// nsenter→setpriv→env→sh exec chain).
-pub(crate) fn preserve_stdin() -> std::io::Result<()> {
+fn preserve_stdin() -> std::io::Result<()> {
     // SAFETY: dup2 only touches fds; called in pre_exec where fd 0 is the
     // child's real stdin and fd 9 is free in a fresh exec'd process.
     if unsafe { libc::dup2(0, STDIN_DUP_FD) } < 0 {
@@ -464,6 +466,105 @@ fn openpty(rows: u32, cols: u32) -> Result<(OwnedFd, OwnedFd)> {
     Ok((master, unsafe { OwnedFd::from_raw_fd(s) }))
 }
 
+/// pre_exec hook shared by every spawn: stdin preservation (see
+/// STDIN_DUP_FD) and an own session/process group. Only async-signal-safe
+/// syscalls — no allocation, no locks, no formatting.
+fn pre_exec_session(tty: bool) -> std::io::Result<()> {
+    preserve_stdin()?;
+    // SAFETY: setsid/ioctl are raw syscalls in the freshly forked child.
+    unsafe {
+        // Own session + process group: kill(-pid) on timeout/disconnect
+        // reaches nsenter's forked pod-side child and its descendants.
+        if libc::setsid() < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if tty {
+            libc::ioctl(0, libc::TIOCSCTTY, 0);
+        }
+    }
+    Ok(())
+}
+
+/// nsenter Command from an argv, with the session pre_exec hook. Stdio is
+/// the caller's.
+fn spawn_cmd(argv: &[OsString], tty: bool) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    // SAFETY: the closure only calls pre_exec_session (async-signal-safe
+    // syscalls, no allocation).
+    unsafe {
+        cmd.pre_exec(move || pre_exec_session(tty));
+    }
+    cmd
+}
+
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl F_GETFL/F_SETFL on an fd we own; no memory is touched.
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl < 0 || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// SIGKILL a whole process group (`pgid` = the session leader's pid — the
+/// pre_exec setsid makes every spawned nsenter one). Reaches nsenter's
+/// forked in-pod child and its descendants; only processes that setsid()
+/// themselves escape (documented residual).
+pub fn kill_pgrp(pgid: u32) {
+    let Ok(p) = i32::try_from(pgid) else {
+        return;
+    };
+    if p <= 0 {
+        return;
+    }
+    // SAFETY: kill(2) with a negative pid targets the group; no memory
+    // involved. ESRCH (already gone) is harmless.
+    unsafe {
+        libc::kill(-p, libc::SIGKILL);
+    }
+}
+
+/// Kill the session's process group and reap the host-side nsenter.
+/// Returns the exit code to report (1 when the status is unavailable).
+async fn kill_group_and_wait(child: &mut tokio::process::Child) -> i32 {
+    if let Some(pid) = child.id() {
+        kill_pgrp(pid);
+    }
+    let _ = child.kill().await;
+    child
+        .wait()
+        .await
+        .map(|s| s.code().unwrap_or(1))
+        .unwrap_or(1)
+}
+
+/// Run an argv to completion with `Stdio::null()` everywhere, bounded by
+/// `timeout` — the exec-healthcheck engine. On timeout the whole process
+/// group is killed and nsenter reaped (no zombie, no lingering pod-side
+/// probe accumulating every interval). Ok(None) = timed out.
+pub async fn run_status(
+    argv: &[OsString],
+    timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let mut scmd = spawn_cmd(argv, false);
+    scmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut cmd = tokio::process::Command::from(scmd);
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().context("nsenter spawn")?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(st) => Ok(Some(st?)),
+        Err(_) => {
+            kill_group_and_wait(&mut child).await;
+            Ok(None)
+        }
+    }
+}
+
 /// Wire up an exec session. `inbound` is the client stream positioned *after*
 /// the ExecStart frame. All output (stdout/stderr + a terminal Exit chunk)
 /// flows through `tx`.
@@ -482,8 +583,24 @@ where
     if start.tty {
         run_tty(&argv, &start, inbound, tx).await
     } else {
-        run_pipe(&argv, start.pod.clone(), inbound, tx).await
+        run_pipe(&argv, inbound, tx).await
     }
+}
+
+/// Write all of `b` to the nonblocking pty master, awaiting writable
+/// readiness between partial writes — never parks a runtime worker.
+async fn pty_write_all(master: &AsyncFd<std::fs::File>, mut b: &[u8]) -> std::io::Result<()> {
+    while !b.is_empty() {
+        let mut guard = master.writable().await?;
+        match guard.try_io(|inner| inner.get_ref().write(b)) {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(n)) => b = &b[n..],
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => {}
+        }
+    }
+    Ok(())
 }
 
 async fn run_tty<S>(argv: &[OsString], start: &ExecStart, mut inbound: S, tx: Tx) -> Result<()>
@@ -494,108 +611,101 @@ where
     let slave_in = slave.try_clone().context("slave clone")?;
     let slave_err = slave.try_clone().context("slave clone")?;
 
-    let mut scmd = std::process::Command::new(&argv[0]);
-    scmd.args(&argv[1..])
-        .stdin(Stdio::from(slave))
+    let mut scmd = spawn_cmd(argv, true);
+    scmd.stdin(Stdio::from(slave))
         .stdout(Stdio::from(slave_in))
         .stderr(Stdio::from(slave_err));
-    unsafe {
-        scmd.pre_exec(|| {
-            preserve_stdin()?;
-            libc::setsid();
-            libc::ioctl(0, libc::TIOCSCTTY, 0);
-            Ok(())
-        });
-    }
     let mut cmd = tokio::process::Command::from(scmd);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("nsenter spawn")?;
+    // The Command still owns the parent's slave copies — drop them now so
+    // the master sees EIO once the pod side lets go of the pty.
+    drop(cmd);
 
-    let master_file = std::fs::File::from(master);
-    let reader_file = master_file.try_clone()?;
+    set_nonblocking(master.as_raw_fd()).context("pty O_NONBLOCK")?;
+    let master = Arc::new(AsyncFd::new(std::fs::File::from(master)).context("pty master AsyncFd")?);
 
-    // Reader: blocking pty reads → stdout chunks; signals drain via oneshot.
-    //
-    // KNOWN RESIDUAL (L5): this is a std::thread doing a blocking read —
-    // unlike the pipe-mode drain tasks below it can't be aborted. If a
-    // detached in-pod grandchild keeps the pty slave open, EIO never
-    // arrives and this thread parks in read() forever (holding reader_file
-    // + a tx_r sender, so the gRPC stream never fully closes server-side).
-    // Bounded by the server's global concurrency cap per leaked session,
-    // but repeats accumulate fds+threads for the daemon's lifetime.
-    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    // Reader: pty master → stdout chunks. A tokio task on a nonblocking fd,
+    // so the waiter can abort it when the session ends even if a detached
+    // in-pod grandchild keeps the slave open (no EIO ever arrives then).
+    // `guard.try_io` on the readiness guard we already hold — never await a
+    // second readable() inside it (AGENTS.md mesh note).
+    let rd = master.clone();
     let tx_r = tx.clone();
-    std::thread::spawn(move || {
-        let mut f = reader_file;
+    let mut reader = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
-            match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx_r.blocking_send(chunk_stdout(buf[..n].to_vec())).is_err() {
+            let Ok(mut guard) = rd.readable().await else {
+                break;
+            };
+            match guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    if tx_r.send(chunk_stdout(buf[..n].to_vec())).await.is_err() {
                         break;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 // EIO = slave side gone (child exited) — normal teardown.
-                Err(_) => break,
+                Ok(Err(_)) => break,
+                Err(_would_block) => {}
             }
         }
-        let _ = drained_tx.send(());
     });
 
     // Inbound: stdin bytes → master; winsize → TIOCSWINSZ (kernel raises
-    // SIGWINCH on the fg process group). master_file is owned here — stdin
-    // writes and winsize ioctls share the fd. Stream end = client gone:
-    // for a tty that's a disconnect (Ctrl-D is data, not EOF) → kill child,
-    // else the remote shell lingers as a zombie on the open pty.
+    // SIGWINCH on the fg process group). Stream end = client gone: for a
+    // tty that's a disconnect (Ctrl-D is data, not EOF) → kill the session,
+    // else the remote shell lingers on the open pty.
     let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let mut f = master_file;
+    let wr = master.clone();
+    let writer = tokio::spawn(async move {
         while let Some(Ok(c)) = inbound.next().await {
             match c.kind {
                 Some(Kind::Stdin(b)) => {
-                    if f.write_all(&b).is_err() {
+                    if pty_write_all(&wr, &b).await.is_err() {
                         break;
                     }
                 }
-                Some(Kind::Winsize(w)) => set_winsize(f.as_raw_fd(), w.rows, w.cols),
+                Some(Kind::Winsize(w)) => set_winsize(wr.as_raw_fd(), w.rows, w.cols),
                 _ => {}
             }
         }
         let _ = gone_tx.send(());
     });
 
-    // Waiter: child exit OF client-disconnect → reader drained → exit chunk
-    // LAST (ordering).
+    // Waiter: child exit OR client disconnect (inbound end / response
+    // channel closed) → reader drained → exit chunk LAST (ordering).
     tokio::spawn(async move {
         let code = tokio::select! {
             st = child.wait() => st.map(|s| s.code().unwrap_or(1)).unwrap_or(1),
-            _ = gone_rx => {
-                let _ = child.kill().await;
-                child.wait().await.map(|s| s.code().unwrap_or(1)).unwrap_or(1)
-            }
+            _ = gone_rx => kill_group_and_wait(&mut child).await,
+            _ = tx.closed() => kill_group_and_wait(&mut child).await,
         };
         // A detached grandchild holding the pty slave means no EIO ever —
-        // grace the drain briefly, then ship the exit chunk regardless.
-        let _ = tokio::time::timeout(DRAIN_GRACE, drained_rx).await;
+        // grace the drain briefly, then stop the reader regardless.
+        if tokio::time::timeout(DRAIN_GRACE, &mut reader)
+            .await
+            .is_err()
+        {
+            reader.abort();
+        }
         let _ = tx.send(chunk_exit(code)).await;
+        // Nothing may write to the pty after the session ended; this also
+        // releases the last master reference held by a stalled writer.
+        writer.abort();
     });
     Ok(())
 }
 
-async fn run_pipe<S>(argv: &[OsString], _pod: String, mut inbound: S, tx: Tx) -> Result<()>
+async fn run_pipe<S>(argv: &[OsString], mut inbound: S, tx: Tx) -> Result<()>
 where
     S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
 {
-    let mut scmd = std::process::Command::new(&argv[0]);
-    scmd.args(&argv[1..])
-        .stdin(Stdio::piped())
+    let mut scmd = spawn_cmd(argv, false);
+    scmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    unsafe {
-        scmd.pre_exec(preserve_stdin);
-    }
     let mut cmd = tokio::process::Command::from(scmd);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("nsenter spawn")?;
@@ -643,17 +753,15 @@ where
         }
     });
 
-    // Waiter: child exit OR response-channel-closed (client gone) → kill.
-    // Note the trigger is tx.closed(), NOT inbound-stream end — a piped
-    // payload legitimately outlives its stdin (think `exec -- cat` doing
-    // work after EOF), so stdin EOF alone must never kill.
+    // Waiter: child exit OR response-channel-closed (client gone / REST
+    // timeout) → kill the whole process group. Note the trigger is
+    // tx.closed(), NOT inbound-stream end — a piped payload legitimately
+    // outlives its stdin (think `exec -- cat` doing work after EOF), so
+    // stdin EOF alone must never kill.
     tokio::spawn(async move {
         let code = tokio::select! {
             st = child.wait() => st.map(|s| s.code().unwrap_or(1)).unwrap_or(1),
-            _ = tx.closed() => {
-                let _ = child.kill().await;
-                child.wait().await.map(|s| s.code().unwrap_or(1)).unwrap_or(1)
-            }
+            _ = tx.closed() => kill_group_and_wait(&mut child).await,
         };
         // A detached grandchild holding the pipes open stalls both drain
         // tasks forever — bound the wait, then abort them so their `tx`
@@ -906,6 +1014,58 @@ mod tests {
         let rc = unsafe { libc::ioctl(s1.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
         assert_eq!(rc, 0);
         assert_eq!((ws.ws_row, ws.ws_col), (24, 80));
+        set_nonblocking(m1.as_raw_fd()).unwrap();
         drop((m1, m2, s1, s2));
+    }
+
+    /// kill_pgrp reaches a grandchild the parent no longer knows about:
+    /// `sh -c 'sleep & echo $!; wait'` in its own group via setsid.
+    #[test]
+    fn kill_pgrp_kills_grandchild() {
+        use std::io::BufRead;
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdout(Stdio::piped());
+        // SAFETY: setsid is a raw syscall in the freshly forked child.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: i32 = line.trim().parse().unwrap();
+        kill_pgrp(child.id());
+        child.wait().unwrap();
+        // The orphaned sleep is reaped by init — poll until it's gone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: kill with signal 0 only probes existence.
+            let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+            if !alive {
+                break;
+            }
+            // Zombie until init reaps it — /proc State tells the difference.
+            let st =
+                std::fs::read_to_string(format!("/proc/{grandchild}/status")).unwrap_or_default();
+            if st
+                .lines()
+                .any(|l| l.starts_with("State:") && l.contains('Z'))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {grandchild} survived kill_pgrp"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }

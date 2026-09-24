@@ -1636,7 +1636,9 @@ impl Svc {
     }
 
     /// exec probe: run argv inside the pod via the same nsenter+setpriv
-    /// path as `rustypods exec` — exit 0 = healthy.
+    /// path as `rustypods exec` — exit 0 = healthy. A hung probe is
+    /// group-killed and reaped on timeout so it can't accumulate a pod-side
+    /// process every interval.
     async fn probe_exec(&self, m: &PodMeta, spec: &state::HealthSpec, timeout: Duration) -> bool {
         let Some(leader) = self.engine.running_pid(&m.name).await else {
             return false;
@@ -1659,23 +1661,19 @@ impl Svc {
                 return false;
             }
         };
-        // Same spawn discipline as exec.rs run_pipe: pre_exec preserves
-        // stdin on STDIN_DUP_FD — without it the argv's `exec 0<&N`
-        // wrapper fails and every probe exits non-zero.
-        let mut scmd = std::process::Command::new(&argv[0]);
-        scmd.args(&argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            scmd.pre_exec(exec::preserve_stdin);
-        }
-        let mut cmd = tokio::process::Command::from(scmd);
-        cmd.kill_on_drop(true);
-        match tokio::time::timeout(timeout, cmd.status()).await {
-            Ok(Ok(s)) => s.success(),
-            _ => false,
+        // Same spawn discipline as exec.rs run_pipe (stdin preserved on
+        // STDIN_DUP_FD, own process group) — spawning the argv by hand
+        // without that hook makes every probe exit non-zero.
+        match exec::run_status(&argv, timeout).await {
+            Ok(Some(s)) => s.success(),
+            Ok(None) => {
+                tracing::warn!("{}: exec probe timed out — killed", m.name);
+                false
+            }
+            Err(e) => {
+                tracing::warn!("{}: exec probe spawn: {e:#}", m.name);
+                false
+            }
         }
     }
 
