@@ -188,6 +188,14 @@ as that unprivileged user with `NO_NEW_PRIVS` set, so `sudo` inside such
 a session does not work — use `--user root` instead. Exec healthchecks in
 these pods default to `nobody` (see below).
 
+A trusted dev pod that needs `sudo`/`yay` in its sessions can opt out per
+pod: add `allow_setuid = true` to `/var/lib/rustypods/conf/pods/<pod>.conf`
+(root-only, so this takes sudo) and run `rustypods reload <pod>`. `ps`
+then shows `setuid(host-root)`. Any process running as the pod user can
+then become host root through sudo, and distrobox sets up passwordless
+sudo. Health probes keep `NO_NEW_PRIVS`, and an untrusted `load` clears
+the flag.
+
 ## Storage quotas (btrfs qgroups)
 
 ```bash

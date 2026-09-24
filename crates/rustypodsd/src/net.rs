@@ -1457,6 +1457,7 @@ mod tests {
             volumes: vec![],
             host_access: false,
             isolated: false,
+            allow_setuid: false,
         }
     }
 

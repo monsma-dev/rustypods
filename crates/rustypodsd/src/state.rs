@@ -371,6 +371,13 @@ pub struct PodMeta {
     /// Pod egress to the outside and published ports still work.
     #[serde(default)]
     pub isolated: bool,
+    /// Exec sessions skip NO_NEW_PRIVS, so sudo/su work. In a pod without a
+    /// user namespace that means any process as the pod user can reach
+    /// HOST root through a setuid binary (distrobox sudoers is often
+    /// NOPASSWD). Conf-only: set it in the root-owned conf and `reload`.
+    /// Probes keep NO_NEW_PRIVS. Userns pods never set it.
+    #[serde(default)]
+    pub allow_setuid: bool,
 }
 
 /// A named volume: a btrfs subvolume under volumes/<name> that pods
@@ -1103,6 +1110,7 @@ fn migrate_json(data_dir: &Path) {
             volumes: vec![],
             host_access: false,
             isolated: false,
+            allow_setuid: false,
         };
         if let Err(e) = save_pod(data_dir, &m) {
             tracing::warn!("migrate pod {name}: {e:#}");
@@ -1284,6 +1292,7 @@ mod tests {
                 volumes: vec![],
                 host_access: false,
                 isolated: false,
+                allow_setuid: false,
             },
         );
         assert_ne!(alloc_net_index(&pods, &st.reserved_net), 7);
@@ -1343,6 +1352,7 @@ mod tests {
             volumes: vec!["data:/data".into(), "cfg:/etc/app:ro".into()],
             host_access: false,
             isolated: false,
+            allow_setuid: false,
         };
         save_pod(&dir, &pod).unwrap();
         let st = load(&dir).unwrap();
@@ -1413,6 +1423,7 @@ mod tests {
             volumes: vec![],
             host_access: false,
             isolated: false,
+            allow_setuid: false,
         }
     }
 

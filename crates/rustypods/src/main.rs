@@ -1128,6 +1128,13 @@ fn print_pod(p: &Pod) {
     if p.autostart {
         extra.push_str(" autostart");
     }
+    if p.allow_setuid {
+        extra.push_str(if p.private_users {
+            " setuid"
+        } else {
+            " setuid(host-root)"
+        });
+    }
     if !p.health.is_empty() {
         extra.push_str(&format!(" health={}", p.health));
     }

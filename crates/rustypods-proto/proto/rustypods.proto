@@ -246,6 +246,9 @@ message Pod {
   string mesh_ip = 24;
   // Import response only: what sanitize stripped. Empty on every other RPC.
   repeated string notes = 25;
+  // Conf opt-in: exec sessions run without NO_NEW_PRIVS (sudo works). In a
+  // pod without a user namespace that reaches host root.
+  bool allow_setuid = 26;
 }
 
 message PodList {

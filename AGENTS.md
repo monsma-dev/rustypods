@@ -162,6 +162,10 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
     setns/setuid/exec). nnp is deliberately NOT set in userns pods so
     `sudo`/`yay` keep working there — a setuid binary only reaches pod
     root, which the same caller may request with `--user root`.
+  - `PodMeta::allow_setuid` (conf-only, like `host_access`) lifts nnp for
+    exec sessions (`exec::run`, gRPC + REST) in one non-userns pod. Probes
+    go through `exec_plan` directly and keep nnp. Untrusted import clears
+    it; the ingress gateway's reload drift check refuses it.
   - Payload env goes through `Command::env_clear().envs()` — nsenter
     execvp()s with its environ — no image `env` binary. `nsenter` is
     resolved on the DAEMON's PATH (`host_nsenter`): with env_clear std
@@ -451,7 +455,7 @@ staging dirs older than the process (`transfer::sweep_stale_staging`).
 - Import always clears started, net_index, stack and ingress_gateway.
   Without `--trust` (REST `?trust=true` to keep them) it also forces
   `private_users`, and strips binds, ports, ingress, host_access,
-  autostart, restart policy, healthchecks and pod env. Image env still
+  allow_setuid, autostart, restart policy, healthchecks and pod env. Image env still
   applies at start. The CLI prints each note. `--trust` keeps the
   exported conf. Image CONF travels; the image tree never does.
 - A btrfs-send archive is rejected on a non-btrfs host before the

@@ -412,7 +412,7 @@ pub struct SanitizeReport {
 /// dropped — those are per-host.
 ///
 /// `trust == false` (default): also force `private_users`, drop binds,
-/// ports, ingress, host_access, autostart, restart policy, healthcheck
+/// ports, ingress, host_access, allow_setuid, autostart, restart policy, healthcheck
 /// and pod-level env. The image conf's env still applies at start.
 /// `trust == true` keeps the exported workload conf.
 pub fn sanitize_import(
@@ -465,6 +465,10 @@ pub fn sanitize_import(
             notes.push("host_access cleared".into());
         }
         m.host_access = false;
+        if m.allow_setuid {
+            notes.push("allow_setuid cleared".into());
+        }
+        m.allow_setuid = false;
         if m.autostart {
             notes.push("autostart cleared".into());
         }
@@ -675,6 +679,7 @@ ingress_gateway = true
 autostart = true
 private_users = false
 host_access = true
+allow_setuid = true
 restart = "always"
 binds = ["/root:/root", "/home"]
 ports = ["127.0.0.1:8080:80"]
@@ -892,6 +897,7 @@ argv = ["/bin/true"]
         assert!(m.binds.is_empty());
         assert!(m.ports.is_empty());
         assert!(!m.host_access);
+        assert!(!m.allow_setuid);
         assert!(!m.autostart);
         assert!(m.restart.is_empty());
         assert!(m.healthcheck.kind.is_empty());
@@ -911,6 +917,7 @@ argv = ["/bin/true"]
         assert!(!m.private_users);
         assert_eq!(m.binds.len(), 2);
         assert!(m.autostart);
+        assert!(m.allow_setuid);
         assert_eq!(m.env.len(), 2);
         assert!(!report.notes.iter().any(|n| n.contains("binds removed")));
     }

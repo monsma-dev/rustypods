@@ -840,19 +840,22 @@ pub async fn run_status(
 
 /// Wire up an exec session. `inbound` is the client stream positioned *after*
 /// the ExecStart frame. All output (stdout/stderr + a terminal Exit chunk)
-/// flows through `tx`.
+/// flows through `tx`. `allow_setuid` is the pod conf opt-in that lifts
+/// NO_NEW_PRIVS (see `PodMeta::allow_setuid`).
 pub async fn run<S>(
     start: ExecStart,
     rootfs: &Path,
     leader: u32,
     private_users: bool,
+    allow_setuid: bool,
     inbound: S,
     tx: Tx,
 ) -> Result<()>
 where
     S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
 {
-    let plan = exec_plan(leader, rootfs, &start, private_users)?;
+    let mut plan = exec_plan(leader, rootfs, &start, private_users)?;
+    plan.no_new_privs &= !allow_setuid;
     if plan.host_root {
         tracing::warn!(
             "pod {}: exec as root in a pod without a user namespace — payload runs as HOST \

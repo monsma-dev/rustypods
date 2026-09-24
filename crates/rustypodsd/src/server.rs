@@ -299,6 +299,7 @@ fn to_pod(
             _ => String::new(),
         },
         notes: Vec::new(),
+        allow_setuid: m.allow_setuid,
     }
 }
 
@@ -1410,12 +1411,12 @@ impl Svc {
         dur: std::time::Duration,
     ) -> Result<ExecOutcome, Status> {
         let name = proto::validate_name(&start.pod).map_err(bad)?.to_string();
-        let private_users = {
+        let (private_users, allow_setuid) = {
             let st = self.st.lock().await;
             let Some(m) = st.pods.get(&name) else {
                 return Err(Status::not_found(format!("pod {name} not found")));
             };
-            m.private_users
+            (m.private_users, m.allow_setuid)
         };
         let Some(leader) = self.engine.running_pid(&name).await else {
             return Err(Status::failed_precondition(format!(
@@ -1435,6 +1436,7 @@ impl Svc {
             &self.pod_rootfs(&name),
             leader,
             private_users,
+            allow_setuid,
             tokio_stream::empty(),
             tx,
         )
@@ -2761,6 +2763,7 @@ impl Svc {
             volumes: req.volumes.clone(),
             host_access: false,
             isolated: false,
+            allow_setuid: false,
             stop_timeout_secs: req.stop_timeout_secs,
         };
         let mut st = self.st.lock().await;
@@ -3279,6 +3282,7 @@ impl Svc {
                         volumes: sp.volumes.clone(),
                         host_access: sp.host_access,
                         isolated: sp.isolated,
+                        allow_setuid: false,
                     };
                     let mut st = self.st.lock().await;
                     if st.pods.contains_key(&pname) {
@@ -4337,7 +4341,8 @@ impl PodControl for Svc {
                         || !meta.binds.is_empty()
                         || meta.stack != cur.stack
                         || meta.net_index != cur.net_index
-                        || meta.private_users != cur.private_users)
+                        || meta.private_users != cur.private_users
+                        || meta.allow_setuid)
                 {
                     return Err(Status::failed_precondition(
                         "the ingress gateway is managed — refusing conf drift on its managed fields",
@@ -4499,6 +4504,7 @@ impl PodControl for Svc {
             volumes: vec![],
             host_access: false,
             isolated: false,
+            allow_setuid: false,
         };
         // Copy the dataplane binary + LEAF pair into the rootfs via
         // symlink-safe helpers. The CA key NEVER leaves the host.
@@ -4831,12 +4837,12 @@ impl PodControl for Svc {
             None => return Err(Status::invalid_argument("empty exec stream")),
         };
         let name = proto::validate_name(&start.pod).map_err(bad)?.to_string();
-        let private_users = {
+        let (private_users, allow_setuid) = {
             let st = self.st.lock().await;
             let Some(m) = st.pods.get(&name) else {
                 return Err(Status::not_found(format!("pod {name} not found")));
             };
-            m.private_users
+            (m.private_users, m.allow_setuid)
         };
         let Some(leader) = self.engine.running_pid(&name).await else {
             return Err(Status::failed_precondition(format!(
@@ -4856,6 +4862,7 @@ impl PodControl for Svc {
             &self.pod_rootfs(&name),
             leader,
             private_users,
+            allow_setuid,
             stream,
             tx,
         )
@@ -6371,6 +6378,7 @@ mod tests {
             volumes: vec![],
             host_access: false,
             isolated: false,
+            allow_setuid: false,
         }
     }
 
