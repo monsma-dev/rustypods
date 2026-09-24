@@ -1310,8 +1310,7 @@ fn build_peer(secret: &StaticSecret, pc: &MeshPeerConf, index: u32) -> Result<(P
         Some(25), // keepalive: NAT'd peers stay mapped
         index,
         None, // per-peer rate limiter
-    )
-    .map_err(|e| anyhow::anyhow!("boringtun peer init: {e}"))?;
+    );
     Ok((
         Peer {
             tunn,
