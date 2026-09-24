@@ -166,8 +166,11 @@ rustypodsd does it itself:
   host→pod localhost DNAT arrive with dst = the veth .1 and are
   de-NATed later, so the drop does not break them. A second input
   rule drops NEW flows from pod veths to `fib daddr type local`,
-  except established replies, mesh DNS :53 / gossip :5305 on
-  `fd00::/8`, and pods with `host_access = true`.
+  except established replies, NDP (untracked — without it the host
+  can't resolve pod MACs), mesh DNS :53 (UDP+TCP) on `fd00::/8`, and
+  pods with `host_access = true`. Gossip :5305 is deliberately NOT
+  open to pods: a pod can spoof a peer's `fd<peer>::1` source and the
+  gossip socket can't tell which interface a datagram came in on.
 - nft scripts use `#` comments — `//` is a syntax error (broke a rebuild).
 - `pkexec` strips PATH to sbin-less dirs → always use absolute paths for
   nft/sysctl/tcpdump in scripts and one-off checks.

@@ -1187,9 +1187,12 @@ pub fn nat_script<'a>(
          \x20 chain frompod {{\n\
          \x20   type filter hook input priority -10; policy accept;\n\
          \x20   iifname \"ve-*\" ct state established,related accept\n\
-         \x20   # Mesh DNS :53 and gossip :5305 on the host ULA.\n\
-         \x20   iifname \"ve-*\" ip6 daddr fd00::/8 udp dport 53 accept\n\
-         \x20   iifname \"ve-*\" ip6 daddr fd00::/8 udp dport 5305 accept\n\
+         \x20   # NDP is untracked; without it the host can't resolve pod MACs.\n\
+         \x20   iifname \"ve-*\" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} accept\n\
+         \x20   # Mesh DNS on the host ULA (UDP and TCP). Gossip :5305 is\n\
+         \x20   # daemon↔daemon over rp-mesh0 only: a pod could spoof a peer's\n\
+         \x20   # fd<peer>::1 source, and the gossip socket can't see the iface.\n\
+         \x20   iifname \"ve-*\" ip6 daddr fd00::/8 meta l4proto {{ tcp, udp }} th dport 53 accept\n\
          {host_ok}\
          \x20   iifname \"ve-*\" fib daddr type local drop\n\
          \x20 }}\n\
@@ -1544,7 +1547,12 @@ mod tests {
         let s = nat_script([&db].into_iter(), &running(&["db"]));
         assert!(s.contains("iifname \"ve-*\" ip daddr 127.0.0.0/8 drop"));
         assert!(s.contains("iifname \"ve-*\" fib daddr type local drop"));
-        assert!(s.contains("udp dport 53 accept"));
+        assert!(s.contains("meta l4proto { tcp, udp } th dport 53 accept"));
+        assert!(s.contains("nd-neighbor-advert"));
+        assert!(
+            !s.contains("dport 5305 accept"),
+            "pods must not reach mesh gossip"
+        );
         let raw = s.find("chain rawpre").unwrap();
         let frompod = s.find("chain frompod").unwrap();
         assert!(raw < frompod);
