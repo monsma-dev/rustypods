@@ -520,11 +520,18 @@ pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
     f64_to_u64(v, mult, "size", s)
 }
 
+/// Largest unit that divides `b` exactly. One-decimal rounding turned
+/// `1500M` into `1.5G`, which parses back as ~1.61GiB.
 pub fn fmt_bytes(b: u64) -> String {
-    if b >= 1 << 30 {
-        format!("{:.1}G", b as f64 / (1u64 << 30) as f64)
-    } else if b >= 1 << 20 {
-        format!("{:.1}M", b as f64 / (1u64 << 20) as f64)
+    const G: u64 = 1 << 30;
+    const M: u64 = 1 << 20;
+    const K: u64 = 1 << 10;
+    if b >= G && b.is_multiple_of(G) {
+        format!("{}G", b / G)
+    } else if b >= M && b.is_multiple_of(M) {
+        format!("{}M", b / M)
+    } else if b >= K && b.is_multiple_of(K) {
+        format!("{}K", b / K)
     } else {
         format!("{b}B")
     }
@@ -565,6 +572,28 @@ pub fn fmt_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_bytes_roundtrip_is_exact() {
+        for n in [
+            0u64,
+            1,
+            512,
+            1024,
+            1500,
+            1500 << 20,
+            1536 << 20,
+            2 << 30,
+            (1 << 30) + 1,
+        ] {
+            let s = fmt_bytes(n);
+            let back = parse_bytes(&s).unwrap();
+            assert_eq!(back, n, "{s}");
+        }
+        assert_eq!(fmt_bytes(1500 << 20), "1500M");
+        assert_eq!(fmt_bytes(2 << 30), "2G");
+        assert_eq!(fmt_bytes(1536), "1536B");
+    }
 
     #[test]
     fn name_validation() {
