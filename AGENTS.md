@@ -116,12 +116,17 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
   payload is its child (`/proc/<pid>/task/<pid>/children`). Cgroup moves and
   metrics must target the CHILD, not the nsenter pid.
 - `machine-<pod>.scope` and `payload/` have `subtree_control` on →
-  `cgroup.procs` writes fail with EBUSY (no-internal-process). exec.rs
-  sidesteps this entirely: `nsenter --cgroup --join-cgroup` joins the
-  leader's cgroup atomically at setns time — exec'd processes land in
-  `machine-<pod>.scope/payload/init.scope` (verified live, 2026-09) and DO
-  fall under the pod's MemoryHigh/CPUQuota. No host-side leaf cgroup is
-  created anymore.
+  writing the payload pid into those `cgroup.procs` files fails with
+  EBUSY (no-internal-process). Do not pass `nsenter --join-cgroup`: that
+  migrates the payload into the leader's cgroup (`payload/init.scope`),
+  which is the pod itself — `cgroup.kill` there would kill the pod, and
+  `kill(-pgid)` misses a payload that `setsid()`s. Each exec instead
+  mkdir's a sibling leaf `rustypods-exec-<pid>-<n>` under the leader
+  cgroup's parent (a leaf, so `cgroup.procs` accepts the pid) and
+  pre_exec writes the child pid there before setgid. `--cgroup` still
+  enters the pod cgroup namespace. The leaf is under the scope, so
+  MemoryHigh/CPUQuota still apply. If that mkdir fails, the leaf is
+  created at `/sys/fs/cgroup/` and a warning is logged.
 - `nsenter --wd=<path>` resolves against the host mountns before setns →
   `getcwd` fails in the container. Don't use it; `cd $HOME` in the login
   shell wrapper instead.
@@ -174,12 +179,15 @@ The daemon talks machined+systemd through `dbus.rs` proxies on one shared
   - Verified host-side (util-linux 2.41.5, unprivileged `unshare -Ur`):
     `-U --preserve-credentials -S 0` keeps the supplementary list and
     only setuid()s; `-U` / `-U -S -G` call setgroups first.
-- Every spawn setsid()s in pre_exec (tty: + TIOCSCTTY). Timeout, client
-  disconnect and probe timeout kill the whole group (`kill(-pid,
-  SIGKILL)`, `exec::kill_pgrp`) — process groups are kernel-global, so
-  this reaches nsenter's forked child inside the pod pidns and its
-  descendants. Residual: a payload that setsid()s itself (daemons)
-  escapes; the pod cgroup can't be used (it's the pod's own init.scope).
+- Every spawn setsid()s in pre_exec (tty: + TIOCSCTTY) and is placed in
+  `rustypods-exec-<pid>-<n>`. Timeout, client disconnect and probe
+  timeout write `1` to that cgroup's `cgroup.kill` and also
+  `kill(-pid, SIGKILL)` (`exec::kill_pgrp`). Process groups are
+  kernel-global, so the signal reaches nsenter's forked child inside
+  the pod pidns; `cgroup.kill` also reaches a payload that setsid()s
+  itself, because it never joined the pod's init.scope. A normal exit
+  disarms the kill so an intentional daemon is left running, then rmdir
+  of the leaf happens off the caller (retry thread).
 - PTY: `openpty` via libc (`posix_openpt`+`grantpt`+`unlockpt`+
   `ptsname_r` — never `ptsname`, its static buffer races between
   concurrent tty execs), master wrapped in `OwnedFd` immediately, then
@@ -739,11 +747,9 @@ exit_code,timed_out,truncated}, 4MiB/stream cap, timeout ≤900s).
   without a user namespace — pass `"user":"root"` explicitly to run as
   host root there, or an unprivileged image user.
 - Timeout kill: dropping the receiver fires tx.closed() → the waiter
-  `kill(-pgid, SIGKILL)`s the session's process group (every spawn
-  setsid()s), which includes nsenter's forked in-pod child and its
-  descendants, then reaps nsenter. Only payloads that setsid()
-  themselves survive; agents running such daemons should still `pkill`
-  or keep them self-terminating.
+  writes `cgroup.kill` on `rustypods-exec-<pid>-<n>` and
+  `kill(-pgid, SIGKILL)`s the session's process group, then reaps
+  nsenter. The cgroup kill covers a payload that setsid()s itself.
 
 ## Rootless podman caveat
 

@@ -394,12 +394,13 @@ rustypods volume send dbdata --to s2   # seed the db volume beforehand
 
 `rustypods shell` no longer uses `machinectl`: the daemon runs
 `nsenter -t <leader> -m -u -i -n -p` with a host pty (`setsid`+`TIOCSCTTY`
-→ real job control) and joins the leader's cgroup atomically
-(`nsenter --cgroup --join-cgroup`): exec'd processes land in
-`machine-<pod>.scope/payload/init.scope` — inside the pod's scope, so the
-pod's MemoryHigh/CPUQuota apply to them. SIGWINCH and exit codes are
-forwarded over the stream; machined is only used for the leader-pid
-lookup.
+→ real job control) and enters the pod cgroup namespace (`nsenter
+--cgroup`). The payload is placed in a per-exec leaf
+`rustypods-exec-<pid>-<n>` under the pod scope, so MemoryHigh/CPUQuota
+still apply and a cancel can `cgroup.kill` the leaf — including a payload
+that called `setsid` — without touching the pod's own cgroup. SIGWINCH
+and exit codes are forwarded over the stream; machined is only used for
+the leader-pid lookup.
 
 No binary from the pod image ever runs with more privilege than the
 requested user: the daemon prepares the identity host-side (bounding set

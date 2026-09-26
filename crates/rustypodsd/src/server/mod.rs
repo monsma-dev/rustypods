@@ -385,17 +385,47 @@ fn clean_staging_sync(dir: &Path, storage: &dyn StorageDriver) {
 }
 
 /// Deletes the staging dir on drop unless disarmed after a successful commit.
+/// Drop only enqueues the path: a Btrfs subvolume walk must not run on the
+/// tokio worker that is tearing the request down.
 struct StagingGuard {
     dir: PathBuf,
     storage: Arc<dyn StorageDriver>,
     armed: bool,
 }
 
+struct StagingJob {
+    dir: PathBuf,
+    storage: Arc<dyn StorageDriver>,
+}
+
+fn enqueue_staging(dir: PathBuf, storage: Arc<dyn StorageDriver>) {
+    use std::sync::mpsc::{sync_channel, TrySendError};
+    use std::sync::OnceLock;
+    static TX: OnceLock<std::sync::mpsc::SyncSender<StagingJob>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = sync_channel::<StagingJob>(32);
+        std::thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                clean_staging_sync(&job.dir, job.storage.as_ref());
+            }
+        });
+        tx
+    });
+    match tx.try_send(StagingJob { dir, storage }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
+            std::thread::spawn(move || clean_staging_sync(&job.dir, job.storage.as_ref()));
+        }
+    }
+}
+
 impl Drop for StagingGuard {
     fn drop(&mut self) {
-        if self.armed {
-            clean_staging_sync(&self.dir, self.storage.as_ref());
+        if !self.armed {
+            return;
         }
+        self.armed = false;
+        enqueue_staging(std::mem::take(&mut self.dir), Arc::clone(&self.storage));
     }
 }
 
@@ -3441,6 +3471,63 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tonic::Request;
+
+    struct SlowDelete;
+
+    impl StorageDriver for SlowDelete {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn supports_quota(&self) -> bool {
+            false
+        }
+        fn create_rootfs(&self, _: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn clone_rootfs(&self, _: &Path, _: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn apply_quota(&self, _: &Path, _: u64) -> Result<()> {
+            Ok(())
+        }
+        fn delete_rootfs(&self, path: &Path) -> Result<()> {
+            std::thread::sleep(Duration::from_millis(250));
+            if path.exists() {
+                std::fs::remove_dir_all(path)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn staging_guard_drop_does_not_run_cleanup_inline() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustypods-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let started = std::time::Instant::now();
+        drop(StagingGuard {
+            dir: dir.clone(),
+            storage: Arc::new(SlowDelete),
+            armed: true,
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "StagingGuard::drop blocked the caller for {:?}",
+            started.elapsed()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while dir.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!dir.exists(), "sweeper did not remove {}", dir.display());
+    }
 
     #[test]
     fn daemon_file_replaces_symlink_without_following() {

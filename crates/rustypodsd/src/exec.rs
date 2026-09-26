@@ -1,7 +1,8 @@
 //! Exec: enter a running pod via nsenter on the machined leader pid.
 //! tty=true allocates a real host pty (setsid+TIOCSCTTY in the child) so job
-//! control and Ctrl-C behave; tty=false uses plain pipes. The exec'd process
-//! is moved into the pod's machined scope so MemoryHigh/CPUQuota still apply.
+//! control and Ctrl-C behave; tty=false uses plain pipes. Each exec lives in
+//! its own leaf cgroup under the pod scope so MemoryHigh/CPUQuota still apply
+//! and a cancel can `cgroup.kill` descendants that called `setsid`.
 //!
 //! Privilege model: no binary from the pod image ever runs with more
 //! privilege than the final target identity. The daemon prepares everything
@@ -12,10 +13,11 @@
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -414,6 +416,8 @@ pub struct ExecPlan {
     /// The payload runs as host root (non-userns pod, explicit `root`) —
     /// the caller logs the warning.
     pub host_root: bool,
+    /// Machined leader pid. The exec leaf is created beside its cgroup.
+    leader: u32,
 }
 
 /// Build the exec plan. `private_users` mirrors the pod's conf: when the
@@ -452,11 +456,12 @@ pub fn exec_plan(
         a.push("--user".into());
     }
     a.extend([
-        // Enter the pod's cgroup view and join the leader's cgroup atomically —
-        // children inherit it at fork, so the in-pod agent counts exec'd work
-        // and scope limits apply, with no host-side cgroup.procs race.
+        // Enter the pod's cgroup namespace. Do not pass --join-cgroup: that
+        // migrates the payload into the leader's own cgroup (the pod), so a
+        // later cgroup.kill would take the pod down and a setsid() payload
+        // would leave the process group we can signal. Membership is the
+        // ephemeral leaf created in `ExecCgroup`, attached in pre_exec.
         "--cgroup".into(),
-        "--join-cgroup".into(),
     ]);
     let mut gid = None;
     let mut groups = Vec::new();
@@ -595,6 +600,7 @@ pub fn exec_plan(
         groups,
         no_new_privs: !private_users,
         host_root,
+        leader,
     })
 }
 
@@ -615,6 +621,40 @@ pub fn host_nsenter() -> PathBuf {
         )
         .find(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from("/usr/bin/nsenter"))
+}
+
+/// Move this process into `cgroup.procs` (`fd` opened by the parent).
+/// Async-signal-safe: `getpid` + `write` only, pid rendered on the stack.
+fn write_self_to_cgroup(fd: RawFd) -> std::io::Result<()> {
+    let pid = unsafe { libc::getpid() };
+    if pid <= 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let mut n = pid as u32;
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let bytes = &buf[i..];
+    let mut off = 0;
+    while off < bytes.len() {
+        let rc = unsafe { libc::write(fd, bytes[off..].as_ptr().cast(), bytes.len() - off) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if rc == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        off += rc as usize;
+    }
+    Ok(())
 }
 
 /// The pre_exec identity/privilege work, as a plain function so it stays
@@ -675,6 +715,12 @@ impl ExecPlan {
     /// A ready-to-spawn Command: host nsenter, cleared environment replaced
     /// by `env`, and the identity pre_exec hook. Stdio is the caller's.
     pub fn command(&self, tty: bool) -> std::process::Command {
+        self.command_in(tty, None)
+    }
+
+    /// Like `command`, and when `cgroup_procs` is set the child moves itself
+    /// into that cgroup before `setgid` (still root, still async-signal-safe).
+    fn command_in(&self, tty: bool, cgroup_procs: Option<RawFd>) -> std::process::Command {
         let mut cmd = std::process::Command::new(host_nsenter());
         cmd.args(&self.argv[1..])
             .env_clear()
@@ -682,13 +728,130 @@ impl ExecPlan {
         let gid = self.gid;
         let groups: Vec<libc::gid_t> = self.groups.clone();
         let nnp = self.no_new_privs;
-        // SAFETY: the closure only calls pre_exec_identity, which is limited
-        // to async-signal-safe syscalls over data owned by the closure (no
-        // allocation, no locks, no I/O beyond fd syscalls).
+        // SAFETY: the closure only calls write_self_to_cgroup and
+        // pre_exec_identity: async-signal-safe syscalls over data owned by
+        // the closure (no allocation, no locks).
         unsafe {
-            cmd.pre_exec(move || pre_exec_identity(tty, gid, &groups, nnp));
+            cmd.pre_exec(move || {
+                if let Some(fd) = cgroup_procs {
+                    write_self_to_cgroup(fd)?;
+                }
+                pre_exec_identity(tty, gid, &groups, nnp)
+            });
         }
         cmd
+    }
+}
+
+static EXEC_CGROUP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// One leaf cgroup per exec. Cancel writes `cgroup.kill`, which SIGKILLs
+/// every member regardless of session — a payload that `setsid()`s stays
+/// in this leaf because we do not pass `--join-cgroup`.
+struct ExecCgroup {
+    dir: PathBuf,
+    procs: OwnedFd,
+    /// Set on a normal exit so Drop does not kill a payload that
+    /// intentionally outlived its parent. Cancel leaves it set.
+    kill_on_drop: bool,
+}
+
+/// Parent directory of the leader's cgroup, so the leaf sits beside
+/// `init.scope` and stays under the pod's MemoryHigh/CPUQuota.
+fn pod_cgroup_parent(leader: u32) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(format!("/proc/{leader}/cgroup")).ok()?;
+    let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+    if !rel.starts_with('/') || rel.split('/').any(|s| s == "..") {
+        return None;
+    }
+    let dir = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    let parent = dir.parent()?.to_path_buf();
+    if parent.starts_with("/sys/fs/cgroup") && parent.is_dir() {
+        Some(parent)
+    } else {
+        None
+    }
+}
+
+impl ExecCgroup {
+    fn create(leader: u32) -> Result<Self> {
+        let id = EXEC_CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!("rustypods-exec-{}-{id}", std::process::id());
+        let parent = pod_cgroup_parent(leader).unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+        let dir = parent.join(&name);
+        if std::fs::create_dir(&dir).is_ok() {
+            return Self::open(dir);
+        }
+        let fallback = PathBuf::from("/sys/fs/cgroup").join(&name);
+        if fallback != dir {
+            tracing::warn!(
+                leader,
+                parent = %parent.display(),
+                "exec leaf under the pod cgroup failed; using the cgroup root"
+            );
+            std::fs::create_dir(&fallback)
+                .with_context(|| format!("create {}", fallback.display()))?;
+            return Self::open(fallback);
+        }
+        std::fs::create_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Self::open(dir)
+    }
+
+    fn open(dir: PathBuf) -> Result<Self> {
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("cgroup.procs"))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_dir(&dir);
+                return Err(e).with_context(|| format!("open {}/cgroup.procs", dir.display()));
+            }
+        };
+        Ok(Self {
+            dir,
+            procs: file.into(),
+            kill_on_drop: true,
+        })
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.procs.as_raw_fd()
+    }
+
+    fn kill_members(&self) {
+        let _ = std::fs::write(self.dir.join("cgroup.kill"), b"1");
+    }
+
+    fn disarm(&mut self) {
+        self.kill_on_drop = false;
+    }
+}
+
+impl Drop for ExecCgroup {
+    fn drop(&mut self) {
+        let kill = self.kill_on_drop;
+        if kill {
+            self.kill_members();
+        }
+        let dir = std::mem::take(&mut self.dir);
+        if dir.as_os_str().is_empty() || std::fs::remove_dir(&dir).is_ok() {
+            return;
+        }
+        // A normal exit may leave an intentional daemon in the leaf. Only
+        // the cancel path expects the directory to drain.
+        if !kill {
+            return;
+        }
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(20));
+                if std::fs::remove_dir(&dir).is_ok() {
+                    return;
+                }
+            }
+            tracing::warn!(path = %dir.display(), "exec cgroup leftover after kill");
+        });
     }
 }
 
@@ -774,8 +937,8 @@ fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
 
 /// SIGKILL a whole process group (`pgid` = the session leader's pid — the
 /// pre_exec setsid makes every spawned nsenter one). Reaches nsenter's
-/// forked in-pod child and its descendants; only processes that setsid()
-/// themselves escape (documented residual).
+/// forked in-pod child and its descendants. A payload that setsid()s itself
+/// leaves this group; `ExecCgroup::kill_members` is what still reaches it.
 pub fn kill_pgrp(pgid: u32) {
     let Ok(p) = i32::try_from(pgid) else {
         return;
@@ -790,9 +953,10 @@ pub fn kill_pgrp(pgid: u32) {
     }
 }
 
-/// Kill the session's process group and reap the host-side nsenter.
+/// Kill the exec cgroup and the session's process group, then reap nsenter.
 /// Returns the exit code to report (1 when the status is unavailable).
-async fn kill_group_and_wait(child: &mut tokio::process::Child) -> i32 {
+async fn kill_group_and_wait(child: &mut tokio::process::Child, cgroup: &ExecCgroup) -> i32 {
+    cgroup.kill_members();
     if let Some(pid) = child.id() {
         kill_pgrp(pid);
     }
@@ -812,7 +976,8 @@ pub async fn run_status(
     plan: &ExecPlan,
     timeout: Duration,
 ) -> Result<Option<std::process::ExitStatus>> {
-    let mut scmd = plan.command(false);
+    let mut cgroup = ExecCgroup::create(plan.leader)?;
+    let mut scmd = plan.command_in(false, Some(cgroup.raw_fd()));
     scmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -820,9 +985,12 @@ pub async fn run_status(
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("nsenter spawn")?;
     match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(st) => Ok(Some(st?)),
+        Ok(st) => {
+            cgroup.disarm();
+            Ok(Some(st?))
+        }
         Err(_) => {
-            kill_group_and_wait(&mut child).await;
+            kill_group_and_wait(&mut child, &cgroup).await;
             Ok(None)
         }
     }
@@ -884,7 +1052,8 @@ where
     let slave_in = slave.try_clone().context("slave clone")?;
     let slave_err = slave.try_clone().context("slave clone")?;
 
-    let mut scmd = plan.command(true);
+    let mut cgroup = ExecCgroup::create(plan.leader)?;
+    let mut scmd = plan.command_in(true, Some(cgroup.raw_fd()));
     scmd.stdin(Stdio::from(slave))
         .stdout(Stdio::from(slave_in))
         .stderr(Stdio::from(slave_err));
@@ -950,11 +1119,18 @@ where
     // Waiter: child exit OR client disconnect (inbound end / response
     // channel closed) → reader drained → exit chunk LAST (ordering).
     tokio::spawn(async move {
+        let mut normal_exit = false;
         let code = tokio::select! {
-            st = child.wait() => st.map(|s| s.code().unwrap_or(1)).unwrap_or(1),
-            _ = gone_rx => kill_group_and_wait(&mut child).await,
-            _ = tx.closed() => kill_group_and_wait(&mut child).await,
+            st = child.wait() => {
+                normal_exit = true;
+                st.map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+            }
+            _ = gone_rx => kill_group_and_wait(&mut child, &cgroup).await,
+            _ = tx.closed() => kill_group_and_wait(&mut child, &cgroup).await,
         };
+        if normal_exit {
+            cgroup.disarm();
+        }
         // A detached grandchild holding the pty slave means no EIO ever —
         // grace the drain briefly, then stop the reader regardless.
         if tokio::time::timeout(DRAIN_GRACE, &mut reader)
@@ -975,7 +1151,8 @@ async fn run_pipe<S>(plan: &ExecPlan, mut inbound: S, tx: Tx) -> Result<()>
 where
     S: Stream<Item = Result<ExecChunk, tonic::Status>> + Unpin + Send + 'static,
 {
-    let mut scmd = plan.command(false);
+    let mut cgroup = ExecCgroup::create(plan.leader)?;
+    let mut scmd = plan.command_in(false, Some(cgroup.raw_fd()));
     scmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1032,10 +1209,17 @@ where
     // outlives its stdin (think `exec -- cat` doing work after EOF), so
     // stdin EOF alone must never kill.
     tokio::spawn(async move {
+        let mut normal_exit = false;
         let code = tokio::select! {
-            st = child.wait() => st.map(|s| s.code().unwrap_or(1)).unwrap_or(1),
-            _ = tx.closed() => kill_group_and_wait(&mut child).await,
+            st = child.wait() => {
+                normal_exit = true;
+                st.map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+            }
+            _ = tx.closed() => kill_group_and_wait(&mut child, &cgroup).await,
         };
+        if normal_exit {
+            cgroup.disarm();
+        }
         // A detached grandchild holding the pipes open stalls both drain
         // tasks forever — bound the wait, then abort them so their `tx`
         // clones drop and the response stream can actually end.
@@ -1120,14 +1304,14 @@ mod tests {
         let p = exec_plan(42, &dir, &start("root", &["echo", "hi"]), false).unwrap();
         let s = strs(&p);
         assert_eq!(&s[..NS_PREFIX.len()], NS_PREFIX);
-        assert_eq!(&s[8..11], &["--cgroup", "--join-cgroup", "--"]);
+        assert_eq!(&s[8..10], &["--cgroup", "--"]);
         assert!(
             !s.iter()
                 .any(|x| x.contains("setpriv") || x.contains("/env")),
             "no image helper may run as host root: {s:?}"
         );
         assert!(!s.iter().any(|x| x.starts_with("--setuid")));
-        assert_eq!(s[11], "/bin/sh");
+        assert_eq!(s[10], "/bin/sh");
         assert!(s.ends_with(&["echo".into(), "hi".into()]));
         assert!(p.host_root);
         assert!(p.no_new_privs);
@@ -1550,6 +1734,65 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "grandchild {grandchild} survived kill_pgrp"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// A grandchild that calls setsid() leaves the process group, so
+    /// kill_pgrp cannot see it. It stays in the exec leaf, and cgroup.kill
+    /// still reaches it.
+    #[test]
+    fn cgroup_kill_reaches_setsid_child() {
+        let cg = match ExecCgroup::create(u32::MAX) {
+            Ok(cg) => cg,
+            Err(e) => {
+                eprintln!("cgroup kill test skipped: {e}");
+                return;
+            }
+        };
+        let fd = cg.raw_fd();
+        let dir = cg.dir.clone();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("setsid sleep 60 & echo $!; wait")
+            .stdout(Stdio::piped());
+        // SAFETY: write(2) and setsid(2) in the freshly forked child.
+        unsafe {
+            cmd.pre_exec(move || {
+                write_self_to_cgroup(fd)?;
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn");
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        // Let `setsid` leave the shell's process group before we signal it.
+        std::thread::sleep(Duration::from_millis(50));
+        kill_pgrp(child.id());
+        child.wait().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let left = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+        assert!(
+            left.split_whitespace().any(|p| !p.is_empty()),
+            "setsid child was not in the exec cgroup after kill_pgrp (echo {line:?}, procs {left:?})"
+        );
+        cg.kill_members();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let procs = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+            if procs.split_whitespace().next().is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cgroup.kill left members: {procs}"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
