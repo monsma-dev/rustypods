@@ -108,6 +108,11 @@ export interface DaemonInfo {
    */
   storageDriver: string;
   runtimeEngine: string;
+  /**
+   * Pod confs excluded from serving (parse error or invariant breach).
+   * Empty when every conf loaded.
+   */
+  quarantined: string[];
 }
 
 export interface Image {
@@ -147,6 +152,12 @@ export interface PullImageRequest {
   reference: string;
   /** Optional image name; default = "<repo-basename>-<tag>" slug. */
   name: string;
+  /**
+   * Clear S_ISUID/S_ISGID while extracting layers. Default keeps them:
+   * images ship sudo/ping, and a user namespace contains that. Pods with
+   * private_users=false are trusted-images-only.
+   */
+  stripSetuid: boolean;
 }
 
 export interface Limits {
@@ -225,6 +236,13 @@ export interface Pod {
    * has no private netns.
    */
   meshIp: string;
+  /** Import response only: what sanitize stripped. Empty on every other RPC. */
+  notes: string[];
+  /**
+   * Conf opt-in: exec sessions run without NO_NEW_PRIVS (sudo works). In a
+   * pod without a user namespace that reaches host root.
+   */
+  allowSetuid: boolean;
 }
 
 export interface PodList {
@@ -267,12 +285,92 @@ export interface VolumeInfoList {
 }
 
 /**
+ * `volume send <name> --to <peer>`: ask the local daemon to push a
+ * named volume straight to a peer over the mesh. The CLI is not in
+ * the data path — the daemons stream peer-to-peer on :5306.
+ */
+export interface SendVolumeRequest {
+  volume: string;
+  /**
+   * Peer selector: conf name ("s2"), WG pubkey, or fd<peer>::1 addr —
+   * same resolution `mesh status` lists.
+   */
+  peer: string;
+  /** "" = same name on the receiver. */
+  rename: string;
+  /**
+   * "" = auto (btrfs send iff BOTH ends run the btrfs driver), "tar"
+   * forces the portable path, "btrfs" refuses unless both qualify.
+   */
+  format: string;
+  /**
+   * Overwrite a same-named volume on the peer — the existing tree is
+   * deleted first. Off by default: refusing beats destroying data.
+   */
+  force: boolean;
+}
+
+export interface SendVolumeResult {
+  /** name on the receiver */
+  volume: string;
+  /** resolved peer addr for display */
+  peer: string;
+  /** payload bytes pushed */
+  bytes: number;
+  /** negotiated: "btrfs" | "tar" */
+  format: string;
+}
+
+/**
+ * Dataplane for SendVolume: the SENDING daemon client-streams this to
+ * the peer's mesh-RPC PodControl. First frame must be `init`.
+ */
+export interface VolumeChunk {
+  init?: VolumeInit | undefined;
+  data?: Uint8Array | undefined;
+}
+
+export interface VolumeInit {
+  /** requested volume name (already validated) */
+  name: string;
+  /** "tar" | "btrfs" — what `data` frames hold */
+  format: string;
+  /** receiver may delete a same-named volume */
+  force: boolean;
+}
+
+export interface ReceiveVolumeResult {
+  name: string;
+  path: string;
+  bytes: number;
+}
+
+/**
  * One frame of a pod export archive (header+manifest in the first
  * chunk, then raw btrfs-send/tar payload bytes). The archive format is
  * opaque to the wire — the daemon owns it.
  */
+export interface ExportRequest {
+  name: string;
+  /**
+   * "" = auto (btrfs send on btrfs, tar elsewhere). "tar" forces tar
+   * even on a btrfs host. "btrfs" requires btrfs storage.
+   */
+  format: string;
+  /**
+   * When cgroup freeze fails, still export (crash-consistent, like a
+   * power cut). Default is to abort so that failure is not silent.
+   */
+  allowInconsistent: boolean;
+}
+
 export interface ExportChunk {
   data: Uint8Array;
+  /**
+   * Operator notice (freeze skipped, …). Not archive bytes — clients
+   * print it and write only `data`.
+   */
+  warning: string;
 }
 
 /**
@@ -287,12 +385,23 @@ export interface ImportChunk {
 export interface ImportOptions {
   /** import under a different pod name ("" = keep) */
   rename: string;
+  /**
+   * Keep exported binds, ports, env, autostart, restart, healthcheck
+   * and private_users=false. Default strips those host-root grants.
+   */
+  trust: boolean;
 }
 
 /** --- Multi-host mesh (Wave I) --- */
 export interface MeshInitRequest {
   /** UDP port for WireGuard; 0 = 51820 */
   listenPort: number;
+  /**
+   * Shared cluster secret gating the mesh-RPC listener (fd<host>::1:5306).
+   * Set the introducer's token when joining an existing mesh; empty
+   * generates a fresh one on first init.
+   */
+  token: string;
 }
 
 /**
@@ -304,6 +413,8 @@ export interface MeshPeer {
   endpoint: string;
   /** base64 x25519 (44 chars) */
   pubkey: string;
+  /** optional alias used by --host (e.g. "s2") */
+  name: string;
 }
 
 export interface MeshPeerInfo {
@@ -315,6 +426,13 @@ export interface MeshPeerInfo {
   handshakeSecsAgo: number;
   txBytes: number;
   rxBytes: number;
+  /** conf alias, "" when unset */
+  name: string;
+  /**
+   * The peer daemon's gRPC-over-mesh address, e.g. "fd…::1" — dial
+   * http://[addr]:5306 for remote pod ops.
+   */
+  grpcAddr: string;
 }
 
 export interface MeshStatus {
@@ -335,6 +453,24 @@ export interface MeshStatus {
   tunPkts: number;
   /** Mesh-DNS registry (Wave K): pod name → mesh addr, local + remote. */
   names: { [key: string]: string };
+  /** TUN writes that returned EAGAIN and were dropped. */
+  tunDrops: number;
+  /**
+   * Set when conf/mesh.conf exists but failed to parse and the mesh
+   * was left down. Empty when the mesh is up or simply uninitialized.
+   */
+  confError: string;
+  /**
+   * Shared secret gating [fd<host>::1]:5306 — shown so the operator can
+   * copy it to `mesh init --token` on a joining host. UDS-gated, same
+   * trust level as the pubkey output.
+   */
+  clusterToken: string;
+  /**
+   * This host's own mesh gRPC addr ("fd<host>::1") — dial
+   * http://[addr]:5306 from any mesh peer.
+   */
+  grpcAddr: string;
 }
 
 export interface MeshStatus_NamesEntry {
@@ -406,6 +542,8 @@ export interface CreatePodRequest {
    * survive pod destroy.
    */
   volumes: string[];
+  /** Seconds to wait for a clean poweroff before hard-kill. 0 = 8s. */
+  stopTimeoutSecs: number;
 }
 
 export interface ClonePodRequest {
@@ -558,7 +696,11 @@ export interface UpdatePodConfigRequest {
    * Absent = keep; present (even empty) = replace volume mounts.
    * Takes effect on the next pod start.
    */
-  volumes?: VolumeList | undefined;
+  volumes?:
+    | VolumeList
+    | undefined;
+  /** Absent = keep. 0 = the 8s default. Seconds before hard-kill on stop. */
+  stopTimeoutSecs?: number | undefined;
 }
 
 export interface StartPodRequest {
@@ -682,6 +824,11 @@ export interface IngressDeployment {
   caCertPath: string;
   /** Whether the CA was also installed into the host trust store. */
   caInstalled: boolean;
+}
+
+export interface IngressCaResult {
+  caCertPath: string;
+  detail: string;
 }
 
 export interface IngressGatewayStatusRequest {
@@ -1265,6 +1412,7 @@ function createBaseDaemonInfo(): DaemonInfo {
     btrfs: false,
     storageDriver: "",
     runtimeEngine: "",
+    quarantined: [],
   };
 }
 
@@ -1290,6 +1438,9 @@ export const DaemonInfo: MessageFns<DaemonInfo> = {
     }
     if (message.runtimeEngine !== "") {
       writer.uint32(58).string(message.runtimeEngine);
+    }
+    for (const v of message.quarantined) {
+      writer.uint32(66).string(v!);
     }
     return writer;
   },
@@ -1363,6 +1514,14 @@ export const DaemonInfo: MessageFns<DaemonInfo> = {
             message.runtimeEngine = reader.string();
             continue;
           }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.quarantined.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1400,6 +1559,9 @@ export const DaemonInfo: MessageFns<DaemonInfo> = {
         : isSet(object.runtime_engine)
         ? globalThis.String(object.runtime_engine)
         : "",
+      quarantined: globalThis.Array.isArray(object?.quarantined)
+        ? object.quarantined.map((e: any) => globalThis.String(e))
+        : [],
     };
   },
 
@@ -1426,6 +1588,9 @@ export const DaemonInfo: MessageFns<DaemonInfo> = {
     if (message.runtimeEngine !== "") {
       obj.runtimeEngine = message.runtimeEngine;
     }
+    if (message.quarantined?.length) {
+      obj.quarantined = message.quarantined;
+    }
     return obj;
   },
 
@@ -1441,6 +1606,7 @@ export const DaemonInfo: MessageFns<DaemonInfo> = {
     message.btrfs = object.btrfs ?? false;
     message.storageDriver = object.storageDriver ?? "";
     message.runtimeEngine = object.runtimeEngine ?? "";
+    message.quarantined = object.quarantined?.map((e) => e) || [];
     return message;
   },
 };
@@ -1892,7 +2058,7 @@ export const ImportImageRequest: MessageFns<ImportImageRequest> = {
 };
 
 function createBasePullImageRequest(): PullImageRequest {
-  return { reference: "", name: "" };
+  return { reference: "", name: "", stripSetuid: false };
 }
 
 export const PullImageRequest: MessageFns<PullImageRequest> = {
@@ -1902,6 +2068,9 @@ export const PullImageRequest: MessageFns<PullImageRequest> = {
     }
     if (message.name !== "") {
       writer.uint32(18).string(message.name);
+    }
+    if (message.stripSetuid !== false) {
+      writer.uint32(24).bool(message.stripSetuid);
     }
     return writer;
   },
@@ -1935,6 +2104,14 @@ export const PullImageRequest: MessageFns<PullImageRequest> = {
             message.name = reader.string();
             continue;
           }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.stripSetuid = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1951,6 +2128,11 @@ export const PullImageRequest: MessageFns<PullImageRequest> = {
     return {
       reference: isSet(object.reference) ? globalThis.String(object.reference) : "",
       name: isSet(object.name) ? globalThis.String(object.name) : "",
+      stripSetuid: isSet(object.stripSetuid)
+        ? globalThis.Boolean(object.stripSetuid)
+        : isSet(object.strip_setuid)
+        ? globalThis.Boolean(object.strip_setuid)
+        : false,
     };
   },
 
@@ -1962,6 +2144,9 @@ export const PullImageRequest: MessageFns<PullImageRequest> = {
     if (message.name !== "") {
       obj.name = message.name;
     }
+    if (message.stripSetuid !== false) {
+      obj.stripSetuid = message.stripSetuid;
+    }
     return obj;
   },
 
@@ -1972,6 +2157,7 @@ export const PullImageRequest: MessageFns<PullImageRequest> = {
     const message = createBasePullImageRequest();
     message.reference = object.reference ?? "";
     message.name = object.name ?? "";
+    message.stripSetuid = object.stripSetuid ?? false;
     return message;
   },
 };
@@ -2115,6 +2301,8 @@ function createBasePod(): Pod {
     volumes: [],
     env: [],
     meshIp: "",
+    notes: [],
+    allowSetuid: false,
   };
 }
 
@@ -2191,6 +2379,12 @@ export const Pod: MessageFns<Pod> = {
     }
     if (message.meshIp !== "") {
       writer.uint32(194).string(message.meshIp);
+    }
+    for (const v of message.notes) {
+      writer.uint32(202).string(v!);
+    }
+    if (message.allowSetuid !== false) {
+      writer.uint32(208).bool(message.allowSetuid);
     }
     return writer;
   },
@@ -2400,6 +2594,22 @@ export const Pod: MessageFns<Pod> = {
             message.meshIp = reader.string();
             continue;
           }
+          case 25: {
+            if (tag !== 202) {
+              break;
+            }
+
+            message.notes.push(reader.string());
+            continue;
+          }
+          case 26: {
+            if (tag !== 208) {
+              break;
+            }
+
+            message.allowSetuid = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -2478,6 +2688,14 @@ export const Pod: MessageFns<Pod> = {
         : isSet(object.mesh_ip)
         ? globalThis.String(object.mesh_ip)
         : "",
+      notes: globalThis.Array.isArray(object?.notes)
+        ? object.notes.map((e: any) => globalThis.String(e))
+        : [],
+      allowSetuid: isSet(object.allowSetuid)
+        ? globalThis.Boolean(object.allowSetuid)
+        : isSet(object.allow_setuid)
+        ? globalThis.Boolean(object.allow_setuid)
+        : false,
     };
   },
 
@@ -2555,6 +2773,12 @@ export const Pod: MessageFns<Pod> = {
     if (message.meshIp !== "") {
       obj.meshIp = message.meshIp;
     }
+    if (message.notes?.length) {
+      obj.notes = message.notes;
+    }
+    if (message.allowSetuid !== false) {
+      obj.allowSetuid = message.allowSetuid;
+    }
     return obj;
   },
 
@@ -2589,6 +2813,8 @@ export const Pod: MessageFns<Pod> = {
     message.volumes = object.volumes?.map((e) => VolumeMount.fromPartial(e)) || [];
     message.env = object.env?.map((e) => e) || [];
     message.meshIp = object.meshIp ?? "";
+    message.notes = object.notes?.map((e) => e) || [];
+    message.allowSetuid = object.allowSetuid ?? false;
     return message;
   },
 };
@@ -3105,14 +3331,661 @@ export const VolumeInfoList: MessageFns<VolumeInfoList> = {
   },
 };
 
+function createBaseSendVolumeRequest(): SendVolumeRequest {
+  return { volume: "", peer: "", rename: "", format: "", force: false };
+}
+
+export const SendVolumeRequest: MessageFns<SendVolumeRequest> = {
+  encode(message: SendVolumeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.volume !== "") {
+      writer.uint32(10).string(message.volume);
+    }
+    if (message.peer !== "") {
+      writer.uint32(18).string(message.peer);
+    }
+    if (message.rename !== "") {
+      writer.uint32(26).string(message.rename);
+    }
+    if (message.format !== "") {
+      writer.uint32(34).string(message.format);
+    }
+    if (message.force !== false) {
+      writer.uint32(40).bool(message.force);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SendVolumeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSendVolumeRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.volume = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.peer = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.rename = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.format = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.force = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SendVolumeRequest {
+    return {
+      volume: isSet(object.volume) ? globalThis.String(object.volume) : "",
+      peer: isSet(object.peer) ? globalThis.String(object.peer) : "",
+      rename: isSet(object.rename) ? globalThis.String(object.rename) : "",
+      format: isSet(object.format) ? globalThis.String(object.format) : "",
+      force: isSet(object.force) ? globalThis.Boolean(object.force) : false,
+    };
+  },
+
+  toJSON(message: SendVolumeRequest): unknown {
+    const obj: any = {};
+    if (message.volume !== "") {
+      obj.volume = message.volume;
+    }
+    if (message.peer !== "") {
+      obj.peer = message.peer;
+    }
+    if (message.rename !== "") {
+      obj.rename = message.rename;
+    }
+    if (message.format !== "") {
+      obj.format = message.format;
+    }
+    if (message.force !== false) {
+      obj.force = message.force;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SendVolumeRequest>, I>>(base?: I): SendVolumeRequest {
+    return SendVolumeRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SendVolumeRequest>, I>>(object: I): SendVolumeRequest {
+    const message = createBaseSendVolumeRequest();
+    message.volume = object.volume ?? "";
+    message.peer = object.peer ?? "";
+    message.rename = object.rename ?? "";
+    message.format = object.format ?? "";
+    message.force = object.force ?? false;
+    return message;
+  },
+};
+
+function createBaseSendVolumeResult(): SendVolumeResult {
+  return { volume: "", peer: "", bytes: 0, format: "" };
+}
+
+export const SendVolumeResult: MessageFns<SendVolumeResult> = {
+  encode(message: SendVolumeResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.volume !== "") {
+      writer.uint32(10).string(message.volume);
+    }
+    if (message.peer !== "") {
+      writer.uint32(18).string(message.peer);
+    }
+    if (message.bytes !== 0) {
+      writer.uint32(24).uint64(message.bytes);
+    }
+    if (message.format !== "") {
+      writer.uint32(34).string(message.format);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SendVolumeResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSendVolumeResult();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.volume = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.peer = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.bytes = longToNumber(reader.uint64());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.format = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SendVolumeResult {
+    return {
+      volume: isSet(object.volume) ? globalThis.String(object.volume) : "",
+      peer: isSet(object.peer) ? globalThis.String(object.peer) : "",
+      bytes: isSet(object.bytes) ? globalThis.Number(object.bytes) : 0,
+      format: isSet(object.format) ? globalThis.String(object.format) : "",
+    };
+  },
+
+  toJSON(message: SendVolumeResult): unknown {
+    const obj: any = {};
+    if (message.volume !== "") {
+      obj.volume = message.volume;
+    }
+    if (message.peer !== "") {
+      obj.peer = message.peer;
+    }
+    if (message.bytes !== 0) {
+      obj.bytes = Math.round(message.bytes);
+    }
+    if (message.format !== "") {
+      obj.format = message.format;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SendVolumeResult>, I>>(base?: I): SendVolumeResult {
+    return SendVolumeResult.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SendVolumeResult>, I>>(object: I): SendVolumeResult {
+    const message = createBaseSendVolumeResult();
+    message.volume = object.volume ?? "";
+    message.peer = object.peer ?? "";
+    message.bytes = object.bytes ?? 0;
+    message.format = object.format ?? "";
+    return message;
+  },
+};
+
+function createBaseVolumeChunk(): VolumeChunk {
+  return { init: undefined, data: undefined };
+}
+
+export const VolumeChunk: MessageFns<VolumeChunk> = {
+  encode(message: VolumeChunk, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.init !== undefined) {
+      VolumeInit.encode(message.init, writer.uint32(10).fork()).join();
+    }
+    if (message.data !== undefined) {
+      writer.uint32(18).bytes(message.data);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VolumeChunk {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseVolumeChunk();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.init = VolumeInit.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.data = reader.bytes();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): VolumeChunk {
+    return {
+      init: isSet(object.init) ? VolumeInit.fromJSON(object.init) : undefined,
+      data: isSet(object.data) ? bytesFromBase64(object.data) : undefined,
+    };
+  },
+
+  toJSON(message: VolumeChunk): unknown {
+    const obj: any = {};
+    if (message.init !== undefined) {
+      obj.init = VolumeInit.toJSON(message.init);
+    }
+    if (message.data !== undefined) {
+      obj.data = base64FromBytes(message.data);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<VolumeChunk>, I>>(base?: I): VolumeChunk {
+    return VolumeChunk.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<VolumeChunk>, I>>(object: I): VolumeChunk {
+    const message = createBaseVolumeChunk();
+    message.init = (object.init !== undefined && object.init !== null)
+      ? VolumeInit.fromPartial(object.init)
+      : undefined;
+    message.data = object.data ?? undefined;
+    return message;
+  },
+};
+
+function createBaseVolumeInit(): VolumeInit {
+  return { name: "", format: "", force: false };
+}
+
+export const VolumeInit: MessageFns<VolumeInit> = {
+  encode(message: VolumeInit, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.format !== "") {
+      writer.uint32(18).string(message.format);
+    }
+    if (message.force !== false) {
+      writer.uint32(24).bool(message.force);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VolumeInit {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseVolumeInit();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.format = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.force = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): VolumeInit {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      format: isSet(object.format) ? globalThis.String(object.format) : "",
+      force: isSet(object.force) ? globalThis.Boolean(object.force) : false,
+    };
+  },
+
+  toJSON(message: VolumeInit): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.format !== "") {
+      obj.format = message.format;
+    }
+    if (message.force !== false) {
+      obj.force = message.force;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<VolumeInit>, I>>(base?: I): VolumeInit {
+    return VolumeInit.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<VolumeInit>, I>>(object: I): VolumeInit {
+    const message = createBaseVolumeInit();
+    message.name = object.name ?? "";
+    message.format = object.format ?? "";
+    message.force = object.force ?? false;
+    return message;
+  },
+};
+
+function createBaseReceiveVolumeResult(): ReceiveVolumeResult {
+  return { name: "", path: "", bytes: 0 };
+}
+
+export const ReceiveVolumeResult: MessageFns<ReceiveVolumeResult> = {
+  encode(message: ReceiveVolumeResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.path !== "") {
+      writer.uint32(18).string(message.path);
+    }
+    if (message.bytes !== 0) {
+      writer.uint32(24).uint64(message.bytes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReceiveVolumeResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseReceiveVolumeResult();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.path = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.bytes = longToNumber(reader.uint64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): ReceiveVolumeResult {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+      bytes: isSet(object.bytes) ? globalThis.Number(object.bytes) : 0,
+    };
+  },
+
+  toJSON(message: ReceiveVolumeResult): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    if (message.bytes !== 0) {
+      obj.bytes = Math.round(message.bytes);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ReceiveVolumeResult>, I>>(base?: I): ReceiveVolumeResult {
+    return ReceiveVolumeResult.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ReceiveVolumeResult>, I>>(object: I): ReceiveVolumeResult {
+    const message = createBaseReceiveVolumeResult();
+    message.name = object.name ?? "";
+    message.path = object.path ?? "";
+    message.bytes = object.bytes ?? 0;
+    return message;
+  },
+};
+
+function createBaseExportRequest(): ExportRequest {
+  return { name: "", format: "", allowInconsistent: false };
+}
+
+export const ExportRequest: MessageFns<ExportRequest> = {
+  encode(message: ExportRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.format !== "") {
+      writer.uint32(18).string(message.format);
+    }
+    if (message.allowInconsistent !== false) {
+      writer.uint32(24).bool(message.allowInconsistent);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ExportRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseExportRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.format = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.allowInconsistent = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): ExportRequest {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      format: isSet(object.format) ? globalThis.String(object.format) : "",
+      allowInconsistent: isSet(object.allowInconsistent)
+        ? globalThis.Boolean(object.allowInconsistent)
+        : isSet(object.allow_inconsistent)
+        ? globalThis.Boolean(object.allow_inconsistent)
+        : false,
+    };
+  },
+
+  toJSON(message: ExportRequest): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.format !== "") {
+      obj.format = message.format;
+    }
+    if (message.allowInconsistent !== false) {
+      obj.allowInconsistent = message.allowInconsistent;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ExportRequest>, I>>(base?: I): ExportRequest {
+    return ExportRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ExportRequest>, I>>(object: I): ExportRequest {
+    const message = createBaseExportRequest();
+    message.name = object.name ?? "";
+    message.format = object.format ?? "";
+    message.allowInconsistent = object.allowInconsistent ?? false;
+    return message;
+  },
+};
+
 function createBaseExportChunk(): ExportChunk {
-  return { data: new Uint8Array(0) };
+  return { data: new Uint8Array(0), warning: "" };
 }
 
 export const ExportChunk: MessageFns<ExportChunk> = {
   encode(message: ExportChunk, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.data.length !== 0) {
       writer.uint32(10).bytes(message.data);
+    }
+    if (message.warning !== "") {
+      writer.uint32(18).string(message.warning);
     }
     return writer;
   },
@@ -3138,6 +4011,14 @@ export const ExportChunk: MessageFns<ExportChunk> = {
             message.data = reader.bytes();
             continue;
           }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.warning = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3151,13 +4032,19 @@ export const ExportChunk: MessageFns<ExportChunk> = {
   },
 
   fromJSON(object: any): ExportChunk {
-    return { data: isSet(object.data) ? bytesFromBase64(object.data) : new Uint8Array(0) };
+    return {
+      data: isSet(object.data) ? bytesFromBase64(object.data) : new Uint8Array(0),
+      warning: isSet(object.warning) ? globalThis.String(object.warning) : "",
+    };
   },
 
   toJSON(message: ExportChunk): unknown {
     const obj: any = {};
     if (message.data.length !== 0) {
       obj.data = base64FromBytes(message.data);
+    }
+    if (message.warning !== "") {
+      obj.warning = message.warning;
     }
     return obj;
   },
@@ -3168,6 +4055,7 @@ export const ExportChunk: MessageFns<ExportChunk> = {
   fromPartial<I extends Exact<DeepPartial<ExportChunk>, I>>(object: I): ExportChunk {
     const message = createBaseExportChunk();
     message.data = object.data ?? new Uint8Array(0);
+    message.warning = object.warning ?? "";
     return message;
   },
 };
@@ -3260,13 +4148,16 @@ export const ImportChunk: MessageFns<ImportChunk> = {
 };
 
 function createBaseImportOptions(): ImportOptions {
-  return { rename: "" };
+  return { rename: "", trust: false };
 }
 
 export const ImportOptions: MessageFns<ImportOptions> = {
   encode(message: ImportOptions, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.rename !== "") {
       writer.uint32(10).string(message.rename);
+    }
+    if (message.trust !== false) {
+      writer.uint32(16).bool(message.trust);
     }
     return writer;
   },
@@ -3292,6 +4183,14 @@ export const ImportOptions: MessageFns<ImportOptions> = {
             message.rename = reader.string();
             continue;
           }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.trust = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3305,13 +4204,19 @@ export const ImportOptions: MessageFns<ImportOptions> = {
   },
 
   fromJSON(object: any): ImportOptions {
-    return { rename: isSet(object.rename) ? globalThis.String(object.rename) : "" };
+    return {
+      rename: isSet(object.rename) ? globalThis.String(object.rename) : "",
+      trust: isSet(object.trust) ? globalThis.Boolean(object.trust) : false,
+    };
   },
 
   toJSON(message: ImportOptions): unknown {
     const obj: any = {};
     if (message.rename !== "") {
       obj.rename = message.rename;
+    }
+    if (message.trust !== false) {
+      obj.trust = message.trust;
     }
     return obj;
   },
@@ -3322,18 +4227,22 @@ export const ImportOptions: MessageFns<ImportOptions> = {
   fromPartial<I extends Exact<DeepPartial<ImportOptions>, I>>(object: I): ImportOptions {
     const message = createBaseImportOptions();
     message.rename = object.rename ?? "";
+    message.trust = object.trust ?? false;
     return message;
   },
 };
 
 function createBaseMeshInitRequest(): MeshInitRequest {
-  return { listenPort: 0 };
+  return { listenPort: 0, token: "" };
 }
 
 export const MeshInitRequest: MessageFns<MeshInitRequest> = {
   encode(message: MeshInitRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.listenPort !== 0) {
       writer.uint32(8).uint32(message.listenPort);
+    }
+    if (message.token !== "") {
+      writer.uint32(18).string(message.token);
     }
     return writer;
   },
@@ -3359,6 +4268,14 @@ export const MeshInitRequest: MessageFns<MeshInitRequest> = {
             message.listenPort = reader.uint32();
             continue;
           }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.token = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3378,6 +4295,7 @@ export const MeshInitRequest: MessageFns<MeshInitRequest> = {
         : isSet(object.listen_port)
         ? globalThis.Number(object.listen_port)
         : 0,
+      token: isSet(object.token) ? globalThis.String(object.token) : "",
     };
   },
 
@@ -3385,6 +4303,9 @@ export const MeshInitRequest: MessageFns<MeshInitRequest> = {
     const obj: any = {};
     if (message.listenPort !== 0) {
       obj.listenPort = Math.round(message.listenPort);
+    }
+    if (message.token !== "") {
+      obj.token = message.token;
     }
     return obj;
   },
@@ -3395,12 +4316,13 @@ export const MeshInitRequest: MessageFns<MeshInitRequest> = {
   fromPartial<I extends Exact<DeepPartial<MeshInitRequest>, I>>(object: I): MeshInitRequest {
     const message = createBaseMeshInitRequest();
     message.listenPort = object.listenPort ?? 0;
+    message.token = object.token ?? "";
     return message;
   },
 };
 
 function createBaseMeshPeer(): MeshPeer {
-  return { endpoint: "", pubkey: "" };
+  return { endpoint: "", pubkey: "", name: "" };
 }
 
 export const MeshPeer: MessageFns<MeshPeer> = {
@@ -3410,6 +4332,9 @@ export const MeshPeer: MessageFns<MeshPeer> = {
     }
     if (message.pubkey !== "") {
       writer.uint32(18).string(message.pubkey);
+    }
+    if (message.name !== "") {
+      writer.uint32(26).string(message.name);
     }
     return writer;
   },
@@ -3443,6 +4368,14 @@ export const MeshPeer: MessageFns<MeshPeer> = {
             message.pubkey = reader.string();
             continue;
           }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3459,6 +4392,7 @@ export const MeshPeer: MessageFns<MeshPeer> = {
     return {
       endpoint: isSet(object.endpoint) ? globalThis.String(object.endpoint) : "",
       pubkey: isSet(object.pubkey) ? globalThis.String(object.pubkey) : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
     };
   },
 
@@ -3470,6 +4404,9 @@ export const MeshPeer: MessageFns<MeshPeer> = {
     if (message.pubkey !== "") {
       obj.pubkey = message.pubkey;
     }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
     return obj;
   },
 
@@ -3480,12 +4417,13 @@ export const MeshPeer: MessageFns<MeshPeer> = {
     const message = createBaseMeshPeer();
     message.endpoint = object.endpoint ?? "";
     message.pubkey = object.pubkey ?? "";
+    message.name = object.name ?? "";
     return message;
   },
 };
 
 function createBaseMeshPeerInfo(): MeshPeerInfo {
-  return { endpoint: "", pubkey: "", prefix: "", handshakeSecsAgo: 0, txBytes: 0, rxBytes: 0 };
+  return { endpoint: "", pubkey: "", prefix: "", handshakeSecsAgo: 0, txBytes: 0, rxBytes: 0, name: "", grpcAddr: "" };
 }
 
 export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
@@ -3507,6 +4445,12 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
     }
     if (message.rxBytes !== 0) {
       writer.uint32(48).uint64(message.rxBytes);
+    }
+    if (message.name !== "") {
+      writer.uint32(58).string(message.name);
+    }
+    if (message.grpcAddr !== "") {
+      writer.uint32(66).string(message.grpcAddr);
     }
     return writer;
   },
@@ -3572,6 +4516,22 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
             message.rxBytes = longToNumber(reader.uint64());
             continue;
           }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.grpcAddr = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3604,6 +4564,12 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
         : isSet(object.rx_bytes)
         ? globalThis.Number(object.rx_bytes)
         : 0,
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      grpcAddr: isSet(object.grpcAddr)
+        ? globalThis.String(object.grpcAddr)
+        : isSet(object.grpc_addr)
+        ? globalThis.String(object.grpc_addr)
+        : "",
     };
   },
 
@@ -3627,6 +4593,12 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
     if (message.rxBytes !== 0) {
       obj.rxBytes = Math.round(message.rxBytes);
     }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.grpcAddr !== "") {
+      obj.grpcAddr = message.grpcAddr;
+    }
     return obj;
   },
 
@@ -3641,6 +4613,8 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
     message.handshakeSecsAgo = object.handshakeSecsAgo ?? 0;
     message.txBytes = object.txBytes ?? 0;
     message.rxBytes = object.rxBytes ?? 0;
+    message.name = object.name ?? "";
+    message.grpcAddr = object.grpcAddr ?? "";
     return message;
   },
 };
@@ -3656,6 +4630,10 @@ function createBaseMeshStatus(): MeshStatus {
     udpPkts: 0,
     tunPkts: 0,
     names: {},
+    tunDrops: 0,
+    confError: "",
+    clusterToken: "",
+    grpcAddr: "",
   };
 }
 
@@ -3688,6 +4666,18 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     globalThis.Object.entries(message.names).forEach(([key, value]: [string, string]) => {
       MeshStatus_NamesEntry.encode({ key: key as any, value }, writer.uint32(74).fork()).join();
     });
+    if (message.tunDrops !== 0) {
+      writer.uint32(80).uint64(message.tunDrops);
+    }
+    if (message.confError !== "") {
+      writer.uint32(90).string(message.confError);
+    }
+    if (message.clusterToken !== "") {
+      writer.uint32(98).string(message.clusterToken);
+    }
+    if (message.grpcAddr !== "") {
+      writer.uint32(106).string(message.grpcAddr);
+    }
     return writer;
   },
 
@@ -3779,6 +4769,38 @@ export const MeshStatus: MessageFns<MeshStatus> = {
             }
             continue;
           }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.tunDrops = longToNumber(reader.uint64());
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.confError = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.clusterToken = reader.string();
+            continue;
+          }
+          case 13: {
+            if (tag !== 106) {
+              break;
+            }
+
+            message.grpcAddr = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -3827,6 +4849,26 @@ export const MeshStatus: MessageFns<MeshStatus> = {
           {},
         )
         : {},
+      tunDrops: isSet(object.tunDrops)
+        ? globalThis.Number(object.tunDrops)
+        : isSet(object.tun_drops)
+        ? globalThis.Number(object.tun_drops)
+        : 0,
+      confError: isSet(object.confError)
+        ? globalThis.String(object.confError)
+        : isSet(object.conf_error)
+        ? globalThis.String(object.conf_error)
+        : "",
+      clusterToken: isSet(object.clusterToken)
+        ? globalThis.String(object.clusterToken)
+        : isSet(object.cluster_token)
+        ? globalThis.String(object.cluster_token)
+        : "",
+      grpcAddr: isSet(object.grpcAddr)
+        ? globalThis.String(object.grpcAddr)
+        : isSet(object.grpc_addr)
+        ? globalThis.String(object.grpc_addr)
+        : "",
     };
   },
 
@@ -3865,6 +4907,18 @@ export const MeshStatus: MessageFns<MeshStatus> = {
         });
       }
     }
+    if (message.tunDrops !== 0) {
+      obj.tunDrops = Math.round(message.tunDrops);
+    }
+    if (message.confError !== "") {
+      obj.confError = message.confError;
+    }
+    if (message.clusterToken !== "") {
+      obj.clusterToken = message.clusterToken;
+    }
+    if (message.grpcAddr !== "") {
+      obj.grpcAddr = message.grpcAddr;
+    }
     return obj;
   },
 
@@ -3890,6 +4944,10 @@ export const MeshStatus: MessageFns<MeshStatus> = {
       },
       {},
     );
+    message.tunDrops = object.tunDrops ?? 0;
+    message.confError = object.confError ?? "";
+    message.clusterToken = object.clusterToken ?? "";
+    message.grpcAddr = object.grpcAddr ?? "";
     return message;
   },
 };
@@ -4204,6 +5262,7 @@ function createBaseCreatePodRequest(): CreatePodRequest {
     healthcheck: undefined,
     env: [],
     volumes: [],
+    stopTimeoutSecs: 0,
   };
 }
 
@@ -4250,6 +5309,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     }
     for (const v of message.volumes) {
       writer.uint32(114).string(v!);
+    }
+    if (message.stopTimeoutSecs !== 0) {
+      writer.uint32(120).uint64(message.stopTimeoutSecs);
     }
     return writer;
   },
@@ -4379,6 +5441,14 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
             message.volumes.push(reader.string());
             continue;
           }
+          case 15: {
+            if (tag !== 120) {
+              break;
+            }
+
+            message.stopTimeoutSecs = longToNumber(reader.uint64());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -4411,6 +5481,11 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       healthcheck: isSet(object.healthcheck) ? HealthCheck.fromJSON(object.healthcheck) : undefined,
       env: globalThis.Array.isArray(object?.env) ? object.env.map((e: any) => globalThis.String(e)) : [],
       volumes: globalThis.Array.isArray(object?.volumes) ? object.volumes.map((e: any) => globalThis.String(e)) : [],
+      stopTimeoutSecs: isSet(object.stopTimeoutSecs)
+        ? globalThis.Number(object.stopTimeoutSecs)
+        : isSet(object.stop_timeout_secs)
+        ? globalThis.Number(object.stop_timeout_secs)
+        : 0,
     };
   },
 
@@ -4458,6 +5533,9 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
     if (message.volumes?.length) {
       obj.volumes = message.volumes;
     }
+    if (message.stopTimeoutSecs !== 0) {
+      obj.stopTimeoutSecs = Math.round(message.stopTimeoutSecs);
+    }
     return obj;
   },
 
@@ -4484,6 +5562,7 @@ export const CreatePodRequest: MessageFns<CreatePodRequest> = {
       : undefined;
     message.env = object.env?.map((e) => e) || [];
     message.volumes = object.volumes?.map((e) => e) || [];
+    message.stopTimeoutSecs = object.stopTimeoutSecs ?? 0;
     return message;
   },
 };
@@ -5699,6 +6778,7 @@ function createBaseUpdatePodConfigRequest(): UpdatePodConfigRequest {
     healthcheck: undefined,
     env: undefined,
     volumes: undefined,
+    stopTimeoutSecs: undefined,
   };
 }
 
@@ -5745,6 +6825,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     }
     if (message.volumes !== undefined) {
       VolumeList.encode(message.volumes, writer.uint32(114).fork()).join();
+    }
+    if (message.stopTimeoutSecs !== undefined) {
+      writer.uint32(120).uint64(message.stopTimeoutSecs);
     }
     return writer;
   },
@@ -5874,6 +6957,14 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
             message.volumes = VolumeList.decode(reader, reader.uint32());
             continue;
           }
+          case 15: {
+            if (tag !== 120) {
+              break;
+            }
+
+            message.stopTimeoutSecs = longToNumber(reader.uint64());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -5914,6 +7005,11 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
       healthcheck: isSet(object.healthcheck) ? HealthCheck.fromJSON(object.healthcheck) : undefined,
       env: isSet(object.env) ? EnvList.fromJSON(object.env) : undefined,
       volumes: isSet(object.volumes) ? VolumeList.fromJSON(object.volumes) : undefined,
+      stopTimeoutSecs: isSet(object.stopTimeoutSecs)
+        ? globalThis.Number(object.stopTimeoutSecs)
+        : isSet(object.stop_timeout_secs)
+        ? globalThis.Number(object.stop_timeout_secs)
+        : undefined,
     };
   },
 
@@ -5961,6 +7057,9 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     if (message.volumes !== undefined) {
       obj.volumes = VolumeList.toJSON(message.volumes);
     }
+    if (message.stopTimeoutSecs !== undefined) {
+      obj.stopTimeoutSecs = Math.round(message.stopTimeoutSecs);
+    }
     return obj;
   },
 
@@ -5995,6 +7094,7 @@ export const UpdatePodConfigRequest: MessageFns<UpdatePodConfigRequest> = {
     message.volumes = (object.volumes !== undefined && object.volumes !== null)
       ? VolumeList.fromPartial(object.volumes)
       : undefined;
+    message.stopTimeoutSecs = object.stopTimeoutSecs ?? undefined;
     return message;
   },
 };
@@ -7546,6 +8646,95 @@ export const IngressDeployment: MessageFns<IngressDeployment> = {
   },
 };
 
+function createBaseIngressCaResult(): IngressCaResult {
+  return { caCertPath: "", detail: "" };
+}
+
+export const IngressCaResult: MessageFns<IngressCaResult> = {
+  encode(message: IngressCaResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.caCertPath !== "") {
+      writer.uint32(10).string(message.caCertPath);
+    }
+    if (message.detail !== "") {
+      writer.uint32(18).string(message.detail);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IngressCaResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseIngressCaResult();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.caCertPath = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.detail = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): IngressCaResult {
+    return {
+      caCertPath: isSet(object.caCertPath)
+        ? globalThis.String(object.caCertPath)
+        : isSet(object.ca_cert_path)
+        ? globalThis.String(object.ca_cert_path)
+        : "",
+      detail: isSet(object.detail) ? globalThis.String(object.detail) : "",
+    };
+  },
+
+  toJSON(message: IngressCaResult): unknown {
+    const obj: any = {};
+    if (message.caCertPath !== "") {
+      obj.caCertPath = message.caCertPath;
+    }
+    if (message.detail !== "") {
+      obj.detail = message.detail;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<IngressCaResult>, I>>(base?: I): IngressCaResult {
+    return IngressCaResult.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<IngressCaResult>, I>>(object: I): IngressCaResult {
+    const message = createBaseIngressCaResult();
+    message.caCertPath = object.caCertPath ?? "";
+    message.detail = object.detail ?? "";
+    return message;
+  },
+};
+
 function createBaseIngressGatewayStatusRequest(): IngressGatewayStatusRequest {
   return {};
 }
@@ -8013,6 +9202,29 @@ export const PodControlDefinition = {
       options: {},
     },
     /**
+     * Cross-host volume copy (cluster plane). `SendVolume` is a unary
+     * call to the LOCAL daemon: resolve the peer, negotiate the payload
+     * format, then stream the volume daemon→daemon to the peer's
+     * mesh-RPC listener. `ReceiveVolume` is that dataplane endpoint —
+     * it is only useful over the mesh (token-gated, peer-guarded).
+     */
+    sendVolume: {
+      name: "SendVolume",
+      requestType: SendVolumeRequest as typeof SendVolumeRequest,
+      requestStream: false,
+      responseType: SendVolumeResult as typeof SendVolumeResult,
+      responseStream: false,
+      options: {},
+    },
+    receiveVolume: {
+      name: "ReceiveVolume",
+      requestType: VolumeChunk as typeof VolumeChunk,
+      requestStream: true,
+      responseType: ReceiveVolumeResult as typeof ReceiveVolumeResult,
+      responseStream: false,
+      options: {},
+    },
+    /**
      * Pod export/import (Wave H): serialize a pod — rootfs, conf, image
      * conf and every attached named volume — into one portable stream,
      * and reconstruct it on any host. Export streams the archive out;
@@ -8021,7 +9233,7 @@ export const PodControlDefinition = {
      */
     exportPod: {
       name: "ExportPod",
-      requestType: PodRef as typeof PodRef,
+      requestType: ExportRequest as typeof ExportRequest,
       requestStream: false,
       responseType: ExportChunk as typeof ExportChunk,
       responseStream: true,
@@ -8107,6 +9319,27 @@ export const PodControlDefinition = {
       requestType: IngressGatewayStatusRequest as typeof IngressGatewayStatusRequest,
       requestStream: false,
       responseType: IngressGatewayStatusResponse as typeof IngressGatewayStatusResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Remove the CA from the host trust store (the inverse of install_ca). */
+    uninstallIngressCa: {
+      name: "UninstallIngressCa",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: IngressCaResult as typeof IngressCaResult,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Replace an old CA. Trust stores that imported the previous CA must
+     * re-import; this does not edit the host trust store itself.
+     */
+    rotateIngressCa: {
+      name: "RotateIngressCa",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: IngressCaResult as typeof IngressCaResult,
       responseStream: false,
       options: {},
     },

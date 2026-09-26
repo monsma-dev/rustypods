@@ -50,27 +50,32 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             for spec in &volume {
                 rustypods_proto::parse_volume_spec(spec)?;
             }
-            let p = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                .await?
-                .create_pod(CreatePodRequest {
-                    name,
-                    image,
-                    storage_max_bytes,
-                    ports: port,
-                    ingress: ingress_rules,
-                    desktop,
-                    binds: bind,
-                    limits: None,
-                    autostart,
-                    cmd,
-                    restart: restart.unwrap_or_default(),
-                    healthcheck,
-                    env,
-                    volumes: volume,
-                    stop_timeout_secs: stop_timeout.unwrap_or(0),
-                })
-                .await?
-                .into_inner();
+            let p = connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                cli.host.clone(),
+                LONG_RPC,
+            )
+            .await?
+            .create_pod(CreatePodRequest {
+                name,
+                image,
+                storage_max_bytes,
+                ports: port,
+                ingress: ingress_rules,
+                desktop,
+                binds: bind,
+                limits: None,
+                autostart,
+                cmd,
+                restart: restart.unwrap_or_default(),
+                healthcheck,
+                env,
+                volumes: volume,
+                stop_timeout_secs: stop_timeout.unwrap_or(0),
+            })
+            .await?
+            .into_inner();
             print_pod(&p);
         }
         Cmd::Start {
@@ -89,21 +94,26 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             } else {
                 None
             };
-            let p = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                .await?
-                .start_pod(StartPodRequest {
-                    name: name.clone(),
-                    limits: limits_proto(memory_high.as_deref(), memory_max.as_deref(), cpu)?,
-                    ephemeral,
-                    private_users: pu,
-                })
-                .await?
-                .into_inner();
+            let p = connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                cli.host.clone(),
+                LONG_RPC,
+            )
+            .await?
+            .start_pod(StartPodRequest {
+                name: name.clone(),
+                limits: limits_proto(memory_high.as_deref(), memory_max.as_deref(), cpu)?,
+                ephemeral,
+                private_users: pu,
+            })
+            .await?
+            .into_inner();
             print_pod(&p);
             println!("shell: rustypods shell {name}");
         }
         Cmd::Stop { name } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
+            let p = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .stop_pod(PodRef { name })
                 .await?
@@ -111,7 +121,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             print_pod(&p);
         }
         Cmd::Restart { name } => {
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone()).await?;
             c.stop_pod(PodRef { name: name.clone() }).await?;
             let p = c
                 .start_pod(StartPodRequest {
@@ -125,7 +135,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             print_pod(&p);
         }
         Cmd::Ps => {
-            let l = connect(cli.socket.clone(), cli.remote.clone())
+            let l = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .list_pods(ListPodsRequest {})
                 .await?
@@ -139,7 +149,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
         }
         Cmd::Destroy { name } => {
             use std::io::IsTerminal;
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone()).await?;
             let n = if std::io::stdin().is_terminal() && !cli.yes {
                 c.list_snapshots(PodRef { name: name.clone() })
                     .await?
@@ -160,7 +170,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             println!("pod {name} destroyed");
         }
         Cmd::Clone { source, dest } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
+            let p = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .clone_pod(ClonePodRequest {
                     source: source.clone(),
@@ -174,7 +184,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             }
         }
         Cmd::Commit { pod, label } => {
-            let s = connect(cli.socket.clone(), cli.remote.clone())
+            let s = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .commit_pod(CommitPodRequest {
                     pod: pod.clone(),
@@ -185,7 +195,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             println!("snapshot {} — instant CoW ({})", s.id, s.path);
         }
         Cmd::Rollback { pod, to } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
+            let p = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .rollback_pod(RollbackPodRequest {
                     pod: pod.clone(),
@@ -202,7 +212,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             print_pod(&p);
         }
         Cmd::Snapshots { pod } => {
-            let l = connect(cli.socket.clone(), cli.remote.clone())
+            let l = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .list_snapshots(PodRef { name: pod })
                 .await?
@@ -219,7 +229,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
                 println!("aborted");
                 return Ok(());
             }
-            connect(cli.socket.clone(), cli.remote.clone())
+            connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .delete_snapshot(SnapshotRef {
                     pod,
@@ -259,7 +269,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             stop_timeout,
         } => {
             // Missing flags = keep current values → fetch them first.
-            let mut c = connect(cli.socket.clone(), cli.remote.clone()).await?;
+            let mut c = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone()).await?;
             let cur = c
                 .list_pods(ListPodsRequest {})
                 .await?
@@ -367,7 +377,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             print_pod(&p);
         }
         Cmd::Reload { name } => {
-            let p = connect(cli.socket.clone(), cli.remote.clone())
+            let p = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .reload_pod_config(PodRef { name })
                 .await?

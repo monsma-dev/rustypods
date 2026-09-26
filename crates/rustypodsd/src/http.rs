@@ -632,18 +632,25 @@ async fn remove_volume(
 
 // --- Multi-host mesh (Wave I/J) ---
 
-/// `POST /v1/mesh/init?listen_port=N` — empty body, port optional.
+/// `POST /v1/mesh/init?listen_port=N&token=…` — empty body, both optional.
 #[derive(Deserialize, Default)]
 struct MeshInitIn {
     #[serde(default)]
     listen_port: u32,
+    #[serde(default)]
+    token: String,
 }
 
 async fn mesh_status_http(State(s): State<Svc>) -> Result<Json<MeshStatus>, ApiErr> {
-    s.get_mesh_status(Request::new(Empty {}))
+    let mut st = s
+        .get_mesh_status(Request::new(Empty {}))
         .await
-        .map(|r| Json(r.into_inner()))
-        .map_err(api_err)
+        .map(|r| r.into_inner())
+        .map_err(api_err)?;
+    // The cluster token unlocks the full PodControl API on every peer —
+    // it must never ride the (possibly read-only) REST channel.
+    st.cluster_token.clear();
+    Ok(Json(st))
 }
 
 async fn mesh_init_http(
@@ -652,6 +659,7 @@ async fn mesh_init_http(
 ) -> Result<Json<MeshStatus>, ApiErr> {
     s.mesh_init(Request::new(MeshInitRequest {
         listen_port: q.listen_port,
+        token: q.token,
     }))
     .await
     .map(|r| Json(r.into_inner()))
@@ -670,6 +678,8 @@ async fn mesh_deinit_http(State(s): State<Svc>) -> Result<Json<MeshStatus>, ApiE
 struct MeshPeerIn {
     endpoint: String,
     pubkey: String,
+    #[serde(default)]
+    name: String,
 }
 
 async fn mesh_add_peer_http(
@@ -679,6 +689,7 @@ async fn mesh_add_peer_http(
     s.mesh_add_peer(Request::new(MeshPeer {
         endpoint: b.endpoint,
         pubkey: b.pubkey,
+        name: b.name,
     }))
     .await
     .map(|r| Json(r.into_inner()))
@@ -694,6 +705,7 @@ async fn mesh_rm_peer_http(
     s.mesh_remove_peer(Request::new(MeshPeer {
         endpoint: String::new(),
         pubkey,
+        name: String::new(),
     }))
     .await
     .map(|r| Json(r.into_inner()))

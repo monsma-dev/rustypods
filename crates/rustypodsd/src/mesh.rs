@@ -31,6 +31,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -470,8 +471,62 @@ impl Mesh {
         Ok(mesh)
     }
 
+    /// Cluster-admin credential used by mesh-RPC and authenticated gossip.
+    pub async fn cluster_token(&self) -> String {
+        self.conf.lock().await.cluster_token.clone()
+    }
+
+    /// Older mesh.conf files have no token. Mint and persist one exactly once
+    /// when the cluster-plane listener first starts.
+    pub async fn ensure_cluster_token(&self) -> Result<String> {
+        let mut conf = self.conf.lock().await;
+        if conf.cluster_token.is_empty() {
+            let mut raw = [0u8; 32];
+            rand_core::OsRng.fill_bytes(&mut raw);
+            conf.cluster_token = raw.iter().map(|b| format!("{b:02x}")).collect();
+            crate::state::save_mesh(&self.data_dir, &conf)?;
+        }
+        Ok(conf.cluster_token.clone())
+    }
+
+    /// Resolve an operator selector to a peer daemon's fd…::1 address.
+    /// Accepted forms: alias, pubkey, /48 prefix, or host address.
+    pub async fn resolve_peer(&self, selector: &str) -> Option<(String, Ipv6Addr)> {
+        let selector = selector.trim().trim_matches(['[', ']']);
+        let conf = self.conf.lock().await;
+        let mut found = None;
+        for peer in &conf.peers {
+            let prefix = prefix_of(&peer.pubkey).ok()?;
+            let addr = host_addr(prefix);
+            let prefix_text = format!("{prefix}/48");
+            let name = peer.name.as_deref().unwrap_or_default();
+            if name == selector
+                || peer.pubkey == selector
+                || prefix.to_string() == selector
+                || prefix_text == selector
+                || addr.to_string() == selector
+            {
+                if found.is_some() {
+                    return None;
+                }
+                let display = if name.is_empty() {
+                    addr.to_string()
+                } else {
+                    name.to_string()
+                };
+                found = Some((display, addr));
+            }
+        }
+        found
+    }
+
     /// Add/replace a peer live: session, endpoint map, route, conf.
-    pub async fn add_peer(&self, endpoint: &str, pubkey_b64: &str) -> Result<()> {
+    pub async fn add_peer(
+        &self,
+        endpoint: &str,
+        pubkey_b64: &str,
+        name: Option<&str>,
+    ) -> Result<()> {
         let pk = parse_pubkey(pubkey_b64)?;
         let _ep: SocketAddr = canon_ep(
             endpoint
@@ -484,10 +539,26 @@ impl Mesh {
             .try_into()
             .map_err(|_| anyhow::anyhow!("mesh private key must decode to 32 bytes"))?;
         let secret = StaticSecret::from(priv_bytes);
+        let name = name
+            .map(rustypods_proto::validate_name)
+            .transpose()
+            .context("invalid peer name")?
+            .map(str::to_string);
         let pc = MeshPeerConf {
             endpoint: endpoint.to_string(),
             pubkey: pubkey_b64.to_string(),
+            name,
         };
+        if let Some(name) = pc.name.as_deref() {
+            let conf = self.conf.lock().await;
+            if conf
+                .peers
+                .iter()
+                .any(|p| p.pubkey != pubkey_b64 && p.name.as_deref() == Some(name))
+            {
+                anyhow::bail!("mesh peer name '{name}' is already in use");
+            }
+        }
         let idx = { self.peers.lock().await.len() as u32 };
         let (peer, ep) = build_peer(&secret, &pc, idx)?;
         let prefix = peer.prefix;
@@ -576,6 +647,12 @@ impl Mesh {
 
     /// Snapshot for `mesh status` / REST.
     pub async fn status(&self) -> rustypods_proto::rpc::MeshStatus {
+        let conf = self.conf.lock().await.clone();
+        let aliases: HashMap<&str, &str> = conf
+            .peers
+            .iter()
+            .filter_map(|p| p.name.as_deref().map(|name| (p.pubkey.as_str(), name)))
+            .collect();
         let peers = self.peers.lock().await;
         let infos = peers
             .values()
@@ -597,6 +674,12 @@ impl Mesh {
                     handshake_secs_ago: since.map(|d| d.as_secs() as i64).unwrap_or(-1),
                     tx_bytes: tx as u64,
                     rx_bytes: rx as u64,
+                    name: aliases
+                        .get(p.pubkey_b64.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string(),
+                    grpc_addr: host_addr(p.prefix).to_string(),
                 }
             })
             .collect();
@@ -612,6 +695,8 @@ impl Mesh {
             tun_drops: self.tun_drops.load(std::sync::atomic::Ordering::Relaxed),
             names: self.names().await.into_iter().collect(),
             conf_error: String::new(),
+            cluster_token: conf.cluster_token,
+            grpc_addr: self.host_addr.to_string(),
         }
     }
 

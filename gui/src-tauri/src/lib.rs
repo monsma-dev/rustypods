@@ -14,11 +14,8 @@ use serde::Serialize;
 use tauri::{Emitter, State};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Channel;
-
-use rustypods_client::connect;
+use rustypods_client::{connect, Client};
 use rustypods_proto::rpc::exec_chunk::Kind;
-use rustypods_proto::rpc::pod_control_client::PodControlClient;
 use rustypods_proto::rpc::*;
 use rustypods_proto::SOCKET_PATH;
 
@@ -53,12 +50,12 @@ static PTY_SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 async fn call<T, F, Fut>(rt: &tokio::runtime::Runtime, f: F) -> Result<T, String>
 where
-    F: FnOnce(PodControlClient<Channel>) -> Fut + Send + 'static,
+    F: FnOnce(Client) -> Fut + Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send,
     T: Send + 'static,
 {
     rt.spawn(async move {
-        let c = connect(PathBuf::from(SOCKET_PATH), None)
+        let c = connect(PathBuf::from(SOCKET_PATH), None, None)
             .await
             .map_err(|e| format!("{e:#}"))?;
         f(c).await
@@ -162,6 +159,11 @@ async fn update_pod_config(
                 autostart: None, // GUI doesn't manage the boot flag (yet)
                 cmd: None,       // GUI doesn't manage the payload override
                 ingress: None,   // GUI doesn't manage ingress rules (yet)
+                restart: None,
+                healthcheck: None,
+                env: None,
+                volumes: None,
+                stop_timeout_secs: None,
             })
             .await
             .map_err(|e| e.message().to_string())?
@@ -207,6 +209,11 @@ async fn create_pod(
                 autostart: false,
                 cmd: vec![],
                 ingress: vec![], // no ingress UI yet
+                restart: String::new(),
+                healthcheck: None,
+                env: vec![],
+                volumes: vec![],
+                stop_timeout_secs: 0,
             })
             .await
             .map_err(|e| e.message().to_string())?
@@ -275,7 +282,7 @@ async fn watch_metrics<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let pod = name.clone();
     let task = rt.0.spawn(async move {
-        let Ok(mut c) = connect(PathBuf::from(SOCKET_PATH), None).await else {
+        let Ok(mut c) = connect(PathBuf::from(SOCKET_PATH), None, None).await else {
             return;
         };
         let Ok(mut s) = c
@@ -328,7 +335,7 @@ async fn watch_logs<R: tauri::Runtime>(
     let pod = name.clone();
     let ev = format!("log-{pod}");
     let task = rt.0.spawn(async move {
-        let Ok(mut c) = connect(PathBuf::from(SOCKET_PATH), None).await else {
+        let Ok(mut c) = connect(PathBuf::from(SOCKET_PATH), None, None).await else {
             return;
         };
         let Ok(mut s) = c
@@ -407,7 +414,7 @@ async fn open_pty<R: tauri::Runtime>(
     let session_id = PTY_SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let task = rt.0.spawn(async move {
         let setup = async {
-            let mut c = connect(PathBuf::from(SOCKET_PATH), None)
+            let mut c = connect(PathBuf::from(SOCKET_PATH), None, None)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
             c.exec(ReceiverStream::new(rx))

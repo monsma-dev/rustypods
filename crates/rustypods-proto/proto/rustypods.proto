@@ -53,6 +53,14 @@ service PodControl {
   rpc CreateVolume(VolumeRef) returns (VolumeInfo);
   rpc RemoveVolume(VolumeRef) returns (Empty);
 
+  // Cross-host volume copy (cluster plane). `SendVolume` is a unary
+  // call to the LOCAL daemon: resolve the peer, negotiate the payload
+  // format, then stream the volume daemon→daemon to the peer's
+  // mesh-RPC listener. `ReceiveVolume` is that dataplane endpoint —
+  // it is only useful over the mesh (token-gated, peer-guarded).
+  rpc SendVolume(SendVolumeRequest) returns (SendVolumeResult);
+  rpc ReceiveVolume(stream VolumeChunk) returns (ReceiveVolumeResult);
+
   // Pod export/import (Wave H): serialize a pod — rootfs, conf, image
   // conf and every attached named volume — into one portable stream,
   // and reconstruct it on any host. Export streams the archive out;
@@ -284,6 +292,52 @@ message VolumeInfoList {
   repeated VolumeInfo volumes = 1;
 }
 
+// `volume send <name> --to <peer>`: ask the local daemon to push a
+// named volume straight to a peer over the mesh. The CLI is not in
+// the data path — the daemons stream peer-to-peer on :5306.
+message SendVolumeRequest {
+  string volume = 1;
+  // Peer selector: conf name ("s2"), WG pubkey, or fd<peer>::1 addr —
+  // same resolution `mesh status` lists.
+  string peer = 2;
+  // "" = same name on the receiver.
+  string rename = 3;
+  // "" = auto (btrfs send iff BOTH ends run the btrfs driver), "tar"
+  // forces the portable path, "btrfs" refuses unless both qualify.
+  string format = 4;
+  // Overwrite a same-named volume on the peer — the existing tree is
+  // deleted first. Off by default: refusing beats destroying data.
+  bool force = 5;
+}
+
+message SendVolumeResult {
+  string volume = 1;       // name on the receiver
+  string peer = 2;         // resolved peer addr for display
+  uint64 bytes = 3;        // payload bytes pushed
+  string format = 4;       // negotiated: "btrfs" | "tar"
+}
+
+// Dataplane for SendVolume: the SENDING daemon client-streams this to
+// the peer's mesh-RPC PodControl. First frame must be `init`.
+message VolumeChunk {
+  oneof kind {
+    VolumeInit init = 1;
+    bytes data = 2;
+  }
+}
+
+message VolumeInit {
+  string name = 1;         // requested volume name (already validated)
+  string format = 2;       // "tar" | "btrfs" — what `data` frames hold
+  bool force = 3;          // receiver may delete a same-named volume
+}
+
+message ReceiveVolumeResult {
+  string name = 1;
+  string path = 2;
+  uint64 bytes = 3;
+}
+
 // One frame of a pod export archive (header+manifest in the first
 // chunk, then raw btrfs-send/tar payload bytes). The archive format is
 // opaque to the wire — the daemon owns it.
@@ -323,6 +377,10 @@ message ImportOptions {
 // --- Multi-host mesh (Wave I) ---
 message MeshInitRequest {
   uint32 listen_port = 1; // UDP port for WireGuard; 0 = 51820
+  // Shared cluster secret gating the mesh-RPC listener (fd<host>::1:5306).
+  // Set the introducer's token when joining an existing mesh; empty
+  // generates a fresh one on first init.
+  string token = 2;
 }
 
 // Peer identity: a reachable UDP endpoint + its WG pubkey. The peer's
@@ -330,6 +388,7 @@ message MeshInitRequest {
 message MeshPeer {
   string endpoint = 1; // "ip:port" or "[v6]:port"
   string pubkey = 2;   // base64 x25519 (44 chars)
+  string name = 3;     // optional alias used by --host (e.g. "s2")
 }
 
 message MeshPeerInfo {
@@ -339,6 +398,10 @@ message MeshPeerInfo {
   int64 handshake_secs_ago = 4;   // -1 = no handshake yet
   uint64 tx_bytes = 5;
   uint64 rx_bytes = 6;
+  string name = 7;                // conf alias, "" when unset
+  // The peer daemon's gRPC-over-mesh address, e.g. "fd…::1" — dial
+  // http://[addr]:5306 for remote pod ops.
+  string grpc_addr = 8;
 }
 
 message MeshStatus {
@@ -359,6 +422,13 @@ message MeshStatus {
   // Set when conf/mesh.conf exists but failed to parse and the mesh
   // was left down. Empty when the mesh is up or simply uninitialized.
   string conf_error = 11;
+  // Shared secret gating [fd<host>::1]:5306 — shown so the operator can
+  // copy it to `mesh init --token` on a joining host. UDS-gated, same
+  // trust level as the pubkey output.
+  string cluster_token = 12;
+  // This host's own mesh gRPC addr ("fd<host>::1") — dial
+  // http://[addr]:5306 from any mesh peer.
+  string grpc_addr = 13;
 }
 
 message ListPodsRequest {}

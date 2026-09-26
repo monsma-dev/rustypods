@@ -38,11 +38,13 @@ impl super::super::Svc {
     /// Shared mesh-deinit body: cancel pump, delete rp-mesh0, strip pod
     /// /128s, remove conf/mesh.conf. Idempotent.
     pub(crate) async fn mesh_down(&self) -> Result<MeshStatus, Status> {
+        let _lc = self.mesh_lifecycle.lock().await;
         let m = self
             .mesh
             .write()
             .map_err(|e| int(anyhow::anyhow!("{e}")))?
             .take();
+        self.stop_mesh_rpc().await;
         if let Some(m) = m {
             self.remove_mesh_addrs(m.prefix).await;
             m.shutdown().await;
@@ -60,7 +62,14 @@ impl super::super::Svc {
         self.mesh().map(|m| m.prefix)
     }
     /// Shared mesh-init body for the gRPC handler and REST facade.
-    pub(crate) async fn mesh_up(&self, listen_port: u32) -> Result<MeshStatus, Status> {
+    /// `token` adopts the introducer's cluster secret when joining an
+    /// existing mesh; empty/absent keeps or generates our own.
+    pub(crate) async fn mesh_up(
+        &self,
+        listen_port: u32,
+        token: &str,
+    ) -> Result<MeshStatus, Status> {
+        let _lc = self.mesh_lifecycle.lock().await;
         if let Some(m) = self.mesh() {
             return Ok(m.status().await);
         }
@@ -75,6 +84,23 @@ impl super::super::Svc {
         if conf.private_key.is_empty() {
             let (priv_, _pub) = mesh::keygen();
             conf.private_key = priv_;
+        }
+        if !token.is_empty() {
+            if !conf.cluster_token.is_empty() && conf.cluster_token != token {
+                return Err(Status::failed_precondition(
+                    "cluster token already set — refusing to rotate implicitly \
+                     (edit conf/mesh.conf by hand if you really mean it)",
+                ));
+            }
+            conf.cluster_token = token.to_string();
+        }
+        if conf.cluster_token.is_empty() {
+            let mut raw = [0u8; 32];
+            use std::io::Read;
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut raw))
+                .map_err(int)?;
+            conf.cluster_token = raw.iter().map(|b| format!("{b:02x}")).collect();
         }
         if let Some(port) =
             mesh::checked_listen_port(listen_port).map_err(Status::invalid_argument)?
@@ -97,7 +123,130 @@ impl super::super::Svc {
         // Pods already running get their /128 now — mesh init must not
         // require a pod restart to take effect.
         self.assign_mesh_addrs().await;
+        // Cluster plane: peer daemons reach this host's PodControl on
+        // [fd<host>::1]:5306 — token-gated, plus the nft ::1-src guard.
+        self.spawn_mesh_rpc().await;
         Ok(status)
+    }
+
+    /// TCP port the mesh-RPC listener serves on.
+    pub(crate) const MESH_RPC_PORT: u16 = 5306;
+
+    /// Start the cluster-plane listener on [fd<host>::1]:5306 if the
+    /// mesh is up and it isn't already. Every request must carry the
+    /// `x-cluster-token` metadata matching conf/mesh.conf — the nft
+    /// guard narrows sources to peer daemon addrs but a pod on a peer
+    /// can forge an ::1 source, so the token is the real gate.
+    pub(crate) async fn spawn_mesh_rpc(&self) {
+        {
+            // A dead task must not block a respawn forever — clear a
+            // finished handle so deinit→init (or a crashed listener) can
+            // recover the cluster plane.
+            let mut guard = match self.mesh_rpc_stop.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            match guard.as_ref() {
+                Some((_, h)) if !h.is_finished() => return,
+                _ => *guard = None,
+            }
+        }
+        let Some(m) = self.mesh() else { return };
+        let token = match m.ensure_cluster_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("cluster token init failed — mesh-RPC listener off: {e:#}");
+                return;
+            }
+        };
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let svc = self.clone();
+        let handle = tokio::spawn(async move {
+            // Bind inside the task with a short retry — a just-stopped
+            // listener may still be draining in-flight streams.
+            let mut listener = None;
+            for _ in 0..12 {
+                match tokio::net::TcpListener::bind((m.host_addr, Self::MESH_RPC_PORT)).await {
+                    Ok(l) => {
+                        listener = Some(l);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "mesh-RPC bind [{}]:{} failed: {e}",
+                            m.host_addr,
+                            Self::MESH_RPC_PORT
+                        );
+                        return;
+                    }
+                }
+            }
+            let Some(listener) = listener else {
+                tracing::error!(
+                    "mesh-RPC bind [{}]:{} still in use after retries — listener off",
+                    m.host_addr,
+                    Self::MESH_RPC_PORT
+                );
+                return;
+            };
+            tracing::info!(
+                "mesh-RPC listening on [{}]:{}",
+                m.host_addr,
+                Self::MESH_RPC_PORT
+            );
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let mut rx = rx;
+            let res = Server::builder()
+                .concurrency_limit_per_connection(32)
+                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256))
+                .add_service(PodControlServer::with_interceptor(
+                    svc,
+                    move |req: Request<()>| {
+                        let ok = req
+                            .metadata()
+                            .get("x-cluster-token")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| v == token)
+                            .unwrap_or(false);
+                        if ok {
+                            Ok(req)
+                        } else {
+                            Err(Status::unauthenticated("missing/invalid x-cluster-token"))
+                        }
+                    },
+                ))
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = rx.changed().await;
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::error!("mesh-RPC server exited: {e:#}");
+            }
+        });
+        {
+            let mut guard = match self.mesh_rpc_stop.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            *guard = Some((tx, handle));
+        }
+    }
+
+    /// Stop the mesh-RPC listener (mesh deinit / daemon shutdown) and
+    /// wait briefly for the port to release so a following `init` can
+    /// rebind immediately.
+    pub(crate) async fn stop_mesh_rpc(&self) {
+        let tup = match self.mesh_rpc_stop.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        if let Some((tx, h)) = tup {
+            let _ = tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+        }
     }
     /// `mesh deinit` counterpart: strip every pod's mesh /128. Best-
     /// effort per pod — a pod mid-stop just logs and moves on.

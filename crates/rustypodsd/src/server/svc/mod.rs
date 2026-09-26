@@ -1,3 +1,4 @@
+mod cluster;
 mod exec;
 mod ingress;
 mod lifecycle;

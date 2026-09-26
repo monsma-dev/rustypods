@@ -960,6 +960,47 @@ pub(crate) fn ensure_mesh_input(wg_port: u16) {
     }
 }
 
+/// Mesh-RPC guard (cluster placement): the daemon serves PodControl on
+/// [fd<host>::1]:5306 for peer hosts. WireGuard cryptokey routing already
+/// proves a packet came through a peer's session, but a pod on a peer can
+/// forge src fd<peer>::1 (it's inside that peer's /48 AllowedIPs) — so we
+/// ALSO restrict :5306 to the exact peer daemon addrs, and the gRPC layer
+/// still requires the cluster token. One atomic table, rebuilt on every
+/// peer add/remove.
+#[expect(dead_code, reason = "RP-003 wires this guard in the P1 security phase")]
+pub(crate) fn ensure_mesh_rpc_guard(peer_addrs: &[Ipv6Addr]) -> Result<()> {
+    // Positive-accept + drop-all: the listener must be reachable ONLY
+    // from a peer host addr over the tunnel — not via `lo` (local
+    // users), not via any LAN iface that happens to route the ULA.
+    let accept_rule = if peer_addrs.is_empty() {
+        String::new()
+    } else {
+        let set = peer_addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("    iifname \"rp-mesh*\" ip6 saddr {{ {set} }} tcp dport 5306 accept\n")
+    };
+    let script = format!(
+        "add table inet rustypods-mesh-rpc\ndelete table inet rustypods-mesh-rpc\n\
+         table inet rustypods-mesh-rpc {{\n\
+         \x20 chain input {{\n\
+         \x20   type filter hook input priority -5; policy accept;\n\
+         {accept_rule}\
+         \x20   tcp dport 5306 drop\n\
+         \x20 }}\n\
+         }}\n"
+    );
+    nft_apply(&script)
+}
+
+/// Remove the mesh-RPC guard table (mesh deinit / teardown-net).
+#[expect(dead_code, reason = "RP-003 wires this guard in the P1 security phase")]
+pub(crate) fn remove_mesh_rpc_guard() {
+    let _ = nft_apply("delete table inet rustypods-mesh-rpc\n");
+}
+
 /// Host-veth name prefix. Standalone nspawn veths and stack uplinks both
 /// use it, so one wildcard covers pod egress and pod↔pod forwarding.
 pub const POD_VETH_PREFIX: &str = "ve-";
@@ -1331,6 +1372,7 @@ pub fn teardown_all() -> Result<()> {
         ("ip", "rustypods"),
         ("ip6", "rustypods6"),
         ("inet", "rustypods"),
+        ("inet", "rustypods-mesh-rpc"),
     ] {
         let _ = run("nft", &["delete", "table", fam, name]);
     }

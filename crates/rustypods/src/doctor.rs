@@ -420,7 +420,9 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     }
 
     let mut daemon_up = false;
-    match rustypods_client::connect_timeout(socket.clone(), None, Duration::from_secs(2)).await {
+    match rustypods_client::connect_timeout(socket.clone(), None, None, Duration::from_secs(2))
+        .await
+    {
         Ok(mut c) => match c.ping(rustypods_proto::rpc::PingRequest {}).await {
             Ok(i) => {
                 let i = i.into_inner();

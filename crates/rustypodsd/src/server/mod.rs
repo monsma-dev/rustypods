@@ -33,8 +33,17 @@ use svc::transfer::import_distrobox;
 /// (generation, routes) last committed to the ingress gateway.
 type IngressPush = (u64, Vec<ActiveIngressRoute>);
 
-#[derive(Clone)]
+/// Cluster-plane listener state: stop signal + task handle.
+type MeshRpcStop = Arc<
+    std::sync::Mutex<
+        Option<(
+            tokio::sync::watch::Sender<bool>,
+            tokio::task::JoinHandle<()>,
+        )>,
+    >,
+>;
 
+#[derive(Clone)]
 pub struct Svc {
     cfg: Config,
     st: Arc<Mutex<State>>,
@@ -80,6 +89,13 @@ pub struct Svc {
     /// up, back to None after `mesh deinit`. std RwLock — mesh_prefix
     /// feeds the sync to_pod path, so a tokio lock won't do.
     mesh: Arc<std::sync::RwLock<Option<Arc<mesh::Mesh>>>>,
+    /// The cluster-plane listener's stop signal + task handle — the
+    /// handle lets `stop` wait for the port to free up and lets `spawn`
+    /// respawn if the task died.
+    mesh_rpc_stop: MeshRpcStop,
+    /// Serializes mesh_up vs mesh_down — a racing pair could otherwise
+    /// delete a fresh conf or have the old teardown kill the new TUN.
+    mesh_lifecycle: Arc<Mutex<()>>,
     /// In-memory mirror of `PodMeta.stopped_by_user`, set before the conf
     /// write so a racing supervisor tick cannot restart a pod mid-stop.
     /// The conf is the source of truth across daemon restarts.
@@ -1103,8 +1119,9 @@ impl PodControl for Svc {
         &self,
         req: Request<MeshInitRequest>,
     ) -> Result<Response<MeshStatus>, Status> {
+        let req = req.into_inner();
         Ok(Response::new(
-            self.mesh_up(req.into_inner().listen_port).await?,
+            self.mesh_up(req.listen_port, &req.token).await?,
         ))
     }
 
@@ -1132,7 +1149,10 @@ impl PodControl for Svc {
                 "mesh not initialized — run `rustypods mesh init` first",
             ));
         };
-        m.add_peer(&p.endpoint, &p.pubkey).await.map_err(bad)?;
+        let name = (!p.name.is_empty()).then_some(p.name.as_str());
+        m.add_peer(&p.endpoint, &p.pubkey, name)
+            .await
+            .map_err(bad)?;
         Ok(Response::new(m.status().await))
     }
 
@@ -2334,6 +2354,26 @@ impl PodControl for Svc {
         Ok(Response::new(Empty {}))
     }
 
+    /// `volume send <name> --to <peer>` — daemon→daemon push over the
+    /// mesh (cluster plane). The heavy lifting lives in svc/cluster.rs.
+    async fn send_volume(
+        &self,
+        req: Request<SendVolumeRequest>,
+    ) -> Result<Response<SendVolumeResult>, Status> {
+        Svc::send_volume(self, req).await
+    }
+
+    /// Dataplane endpoint for `send_volume` on the RECEIVING side.
+    /// Only reachable over the mesh-RPC listener (token + peer guard)
+    /// in real deployments; on UDS it works too, for tests.
+    async fn receive_volume(
+        &self,
+        req: Request<tonic::Streaming<VolumeChunk>>,
+    ) -> Result<Response<ReceiveVolumeResult>, Status> {
+        let res = self.receive_volume(req.into_inner()).await?;
+        Ok(Response::new(res))
+    }
+
     type ExportPodStream = ReceiverStream<Result<ExportChunk, Status>>;
 
     async fn export_pod(
@@ -2908,6 +2948,8 @@ impl Svc {
             health: Default::default(),
             stop_intent: Default::default(),
             mesh: Default::default(),
+            mesh_rpc_stop: Arc::new(std::sync::Mutex::new(None)),
+            mesh_lifecycle: Default::default(),
             inflight: Inflight::new(),
         }
     }
@@ -3034,6 +3076,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         health: Default::default(),
         stop_intent: Default::default(),
         mesh: Default::default(),
+        mesh_rpc_stop: Arc::new(std::sync::Mutex::new(None)),
+        mesh_lifecycle: Default::default(),
     };
 
     // Restore unless-stopped intent from conf so the in-memory set matches
@@ -3111,6 +3155,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
                     }
                 }
                 svc.assign_mesh_addrs().await;
+                // Cluster plane on [fd<host>::1]:5306 — peers dial this
+                // for `--host` calls; token + nft guard inside.
+                svc.spawn_mesh_rpc().await;
             }
             Err(e) => tracing::error!("mesh start failed (mesh disabled): {e:#}"),
         },
@@ -3908,6 +3955,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(log.lock().await.as_slice(), ["stop"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn receive_volume_tar_lands_and_registers() {
+        use rustypods_proto::rpc::volume_chunk::Kind as VolKind;
+        let dir = std::env::temp_dir().join(format!("rp-vrecv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut svc = Svc::stub(dir.clone());
+        // A real directory driver — NopStore never makes the dst tree.
+        svc.storage = crate::storage::detect(&dir);
+        assert_eq!(svc.storage.name(), "reflink-copy");
+
+        // tar of `hello-vol/hello.txt` — the stream a peer would send.
+        let mut tarbuf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tarbuf);
+            let mut h = tar::Header::new_gnu();
+            let data = b"cluster-data";
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "hello-vol/hello.txt", &data[..])
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let chunks: Vec<Result<VolumeChunk, Status>> = vec![
+            Ok(VolumeChunk {
+                kind: Some(VolKind::Init(VolumeInit {
+                    name: "hello-vol".into(),
+                    format: "tar".into(),
+                    force: false,
+                })),
+            }),
+            Ok(VolumeChunk {
+                kind: Some(VolKind::Data(tarbuf)),
+            }),
+        ];
+        let res = svc
+            .receive_volume(tokio_stream::iter(chunks))
+            .await
+            .expect("receive_volume failed");
+        assert_eq!(res.name, "hello-vol");
+        let landed = proto::volumes_dir(&dir).join("hello-vol/hello.txt");
+        assert_eq!(std::fs::read(&landed).unwrap(), b"cluster-data");
+        assert!(svc.st.lock().await.volumes.contains_key("hello-vol"));
+        // A second send without force must refuse, not overwrite.
+        let chunks2: Vec<Result<VolumeChunk, Status>> = vec![Ok(VolumeChunk {
+            kind: Some(VolKind::Init(VolumeInit {
+                name: "hello-vol".into(),
+                format: "tar".into(),
+                force: false,
+            })),
+        })];
+        let err = svc
+            .receive_volume(tokio_stream::iter(chunks2))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_stack_rejects_placement_key() {
+        let dir = std::env::temp_dir().join(format!("rp-stackpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("images/img")).unwrap();
+        let svc = Svc::stub(dir.clone());
+        let toml = br#"name = "shop"
+[pods.web]
+image = "img"
+placement = "s2"
+"#
+        .to_vec();
+        let err = svc
+            .apply_stack_work(Request::new(ApplyStackRequest { toml }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("placement"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -399,6 +399,54 @@ fn tar_path_stays_inside(raw: &[u8]) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
+/// Every entry's first path component must equal `name` — the cluster
+/// receive path trusts the peer daemon, but a buggy or hand-rolled
+/// sender could ship entries that spill into a *different* volume.
+/// Checks the raw bytes (pre-`unpack_in`) so nothing is written before
+/// the whole archive passes.
+pub fn tar_entries_under<R: Read>(reader: R, name: &str) -> Result<()> {
+    let mut ar = tar::Archive::new(reader);
+    for ent in ar.entries()? {
+        let ent = ent?;
+        let raw = ent.path_bytes();
+        let s = String::from_utf8_lossy(&raw);
+        let first = Path::new(s.as_ref())
+            .components()
+            .next()
+            .and_then(|c| match c {
+                std::path::Component::Normal(o) => Some(o.to_string_lossy().into_owned()),
+                _ => None,
+            });
+        if first.as_deref() != Some(name) {
+            anyhow::bail!("tar entry {s} escapes the target volume {name} — refusing receive");
+        }
+    }
+    Ok(())
+}
+
+/// HMAC-SHA256 — used to authenticate mesh gossip frames with the
+/// cluster token (no extra crate for two pads and two hashes).
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    const B: usize = 64;
+    let mut k = [0u8; B];
+    if key.len() > B {
+        k[..32].copy_from_slice(&sha2::Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let xor = |p: u8| -> Vec<u8> { k.iter().map(|b| b ^ p).collect() };
+    let inner = sha2::Sha256::new()
+        .chain_update(xor(0x36))
+        .chain_update(msg)
+        .finalize();
+    sha2::Sha256::new()
+        .chain_update(xor(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
 /// What [`sanitize_import`] removed or forced. Printed by the CLI and
 /// returned on the import response.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -520,6 +568,8 @@ fn rand_suffix() -> String {
 pub fn is_staging_dir_name(name: &str) -> bool {
     name.strip_prefix(".import-")
         .or_else(|| name.strip_prefix(".export-"))
+        .or_else(|| name.strip_prefix(".vsend-"))
+        .or_else(|| name.strip_prefix(".vrecv-"))
         .is_some_and(|rest| !rest.is_empty())
 }
 
@@ -936,6 +986,8 @@ argv = ["/bin/true"]
         assert_ne!(a, b);
         assert!(is_staging_dir_name(&a));
         assert!(is_staging_dir_name(".export-1"));
+        assert!(is_staging_dir_name(".vsend-abc"));
+        assert!(is_staging_dir_name(".vrecv-xyz"));
         assert!(!is_staging_dir_name(".import-"));
         assert!(!is_staging_dir_name("pods"));
         assert!(!is_staging_dir_name(".import"));
@@ -985,5 +1037,37 @@ argv = ["/bin/true"]
         let mut c = Cursor::new(vec![1u8, 2, 3, 4, 5]);
         let b = read_capped(&mut c, 3);
         assert_eq!(b, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        // RFC 4231 test case 2: key="Jefe", msg="what do ya want for nothing?"
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn tar_entries_under_rejects_foreign_paths() {
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append(&h.clone(), std::io::empty()).ok();
+            b.append_data(&mut h.clone(), "vol/ok.txt", std::io::empty())
+                .unwrap();
+            b.append_data(&mut h, "other/evil.txt", std::io::empty())
+                .unwrap();
+            b.finish().unwrap();
+        }
+        assert!(tar_entries_under(&buf[..], "vol").is_err());
+        assert!(tar_entries_under(&buf[..], "other").is_err()); // vol/ comes first
     }
 }

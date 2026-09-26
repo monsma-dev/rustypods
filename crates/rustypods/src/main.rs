@@ -35,6 +35,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     remote: Option<String>,
 
+    /// Manage a configured mesh peer directly over the encrypted cluster plane.
+    /// Accepts the peer name, pubkey, /48 prefix, or fd…::1 address.
+    #[arg(long, global = true, conflicts_with = "remote")]
+    host: Option<String>,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -415,6 +420,10 @@ enum MeshCmd {
         /// UDP port WireGuard listens on (default 51820).
         #[arg(long, default_value_t = 51820)]
         port: u32,
+        /// Shared cluster token from the introducing host. Empty on the
+        /// first host generates a new token.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Show mesh state: pubkey, listen addr, /48, per-peer handshakes.
     Status,
@@ -425,6 +434,9 @@ enum MeshCmd {
         endpoint: String,
         /// Peer's base64 WG pubkey (its `mesh init` output).
         pubkey: String,
+        /// Optional stable alias used by `rustypods --host <name> …`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Remove a peer by its pubkey.
     RmPeer {
@@ -479,6 +491,22 @@ enum VolumeCmd {
     /// Delete a volume's data (refused while any pod still mounts it).
     #[command(visible_alias = "remove")]
     Rm { name: String },
+    /// Copy a named volume daemon-to-daemon over the encrypted mesh.
+    Send {
+        name: String,
+        /// Target peer name, pubkey, prefix, or fd…::1 address.
+        #[arg(long)]
+        to: String,
+        /// Store under a different name on the receiver.
+        #[arg(long)]
+        rename_as: Option<String>,
+        /// Transfer format; auto uses btrfs only when both hosts support it.
+        #[arg(long, value_parser = ["tar", "btrfs"])]
+        format: Option<String>,
+        /// Replace an existing unmounted volume on the receiver.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -545,8 +573,7 @@ pub(crate) fn limits_proto(
 /// leader pid, a host pty gives job control, the remote exit code comes back
 /// exactly. Raw mode + SIGWINCH forwarding on this side.
 pub(crate) async fn shell_exec(
-    sock: PathBuf,
-    remote: Option<String>,
+    cli: &Cli,
     name: String,
     user: Option<String>,
     workdir: Option<String>,
@@ -588,7 +615,7 @@ pub(crate) async fn shell_exec(
         })),
     })
     .await?;
-    let mut c = connect(sock, remote).await?;
+    let mut c = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone()).await?;
     let mut inbound = c.exec(ReceiverStream::new(rx)).await?.into_inner();
 
     // Raw mode so the remote pty gets every keystroke unprocessed.
@@ -680,6 +707,7 @@ pub(crate) fn split_pod_path(s: &str) -> Result<Option<(String, String)>> {
 pub(crate) async fn exec_open(
     sock: &std::path::Path,
     remote: &Option<String>,
+    host: &Option<String>,
     start: ExecStart,
 ) -> Result<(
     tokio::sync::mpsc::Sender<ExecChunk>,
@@ -692,7 +720,7 @@ pub(crate) async fn exec_open(
         kind: Some(Kind::Start(start)),
     })
     .await?;
-    let mut c = connect(sock.to_path_buf(), remote.clone()).await?;
+    let mut c = connect(sock.to_path_buf(), remote.clone(), host.clone()).await?;
     let inbound = c.exec(ReceiverStream::new(rx)).await?.into_inner();
     Ok((tx, inbound))
 }
@@ -732,6 +760,7 @@ pub(crate) fn cp_start(pod: &str, user: &str, argv: Vec<String>) -> ExecStart {
 pub(crate) async fn pod_is_dir(
     sock: &std::path::Path,
     remote: &Option<String>,
+    host: &Option<String>,
     pod: &str,
     user: &str,
     path: &str,
@@ -739,6 +768,7 @@ pub(crate) async fn pod_is_dir(
     let (tx, mut inbound) = exec_open(
         sock,
         remote,
+        host,
         cp_start(
             pod,
             user,
@@ -821,6 +851,7 @@ impl Producer {
 pub(crate) async fn cp_to_pod(
     sock: PathBuf,
     remote: Option<String>,
+    host: Option<String>,
     pod: &str,
     user: &str,
     src: &std::path::Path,
@@ -828,7 +859,7 @@ pub(crate) async fn cp_to_pod(
 ) -> Result<()> {
     let meta = std::fs::metadata(src)
         .with_context(|| format!("{}: no such file or directory", src.display()))?;
-    let dst_is_dir = pod_is_dir(&sock, &remote, pod, user, dst).await?;
+    let dst_is_dir = pod_is_dir(&sock, &remote, &host, pod, user, dst).await?;
     let base = src
         .file_name()
         .context("source has no file name")?
@@ -871,7 +902,7 @@ pub(crate) async fn cp_to_pod(
         )
     };
 
-    let (tx, mut inbound) = exec_open(&sock, &remote, cp_start(pod, user, argv)).await?;
+    let (tx, mut inbound) = exec_open(&sock, &remote, &host, cp_start(pod, user, argv)).await?;
     let prod = tokio::spawn(producer.stream(tx));
     let (code, err) = exec_wait(&mut inbound).await?;
     prod.await??;
@@ -884,6 +915,7 @@ pub(crate) async fn cp_to_pod(
 pub(crate) async fn cp_from_pod(
     sock: PathBuf,
     remote: Option<String>,
+    host: Option<String>,
     pod: &str,
     user: &str,
     src: &str,
@@ -893,7 +925,7 @@ pub(crate) async fn cp_from_pod(
     use std::io::Write;
     use tokio::io::AsyncWriteExt;
 
-    let src_is_dir = pod_is_dir(&sock, &remote, pod, user, src).await?;
+    let src_is_dir = pod_is_dir(&sock, &remote, &host, pod, user, src).await?;
     let base = std::path::Path::new(src)
         .file_name()
         .context("source has no file name")?
@@ -910,6 +942,7 @@ pub(crate) async fn cp_from_pod(
         let (tx, mut inbound) = exec_open(
             &sock,
             &remote,
+            &host,
             cp_start(
                 pod,
                 user,
@@ -964,6 +997,7 @@ pub(crate) async fn cp_from_pod(
         let (tx, mut inbound) = exec_open(
             &sock,
             &remote,
+            &host,
             cp_start(pod, user, vec!["cat".into(), src.into()]),
         )
         .await?;
@@ -995,6 +1029,7 @@ pub(crate) async fn cp_from_pod(
 pub(crate) async fn cp_cmd(
     sock: PathBuf,
     remote: Option<String>,
+    host: Option<String>,
     src: String,
     dst: String,
     user: Option<String>,
@@ -1006,10 +1041,10 @@ pub(crate) async fn cp_cmd(
         .unwrap_or_else(|| "root".into());
     match (src_pod, dst_pod) {
         (Some((pod, sp)), None) => {
-            cp_from_pod(sock, remote, &pod, &user, &sp, &PathBuf::from(&dst)).await
+            cp_from_pod(sock, remote, host, &pod, &user, &sp, &PathBuf::from(&dst)).await
         }
         (None, Some((pod, dp))) => {
-            cp_to_pod(sock, remote, &pod, &user, &PathBuf::from(&src), &dp).await
+            cp_to_pod(sock, remote, host, &pod, &user, &PathBuf::from(&src), &dp).await
         }
         (Some(_), Some(_)) => {
             anyhow::bail!("pod-to-pod copy not supported — copy via the host")
@@ -1171,6 +1206,19 @@ pub(crate) fn print_mesh_status(st: &MeshStatus) {
     println!("pubkey:  {}", st.pubkey);
     println!("listen:  {}", st.listen);
     println!("prefix:  {}", st.prefix);
+    if !st.grpc_addr.is_empty() {
+        println!(
+            "rpc:     [{}]:{}",
+            st.grpc_addr,
+            rustypods_client::MESH_RPC_PORT
+        );
+    }
+    if !st.cluster_token.is_empty() {
+        println!(
+            "token:   {}  (share with peer hosts' `mesh init --token`)",
+            st.cluster_token
+        );
+    }
     println!(
         "pump:    ticks={} udp={} tun={} tun_drops={}",
         st.pump_ticks, st.udp_pkts, st.tun_pkts, st.tun_drops
@@ -1188,9 +1236,16 @@ pub(crate) fn print_mesh_status(st: &MeshStatus) {
             format!("handshake {}s ago", p.handshake_secs_ago)
         };
         println!(
-            "peer {} {}  {}  tx={} rx={}",
+            "peer {}{} {}  rpc=[{}]:{}  {}  tx={} rx={}",
+            if p.name.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", p.name)
+            },
             p.endpoint,
             p.prefix,
+            p.grpc_addr,
+            rustypods_client::MESH_RPC_PORT,
             hs,
             fmt_bytes(p.tx_bytes),
             fmt_bytes(p.rx_bytes)
@@ -1340,7 +1395,7 @@ impl Progress {
 
 pub(crate) async fn print_versions(cli: &Cli) -> Result<()> {
     println!("rustypods {}", env!("CARGO_PKG_VERSION"));
-    match connect(cli.socket.clone(), cli.remote.clone()).await {
+    match connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone()).await {
         Ok(mut c) => match c.ping(PingRequest {}).await {
             Ok(info) => println!("rustypodsd {}", info.into_inner().version),
             Err(e) => println!("rustypodsd unreachable ({e})"),
@@ -1404,6 +1459,55 @@ mod tests {
         let cli = Cli::try_parse_from(["rustypods", "-V", "--remote", "user@host"]).unwrap();
         assert!(cli.show_version);
         assert_eq!(cli.remote.as_deref(), Some("user@host"));
+    }
+
+    #[test]
+    fn mesh_host_and_cluster_flags_parse() {
+        let cli = Cli::try_parse_from(["rustypods", "--host", "s2", "ps"]).unwrap();
+        assert_eq!(cli.host.as_deref(), Some("s2"));
+        assert!(matches!(cli.cmd, Some(Cmd::Ps)));
+        assert!(
+            Cli::try_parse_from(["rustypods", "--host", "s2", "--remote", "user@host", "ps",])
+                .is_err()
+        );
+
+        let cli = Cli::try_parse_from(["rustypods", "mesh", "init", "--token", "cluster-secret"])
+            .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Mesh {
+                sub: MeshCmd::Init {
+                    token: Some(ref t),
+                    ..
+                }
+            }) if t == "cluster-secret"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "rustypods",
+            "volume",
+            "send",
+            "dbdata",
+            "--to",
+            "s2",
+            "--rename-as",
+            "dbcopy",
+            "--format",
+            "tar",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Volume {
+                sub: VolumeCmd::Send {
+                    ref name,
+                    ref to,
+                    rename_as: Some(ref rename),
+                    format: Some(ref format),
+                    ..
+                }
+            }) if name == "dbdata" && to == "s2" && rename == "dbcopy" && format == "tar"
+        ));
     }
 
     #[test]

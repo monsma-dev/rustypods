@@ -565,6 +565,11 @@ pub struct MeshConf {
     /// UDP listen port for WireGuard datagrams.
     #[serde(default = "default_mesh_port")]
     pub listen_port: u16,
+    /// Shared secret gating the mesh-RPC listener on fd<host>::1:5306.
+    /// Generated on `mesh init`; joining hosts adopt the introducer's
+    /// token via `mesh init --token`.
+    #[serde(default)]
+    pub cluster_token: String,
     #[serde(default)]
     pub peers: Vec<MeshPeerConf>,
 }
@@ -575,6 +580,9 @@ pub struct MeshPeerConf {
     pub endpoint: String,
     /// base64 x25519 pubkey — also derives the peer's ULA /48.
     pub pubkey: String,
+    /// Optional alias for `--host <name>` resolution.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn default_mesh_port() -> u16 {
@@ -586,6 +594,7 @@ impl std::fmt::Debug for MeshConf {
         f.debug_struct("MeshConf")
             .field("format", &self.format)
             .field("private_key", &"<redacted>")
+            .field("cluster_token", &"<redacted>")
             .field("listen_port", &self.listen_port)
             .field("peers", &self.peers)
             .finish()
@@ -1551,9 +1560,11 @@ mod tests {
             format: CONF_FORMAT,
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             listen_port: 51820,
+            cluster_token: "deadbeef".into(),
             peers: vec![MeshPeerConf {
                 endpoint: "192.0.2.1:51820".into(),
                 pubkey: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=".into(),
+                name: Some("s2".into()),
             }],
         };
         save_mesh(&dir, &conf).unwrap();
@@ -1575,6 +1586,7 @@ mod tests {
         let shown = format!("{:?}", conf);
         assert!(shown.contains("<redacted>"));
         assert!(!shown.contains(&conf.private_key));
+        assert!(!shown.contains(&conf.cluster_token));
         // A truncated file is an error, not "uninitialized".
         std::fs::write(dir.join("conf/mesh.conf"), "private_key = \"abc\n").unwrap();
         let err = load_mesh(&dir).unwrap_err();

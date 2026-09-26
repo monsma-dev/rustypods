@@ -141,8 +141,24 @@ Handy flags: `start --ephemeral` (throwaway run, `-x`) and
 ### Mesh
 
 `rustypods mesh init` creates `conf/mesh.conf` (mode 0600, holds the
-WireGuard private key) and a stable ULA /48. Peers are added with
-`mesh add-peer`. There is no in-band key rotation: `mesh deinit` (or
+WireGuard private key + a generated cluster token) and a stable ULA /48.
+Peers are added with `mesh add-peer <ip:port> <pubkey> [--name s2]`.
+Joining hosts adopt the shared token via `mesh init --token <tok>`
+(`mesh status` on the first host prints it).
+
+With the mesh up, every daemon also serves its PodControl API to peers
+on `[fd<host>::1]:5306` (token-gated, nft source-guarded) — so the CLI
+can drive a peer directly:
+
+```bash
+rustypods --host s2 ps        # list pods on peer s2 — no ssh needed
+rustypods --host s2 shell db  # exec into a pod on the peer
+```
+rustypods volume send dbdata --to s2   # push a named volume daemon→daemon
+                                       # (btrfs send when both ends are
+                                       # btrfs, tar otherwise — rename
+                                       # and --force supported)
+``` There is no in-band key rotation: `mesh deinit` (or
 remove a corrupt `conf/mesh.conf` by hand) on every host, then `mesh
 init` and re-add peers with the new pubkeys. `mesh init` will not
 replace a file it cannot parse — that would mint a new /48 and break
@@ -336,6 +352,43 @@ server in `demo-web` on `127.0.0.1:8080` directly (no DNS, no proxy).
 Host port mappings DNAT to the shared stack IP; two members therefore
 can't publish the same host port (rejected at apply). Re-applying a
 stack.toml is idempotent — confs update, running rootfs stays.
+
+### Mesh placement (multi-host stacks)
+
+A member can pin itself to a mesh peer with `placement`:
+
+```toml
+name = "shop"
+
+[pods.web]
+image = "app-web"
+placement = "s2"            # created on peer s2 over the cluster plane
+
+[pods.db]
+image = "app-db"            # no placement → the daemon you're connected to
+volumes = ["dbdata:/var/lib/mysql"]
+```
+
+One `rustypods apply` fans out: the CLI resolves each `placement`
+through the local mesh (`name`, pubkey, prefix, or `fd…::1` — anything
+`--host` accepts), rewrites the toml per host, and sends each daemon an
+`ApplyStack` holding only its members. Each host's apply is atomic;
+a failure on one host is reported and `apply` can simply be re-run.
+
+Same-host members still share the stack netns and reach each other on
+`127.0.0.1`. Members on **different** hosts each get their own stack
+netns and reach each other by gossip-published mesh name —
+`shop-db.rustypods.local` — not localhost. Host ports and ingress
+publish on the member's own host. Don't combine `placement` with
+`--host` (the placement already implies the target).
+
+Lifecycle on peers is the same flag you already know:
+
+```bash
+rustypods --host s2 stack start shop   # start s2's members
+rustypods stack start shop             # start the local members
+rustypods volume send dbdata --to s2   # seed the db volume beforehand
+```
 
 ## Exec RPC
 

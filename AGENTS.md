@@ -555,6 +555,84 @@ from pods on other hosts. L3, end-to-end encrypted, no NAT.
 - Scope: standalone pods only (stack members share one netns and are
   skipped); IPv6 ULA only — v4 has no place on the mesh.
 
+### Cluster plane: `--host <peer>` (daemon-to-daemon gRPC)
+
+`rustypods --host s2 ps|start|exec …` runs the full PodControl API on a
+peer daemon over the mesh — the placement primitive. Resolution happens
+client-side: the CLI asks the LOCAL daemon's GetMeshStatus for the peer
+registry (matching `name`, pubkey, or `fd<peer>::1`), then dials
+`http://[fd<peer>::1]:5306` over the WG tunnel (h2c — WireGuard already
+encrypts).
+
+- The cluster-plane listener lives on `[fd<host>::1]:5306`, spawned by
+  `mesh_up`/startup-restore and torn down by `mesh_down` (watch channel
+  `svc.mesh_rpc_stop` — Arc-wrapped std Mutex since Svc is Clone).
+- Auth: shared `cluster_token` in conf/mesh.conf (0600), sent as
+  `x-cluster-token` gRPC metadata, enforced by a server interceptor.
+  Generate on the FIRST host (`mesh init` auto-mints when absent);
+  `mesh init --token <tok>` on joiners. `mesh status` prints it — UDS
+  is uid-gated so that's safe. Debug-redacted in MeshConf.
+- Defense in depth: nftables `rustypods-mesh-rpc` input chain drops
+  tcp/5306 from anything but the peers' `fd<peer>::1` addrs (rebuilt on
+  every add/remove-peer and mesh start). nft alone is NOT sufficient —
+  a pod on a peer can spoof `fd<peer>::1` as source (cryptokey routing
+  accepts any src inside the peer /48); the token is the real gate.
+- `--host` and `--remote` are mutually exclusive; `--remote` stays the
+  escape for hosts without mesh.
+- `mesh add-peer --name s2` stores the alias in conf (MeshPeerConf.name
+  + proto MeshPeer.name / MeshPeerInfo.name).
+
+### Volume streaming: `volume send <name> --to <peer>`
+
+Daemon→daemon dataplane on the same channel: `SendVolume` (unary, to
+the LOCAL daemon) resolves the peer, pings it for its storage driver
+(`DaemonInfo.storage_driver`), negotiates the format (btrfs send iff
+BOTH ends run btrfs — our AlmaLinux/XFS fleet always lands on tar),
+then client-streams `VolumeChunk{init,data}` to the peer's
+`ReceiveVolume`. Sender rewrites top-level tar entries to the target
+name (`--transform`), so `--rename-as` works without receiver logic.
+Receiver stages the payload to disk first, only registers the
+VolumeMeta after a clean unpack — a mid-stream abort leaves no
+half-volume. `--force` overwrites a same-named peer volume, refused
+while pods mount it there. This is the primitive the DB backup
+pipeline sits on (snapshot → volume → `send --to`).
+
+### Hardening notes (post-review)
+
+- nft guard on :5306 is positive-accept + drop-all: only `iifname
+  "rp-mesh*" ip6 saddr {peer ::1s}` passes — `lo`, LAN and any
+  non-tunnel ingress are dropped.
+- Gossip frames are HMAC-SHA256-signed with the cluster token
+  (`{"mac","body"}` envelope): a pod on a peer can forge the ::1 source
+  but not the tag. Unsigned frames only pass when this host has no
+  token at all.
+- `/v1/mesh` REST never serializes `cluster_token` (cleared in the
+  handler) — the ro bearer must not become cluster-admin.
+- receive_volume stages to `.vrecv-*` under a byte cap
+  (`import_max_bytes`), asserts every tar entry lives under `<name>/`,
+  re-checks exists+mounted under the `volume:` op lock, and only then
+  deletes the old tree and clones the staged one into place. `.vsend-*`
+  /`.vrecv-*` are swept by the boot-time stale-staging pass.
+- Mesh listener state holds (stop-signal, JoinHandle): stop awaits the
+  task so a following init rebinds cleanly; a dead listener is respawned
+  by the next spawn_mesh_rpc. mesh_up/mesh_down hold `mesh_lifecycle`.
+- Cluster token = full PodControl on every peer (needed for `--host`);
+  it is the cluster-admin credential, same model as kubectl client certs.
+
+### Stack placement: `placement = "<peer>"` in stack.toml
+
+CLI-side fan-out, daemon stays per-host atomic: on `apply` the CLI
+light-parses the toml (`split_stack_by_placement` in cmd/cluster.rs),
+groups members by placement, resolves each through the local mesh
+(via `connect_mesh`), and sends every target a rewritten toml with the
+key stripped — `apply_stack_work` REJECTS any toml still carrying it.
+Semantics shift per member: same host → shared stack netns + 127.0.0.1
+as before; different host → own netns + gossip name
+(`<stack>-<member>.rustypods.local`). Ports/ingress publish on the
+member's host. `--host` + placement is refused (target is implied).
+Partial fan-out failure is per-host reported; `apply` is idempotent —
+just re-run.
+
 ## Mesh-DNS (Wave K)
 
 Cross-host pod-name resolution: `ping db` from a pod on host A finds

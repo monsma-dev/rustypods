@@ -4,10 +4,10 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
     let cmd = cli.cmd.take().unwrap();
     match cmd {
         Cmd::Cp { src, dst, user } => {
-            cp_cmd(cli.socket, cli.remote, src, dst, user).await?;
+            cp_cmd(cli.socket, cli.remote, cli.host, src, dst, user).await?;
         }
         Cmd::Images => {
-            let l = connect(cli.socket.clone(), cli.remote.clone())
+            let l = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .list_images(ListImagesRequest {})
                 .await?
@@ -38,16 +38,20 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
         } => {
             println!("pulling {reference} (this can take a while)...");
             // Pulls routinely outlast the default 30s call bound.
-            let img =
-                rustypods_client::connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                    .await?
-                    .pull_image(PullImageRequest {
-                        reference,
-                        name: name.unwrap_or_default(),
-                        strip_setuid,
-                    })
-                    .await?
-                    .into_inner();
+            let img = rustypods_client::connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                cli.host.clone(),
+                LONG_RPC,
+            )
+            .await?
+            .pull_image(PullImageRequest {
+                reference,
+                name: name.unwrap_or_default(),
+                strip_setuid,
+            })
+            .await?
+            .into_inner();
             println!("image {} → {}", img.name, img.path);
             if !img.entrypoint.is_empty() || !img.cmd.is_empty() {
                 println!(
@@ -72,16 +76,20 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
                 None => current_username()?,
             };
             println!("exporting: {from_distrobox} → {name} (this can take a while)...");
-            let img =
-                rustypods_client::connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC)
-                    .await?
-                    .import_image(ImportImageRequest {
-                        name: name.clone(),
-                        distrobox: from_distrobox,
-                        import_user: user,
-                    })
-                    .await?
-                    .into_inner();
+            let img = rustypods_client::connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                cli.host.clone(),
+                LONG_RPC,
+            )
+            .await?
+            .import_image(ImportImageRequest {
+                name: name.clone(),
+                distrobox: from_distrobox,
+                import_user: user,
+            })
+            .await?
+            .into_inner();
             println!("image {} → {}", img.name, img.path);
         }
         Cmd::Rmi { name } => {
@@ -89,7 +97,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
                 println!("aborted");
                 return Ok(());
             }
-            connect(cli.socket.clone(), cli.remote.clone())
+            connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                 .await?
                 .remove_image(ImageRef { name: name.clone() })
                 .await?;
@@ -101,7 +109,13 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
             format,
             allow_inconsistent,
         } => {
-            let mut c = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?;
+            let mut c = connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                cli.host.clone(),
+                LONG_RPC,
+            )
+            .await?;
             let mut stream = c
                 .export_pod(ExportRequest {
                     name: pod.clone(),
@@ -155,7 +169,13 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
         Cmd::Load { file, name, trust } => {
             // The unary reply only lands after the full upload — the
             // default 30s call timeout would cut big archives mid-send.
-            let mut c = connect_timeout(cli.socket.clone(), cli.remote.clone(), LONG_RPC).await?;
+            let mut c = connect_timeout(
+                cli.socket.clone(),
+                cli.remote.clone(),
+                cli.host.clone(),
+                LONG_RPC,
+            )
+            .await?;
             use rustypods_proto::rpc::import_chunk::Kind;
             // Open before the RPC so a missing file errors locally.
             let mut input: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if file == "-" {

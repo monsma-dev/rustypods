@@ -73,6 +73,12 @@ pub struct StackPod {
     /// Drop forwarded traffic between this member and other pod veths.
     #[serde(default)]
     pub isolated: bool,
+    /// Mesh placement: a peer name/pubkey/prefix from `mesh status`.
+    /// Handled entirely CLI-side — the CLI fans the stack out over the
+    /// cluster plane and sends each daemon a rewritten toml without this
+    /// key. Daemons reject a toml that still carries it.
+    #[serde(default)]
+    pub placement: Option<String>,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.

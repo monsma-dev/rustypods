@@ -16,6 +16,18 @@ impl super::super::Svc {
             })
             .map_err(bad)?
         };
+        // `placement` is resolved CLI-side: the CLI rewrites the toml per
+        // target host and strips the key before ApplyStack. A toml that
+        // still carries it was aimed at the wrong layer — refuse loudly
+        // instead of materialising foreign members on this host.
+        if let Some((member, p)) = def.pods.iter().find(|(_, p)| p.placement.is_some()) {
+            return Err(bad(anyhow::anyhow!(
+                "pods.{member}: placement '{}' must be resolved by the CLI — \
+                 run `rustypods apply` (without --remote/--host) on a \
+                 mesh-connected daemon",
+                p.placement.as_deref().unwrap_or_default()
+            )));
+        }
         // Serialize the whole apply per stack name — two concurrent applies
         // of the same stack could otherwise compute different net indexes
         // and split the members across /30 pairs. The `stack:` prefix keeps

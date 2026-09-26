@@ -2325,6 +2325,7 @@ dependencies = [
  "rustypods-proto",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower",
  "tracing",
