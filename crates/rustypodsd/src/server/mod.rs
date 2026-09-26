@@ -1144,16 +1144,10 @@ impl PodControl for Svc {
 
     async fn mesh_add_peer(&self, req: Request<MeshPeer>) -> Result<Response<MeshStatus>, Status> {
         let p = req.into_inner();
-        let Some(m) = self.mesh() else {
-            return Err(Status::failed_precondition(
-                "mesh not initialized — run `rustypods mesh init` first",
-            ));
-        };
-        let name = (!p.name.is_empty()).then_some(p.name.as_str());
-        m.add_peer(&p.endpoint, &p.pubkey, name)
-            .await
-            .map_err(bad)?;
-        Ok(Response::new(m.status().await))
+        Ok(Response::new(
+            self.apply_mesh_peer(&p.endpoint, &p.pubkey, &p.name)
+                .await?,
+        ))
     }
 
     async fn mesh_remove_peer(
@@ -1161,15 +1155,7 @@ impl PodControl for Svc {
         req: Request<MeshPeer>,
     ) -> Result<Response<MeshStatus>, Status> {
         let p = req.into_inner();
-        let Some(m) = self.mesh() else {
-            return Err(Status::failed_precondition(
-                "mesh not initialized — run `rustypods mesh init` first",
-            ));
-        };
-        if !m.remove_peer(&p.pubkey).await.map_err(bad)? {
-            return Err(Status::not_found("no such mesh peer"));
-        }
-        Ok(Response::new(m.status().await))
+        Ok(Response::new(self.drop_mesh_peer(&p.pubkey).await?))
     }
 
     async fn mesh_deinit(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
@@ -3155,9 +3141,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
                     }
                 }
                 svc.assign_mesh_addrs().await;
-                // Cluster plane on [fd<host>::1]:5306 — peers dial this
-                // for `--host` calls; token + nft guard inside.
-                svc.spawn_mesh_rpc().await;
+                // Kernel drop before the listener. If nft fails, leave
+                // :5306 unbound rather than accept on lo.
+                if let Err(e) = svc.sync_mesh_rpc_guard().await {
+                    tracing::error!("mesh rpc guard failed; cluster listener stays down: {e}");
+                } else {
+                    svc.spawn_mesh_rpc().await;
+                }
             }
             Err(e) => tracing::error!("mesh start failed (mesh disabled): {e:#}"),
         },

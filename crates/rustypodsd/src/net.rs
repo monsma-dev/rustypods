@@ -967,11 +967,11 @@ pub(crate) fn ensure_mesh_input(wg_port: u16) {
 /// ALSO restrict :5306 to the exact peer daemon addrs, and the gRPC layer
 /// still requires the cluster token. One atomic table, rebuilt on every
 /// peer add/remove.
-#[expect(dead_code, reason = "RP-003 wires this guard in the P1 security phase")]
-pub(crate) fn ensure_mesh_rpc_guard(peer_addrs: &[Ipv6Addr]) -> Result<()> {
-    // Positive-accept + drop-all: the listener must be reachable ONLY
-    // from a peer host addr over the tunnel — not via `lo` (local
-    // users), not via any LAN iface that happens to route the ULA.
+///
+/// Positive-accept + drop-all: the listener is reachable only from a
+/// peer host addr on `rp-mesh*`. `lo` and any LAN iface that routes the
+/// ULA hit the drop, including when the peer set is empty.
+pub(crate) fn mesh_rpc_guard_script(peer_addrs: &[Ipv6Addr]) -> String {
     let accept_rule = if peer_addrs.is_empty() {
         String::new()
     } else {
@@ -982,7 +982,7 @@ pub(crate) fn ensure_mesh_rpc_guard(peer_addrs: &[Ipv6Addr]) -> Result<()> {
             .join(", ");
         format!("    iifname \"rp-mesh*\" ip6 saddr {{ {set} }} tcp dport 5306 accept\n")
     };
-    let script = format!(
+    format!(
         "add table inet rustypods-mesh-rpc\ndelete table inet rustypods-mesh-rpc\n\
          table inet rustypods-mesh-rpc {{\n\
          \x20 chain input {{\n\
@@ -991,14 +991,17 @@ pub(crate) fn ensure_mesh_rpc_guard(peer_addrs: &[Ipv6Addr]) -> Result<()> {
          \x20   tcp dport 5306 drop\n\
          \x20 }}\n\
          }}\n"
-    );
-    nft_apply(&script)
+    )
 }
 
-/// Remove the mesh-RPC guard table (mesh deinit / teardown-net).
-#[expect(dead_code, reason = "RP-003 wires this guard in the P1 security phase")]
-pub(crate) fn remove_mesh_rpc_guard() {
-    let _ = nft_apply("delete table inet rustypods-mesh-rpc\n");
+pub(crate) fn ensure_mesh_rpc_guard(peer_addrs: &[Ipv6Addr]) -> Result<()> {
+    nft_apply(&mesh_rpc_guard_script(peer_addrs))
+}
+
+/// Drop the mesh-RPC table. `add` then `delete` is idempotent when the
+/// table is already gone (mesh deinit / teardown-net).
+pub(crate) fn remove_mesh_rpc_guard() -> Result<()> {
+    nft_apply("add table inet rustypods-mesh-rpc\ndelete table inet rustypods-mesh-rpc\n")
 }
 
 /// Host-veth name prefix. Standalone nspawn veths and stack uplinks both
@@ -1501,6 +1504,23 @@ mod tests {
             isolated: false,
             allow_setuid: false,
         }
+    }
+
+    #[test]
+    fn mesh_rpc_guard_drops_non_tunnel_including_loopback() {
+        let peer = Ipv6Addr::new(0xfdab, 0x1, 0x2, 0, 0, 0, 0, 1);
+        let script = mesh_rpc_guard_script(&[peer]);
+        assert!(script.contains("iifname \"rp-mesh*\""));
+        assert!(script.contains("fdab:1:2::1"));
+        assert!(script.contains("tcp dport 5306 accept"));
+        assert!(script.contains("tcp dport 5306 drop"));
+        assert!(!script.contains("iifname \"lo\""));
+        // No accept for the empty set: every tcp/5306 packet, including
+        // one that arrives on lo, hits the drop.
+        let empty = mesh_rpc_guard_script(&[]);
+        assert!(!empty.contains("iifname"));
+        assert!(!empty.contains("tcp dport 5306 accept"));
+        assert!(empty.contains("tcp dport 5306 drop"));
     }
 
     fn running(names: &[&str]) -> std::collections::BTreeSet<String> {

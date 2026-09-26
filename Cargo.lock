@@ -2410,6 +2410,7 @@ dependencies = [
  "boringtun",
  "clap",
  "flate2",
+ "hmac",
  "http",
  "hyper",
  "hyper-util",

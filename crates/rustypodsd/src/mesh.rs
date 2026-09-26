@@ -31,6 +31,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use hmac::{Hmac, Mac};
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
@@ -601,6 +602,16 @@ impl Mesh {
         Ok(())
     }
 
+    /// `fd<peer>::1` for every live session. The nft guard accepts only
+    /// these sources; duplicates collapse so the set stays stable.
+    pub(crate) async fn peer_host_addrs(&self) -> Vec<Ipv6Addr> {
+        let peers = self.peers.lock().await;
+        let mut addrs: Vec<Ipv6Addr> = peers.values().map(|p| host_addr(p.prefix)).collect();
+        addrs.sort();
+        addrs.dedup();
+        addrs
+    }
+
     /// Remove a peer: session, endpoint map, route, conf.
     pub async fn remove_peer(&self, pubkey_b64: &str) -> Result<bool> {
         let pk = parse_pubkey(pubkey_b64)?;
@@ -972,25 +983,33 @@ impl Mesh {
         out
     }
 
-    /// Push the local registry to every peer: JSON over the tunnel to
-    /// fd<peer>::1:5305. Full-state (not delta) — replace semantics
-    /// heal missed updates and pod removals.
+    /// Push the local registry to every peer: an HMAC-signed JSON frame
+    /// over the tunnel to fd<peer>::1:5305. Full-state (not delta) —
+    /// replace semantics heal missed updates and pod removals. The
+    /// cluster token is cloned before the peer lock so signing never
+    /// holds the conf lock across the UDP send.
     async fn send_announces(&self) {
         let names = self.local_names.lock().await.clone();
-        let body = serde_json::json!({ "names": names }).to_string();
+        let payload = serde_json::json!({ "names": names }).to_string();
+        let token = self.cluster_token().await;
+        let Some(body) = seal_gossip(&token, &payload) else {
+            tracing::debug!("mesh gossip: not sending (no cluster token)");
+            return;
+        };
         let peers = self.peers.lock().await;
         for p in peers.values() {
             let dst = SocketAddr::new(IpAddr::V6(host_addr(p.prefix)), GOSSIP_PORT);
-            if let Err(e) = self.gossip.send_to(body.as_bytes(), dst).await {
+            if let Err(e) = self.gossip.send_to(&body, dst).await {
                 tracing::debug!("mesh gossip → {dst}: {e}");
             }
         }
     }
 
-    /// Receive peers' registries. Trust boundary: the datagram arrived
-    /// decapsulated from the tunnel AND src must be exactly that peer's
-    /// fd<peer>::1 — a pod can't forge it (pods use :<idx>::2, and a
-    /// spoofed src still has to be inside a *configured* peer /48).
+    /// Receive peers' registries. Tunnel decapsulation and an exact
+    /// `fd<peer>::1` source are not enough: a pod inside that peer's
+    /// /48 can forge the source. The HMAC (cluster token) binds the
+    /// payload to the cluster. A missing or wrong tag is dropped
+    /// before the registry JSON is parsed.
     async fn gossip_rx(self: Arc<Self>) {
         let mut buf = vec![0u8; 8192];
         let mut shutdown = self.shutdown_tx.subscribe();
@@ -1012,11 +1031,12 @@ impl Mesh {
                         let segs = src6.segments();
                         Ipv6Addr::new(segs[0], segs[1], segs[2], 0, 0, 0, 0, 0)
                     };
-                    #[derive(serde::Deserialize)]
-                    struct Ann {
-                        names: std::collections::BTreeMap<String, Ipv6Addr>,
-                    }
-                    match serde_json::from_slice::<Ann>(&buf[..n]) {
+                    let token = self.cluster_token().await;
+                    let Some(payload) = open_signed_gossip(&token, &buf[..n]) else {
+                        tracing::debug!("mesh gossip: rejected frame from {src}");
+                        continue;
+                    };
+                    match serde_json::from_str::<Ann>(&payload) {
                         Ok(a) => {
                             let names = sanitize_registry(peer_prefix, a.names);
                             self.remote_names
@@ -1314,6 +1334,92 @@ fn dns_answer_aaaa(pkt: &[u8], addr: Ipv6Addr) -> Option<Vec<u8>> {
     out.extend_from_slice(&16u16.to_be_bytes()); // rdlength
     out.extend_from_slice(&addr.octets());
     Some(out)
+}
+
+/// Wire format on UDP 5305. `payload` is the registry JSON; `signature`
+/// is the lowercase hex HMAC-SHA256 of that exact string.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SignedGossip {
+    payload: String,
+    signature: String,
+}
+
+/// Registry body carried inside [`SignedGossip::payload`].
+#[derive(serde::Deserialize)]
+struct Ann {
+    names: NameMap,
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// HMAC-SHA256(cluster_token, payload), lowercase hex. `None` when the
+/// token is missing — gossip stays unsigned-never, not unsigned-ok.
+fn gossip_mac(token: &str, payload: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut mac = HmacSha256::new_from_slice(token.as_bytes()).ok()?;
+    mac.update(payload.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    Some(hex_encode(&tag))
+}
+
+/// Wrap `payload` in a [`SignedGossip`] frame. Fails closed without a token.
+fn seal_gossip(token: &str, payload: &str) -> Option<Vec<u8>> {
+    let signature = gossip_mac(token, payload)?;
+    serde_json::to_vec(&SignedGossip {
+        payload: payload.to_string(),
+        signature,
+    })
+    .ok()
+}
+
+/// Split a frame and check the tag in constant time. The payload string
+/// is returned only after `Mac::verify_slice` succeeds — callers parse
+/// the registry JSON from that string, never from the raw datagram.
+fn open_signed_gossip(token: &str, frame: &[u8]) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let frame: SignedGossip = serde_json::from_slice(frame).ok()?;
+    let sig = hex_decode_32(&frame.signature)?;
+    let mut mac = HmacSha256::new_from_slice(token.as_bytes()).ok()?;
+    mac.update(frame.payload.as_bytes());
+    mac.verify_slice(&sig).ok()?;
+    Some(frame.payload)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// Exactly 32 bytes of lowercase hex. Anything else is a bad tag.
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let raw = s.as_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_val(raw[i * 2])?;
+        let lo = hex_val(raw[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// Registry values must stay inside the announcer's own /48 — never
@@ -1733,5 +1839,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buf[..n], b"x");
+    }
+
+    #[test]
+    fn gossip_frame_verifies_and_rejects_tampering() {
+        let token = "cluster-token";
+        let payload = serde_json::json!({ "names": { "db": "fdab:1:2:3::2" } }).to_string();
+        let frame = seal_gossip(token, &payload).expect("signed frame");
+        assert_eq!(
+            open_signed_gossip(token, &frame).as_deref(),
+            Some(payload.as_str())
+        );
+
+        // Inner registry JSON is only parsed after the tag checks out.
+        let ann: Ann = serde_json::from_str(&open_signed_gossip(token, &frame).unwrap()).unwrap();
+        assert!(ann.names.contains_key("db"));
+
+        let mut tampered: SignedGossip = serde_json::from_slice(&frame).unwrap();
+        tampered.payload.push(' ');
+        let bad_payload = serde_json::to_vec(&tampered).unwrap();
+        assert!(open_signed_gossip(token, &bad_payload).is_none());
+
+        let mut sig = tampered.signature.into_bytes();
+        sig[0] = if sig[0] == b'a' { b'b' } else { b'a' };
+        tampered.payload = payload.clone();
+        tampered.signature = String::from_utf8(sig).unwrap();
+        let bad_sig = serde_json::to_vec(&tampered).unwrap();
+        assert!(open_signed_gossip(token, &bad_sig).is_none());
+
+        // Unsigned registry JSON never reaches the name map.
+        assert!(open_signed_gossip(token, payload.as_bytes()).is_none());
+        assert!(open_signed_gossip("", &frame).is_none());
+        assert!(seal_gossip("", &payload).is_none());
     }
 }

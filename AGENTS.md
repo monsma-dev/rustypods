@@ -603,9 +603,10 @@ pipeline sits on (snapshot → volume → `send --to`).
   "rp-mesh*" ip6 saddr {peer ::1s}` passes — `lo`, LAN and any
   non-tunnel ingress are dropped.
 - Gossip frames are HMAC-SHA256-signed with the cluster token
-  (`{"mac","body"}` envelope): a pod on a peer can forge the ::1 source
-  but not the tag. Unsigned frames only pass when this host has no
-  token at all.
+  (`{"payload","signature"}` envelope, tag checked with
+  `hmac::Mac::verify_slice` before the registry JSON is parsed): a pod
+  on a peer can forge the ::1 source but not the tag. Frames without a
+  valid tag are dropped, including when this host has no token yet.
 - `/v1/mesh` REST never serializes `cluster_token` (cleared in the
   handler) — the ro bearer must not become cluster-admin.
 - receive_volume stages to `.vrecv-*` under a byte cap

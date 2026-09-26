@@ -44,7 +44,14 @@ impl super::super::Svc {
             .write()
             .map_err(|e| int(anyhow::anyhow!("{e}")))?
             .take();
+        // Close the accept socket first, then delete the drop table.
+        // The other order would open :5306 for the whole teardown window.
         self.stop_mesh_rpc().await;
+        match tokio::task::spawn_blocking(net::remove_mesh_rpc_guard).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("mesh rpc guard teardown: {e:#}"),
+            Err(e) => tracing::warn!("mesh rpc guard teardown task: {e}"),
+        }
         if let Some(m) = m {
             self.remove_mesh_addrs(m.prefix).await;
             m.shutdown().await;
@@ -71,6 +78,10 @@ impl super::super::Svc {
     ) -> Result<MeshStatus, Status> {
         let _lc = self.mesh_lifecycle.lock().await;
         if let Some(m) = self.mesh() {
+            // A previous init may have stored the mesh and then failed
+            // the guard. Retry both so :5306 never listens unguarded.
+            self.sync_mesh_rpc_guard().await?;
+            self.spawn_mesh_rpc().await;
             return Ok(m.status().await);
         }
         let mut conf = match state::load_mesh(&self.cfg.data_dir) {
@@ -123,10 +134,59 @@ impl super::super::Svc {
         // Pods already running get their /128 now — mesh init must not
         // require a pod restart to take effect.
         self.assign_mesh_addrs().await;
-        // Cluster plane: peer daemons reach this host's PodControl on
-        // [fd<host>::1]:5306 — token-gated, plus the nft ::1-src guard.
+        // Install the kernel drop before the listener binds, so a local
+        // connect to :5306 cannot land in the accept queue.
+        self.sync_mesh_rpc_guard().await?;
         self.spawn_mesh_rpc().await;
         Ok(status)
+    }
+
+    /// Rebuild `inet rustypods-mesh-rpc` from the live peer set. An empty
+    /// set still installs the drop, which is what closes :5306 on `lo`.
+    pub(crate) async fn sync_mesh_rpc_guard(&self) -> Result<(), Status> {
+        let Some(m) = self.mesh() else {
+            return Ok(());
+        };
+        let addrs = m.peer_host_addrs().await;
+        tokio::task::spawn_blocking(move || net::ensure_mesh_rpc_guard(&addrs))
+            .await
+            .map_err(|e| int(anyhow::anyhow!("mesh rpc guard task: {e}")))?
+            .map_err(int)
+    }
+
+    /// Add a peer, then rebuild the :5306 guard. The nft error is
+    /// returned after the session exists so the operator sees that the
+    /// kernel filter did not catch up.
+    pub(crate) async fn apply_mesh_peer(
+        &self,
+        endpoint: &str,
+        pubkey: &str,
+        name: &str,
+    ) -> Result<MeshStatus, Status> {
+        let Some(m) = self.mesh() else {
+            return Err(Status::failed_precondition(
+                "mesh not initialized — run `rustypods mesh init` first",
+            ));
+        };
+        let alias = (!name.is_empty()).then_some(name);
+        m.add_peer(endpoint, pubkey, alias).await.map_err(bad)?;
+        self.sync_mesh_rpc_guard().await?;
+        Ok(m.status().await)
+    }
+
+    /// Remove a peer, then rebuild the guard so that host's `fd…::1`
+    /// loses its accept. A missing peer does not touch nft.
+    pub(crate) async fn drop_mesh_peer(&self, pubkey: &str) -> Result<MeshStatus, Status> {
+        let Some(m) = self.mesh() else {
+            return Err(Status::failed_precondition(
+                "mesh not initialized — run `rustypods mesh init` first",
+            ));
+        };
+        if !m.remove_peer(pubkey).await.map_err(bad)? {
+            return Err(Status::not_found("no such mesh peer"));
+        }
+        self.sync_mesh_rpc_guard().await?;
+        Ok(m.status().await)
     }
 
     /// TCP port the mesh-RPC listener serves on.
