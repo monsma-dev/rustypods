@@ -12,6 +12,22 @@ pub mod rpc {
 pub const SOCKET_PATH: &str = "/run/rustypods/daemon.sock";
 pub const DATA_DIR: &str = "/var/lib/rustypods";
 
+/// DNS zone the mesh CA may issue. The leaf name is never this apex.
+pub const MESH_NODE_ZONE: &str = "node.mesh.rustypods";
+
+/// DNS SAN bound to a WireGuard public key. The label is the first 15
+/// bytes of SHA-256(trimmed pubkey) as lowercase hex, so it stays inside
+/// a 63-character DNS label and cannot carry the base64 key itself.
+pub fn node_dns(wg_pubkey_b64: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let dig = Sha256::digest(wg_pubkey_b64.trim().as_bytes());
+    let mut label = String::with_capacity(30);
+    for byte in &dig[..15] {
+        label.push_str(&format!("{byte:02x}"));
+    }
+    format!("{label}.{MESH_NODE_ZONE}")
+}
+
 pub fn images_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("images")
 }
@@ -964,5 +980,16 @@ mod tests {
         assert_eq!(fmt_duration(30 * 60), "30m");
         assert_eq!(fmt_duration(45), "45s");
         assert_eq!(fmt_duration(0), "0s");
+    }
+
+    #[test]
+    fn node_dns_is_a_mesh_label() {
+        let name = crate::node_dns("pubkey");
+        let (label, rest) = name.split_once('.').unwrap();
+        assert_eq!(rest, "node.mesh.rustypods");
+        assert_eq!(label.len(), 30);
+        assert!(label.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(name, crate::node_dns(" pubkey "));
+        assert_ne!(name, crate::node_dns("other"));
     }
 }

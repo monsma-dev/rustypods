@@ -10,7 +10,7 @@ description = "RustyPods client — tonic gRPC over UDS or ssh (stdio-bridge, so
 anyhow.workspace = true
 rustypods-proto.workspace = true
 tokio.workspace = true
-tonic.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
 tower.workspace = true
 http.workspace = true
 hyper-util.workspace = true

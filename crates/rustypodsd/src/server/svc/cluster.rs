@@ -1,7 +1,7 @@
 //! Cluster plane: daemon→daemon volume streaming over the mesh.
 //!
 //! `volume send <name> --to <peer>` lands here as `SendVolume`: the
-//! local daemon resolves the peer, opens a token-authenticated gRPC
+//! local daemon resolves the peer, opens an mTLS gRPC
 //! client to `fd<peer>::1:5306`, and pushes the volume as a tar or
 //! btrfs-send stream. The peer's `ReceiveVolume` handler is the other
 //! end. The CLI never touches the payload bytes.
@@ -20,42 +20,36 @@ const CLUSTER_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// crate (it IS the server).
 const MESH_RPC_PORT: u16 = 5306;
 
-/// `x-cluster-token` injector for outbound peer calls.
-#[derive(Clone)]
-struct ClusterAuth(tonic::metadata::MetadataValue<tonic::metadata::Ascii>);
-
-impl tonic::service::Interceptor for ClusterAuth {
-    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
-        req.metadata_mut().insert("x-cluster-token", self.0.clone());
-        Ok(req)
-    }
-}
-
-type ClusterClient = PodControlClient<
-    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, ClusterAuth>,
->;
+type ClusterClient = PodControlClient<tonic::transport::Channel>;
 
 impl super::super::Svc {
-    /// Open a token-authenticated PodControl channel to a peer daemon.
+    /// Open an mTLS PodControl channel to a peer daemon. The server name
+    /// is that peer's WireGuard DNS SAN, not the zone apex.
     async fn cluster_client(&self, peer_addr: Ipv6Addr) -> Result<ClusterClient, Status> {
         let Some(m) = self.mesh() else {
             return Err(Status::failed_precondition(
                 "mesh is not up — `rustypods mesh init` first",
             ));
         };
-        let token = m.cluster_token().await;
-        if token.is_empty() {
-            return Err(Status::failed_precondition(
-                "this mesh has no cluster token — re-run `mesh init` or fix conf/mesh.conf",
+        let pubkey = m
+            .pubkey_for_host(peer_addr)
+            .await
+            .ok_or_else(|| Status::not_found(format!("no mesh peer owns [{peer_addr}]")))?;
+        let material = crate::meshca::load_material(&self.cfg.data_dir)
+            .map_err(|e| Status::failed_precondition(format!("mesh TLS material: {e:#}")))?;
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .domain_name(crate::meshca::node_dns(&pubkey))
+            .ca_certificate(tonic::transport::Certificate::from_pem(material.ca_crt))
+            .identity(tonic::transport::Identity::from_pem(
+                material.node_crt,
+                material.node_key,
             ));
-        }
-        let tok_val = token
-            .parse()
-            .map_err(|_| Status::internal("cluster token is not valid gRPC metadata"))?;
         let ep =
-            tonic::transport::Endpoint::try_from(format!("http://[{peer_addr}]:{MESH_RPC_PORT}"))
+            tonic::transport::Endpoint::try_from(format!("https://[{peer_addr}]:{MESH_RPC_PORT}"))
                 .map_err(int)?
-                .connect_timeout(CLUSTER_DIAL_TIMEOUT);
+                .connect_timeout(CLUSTER_DIAL_TIMEOUT)
+                .tls_config(tls)
+                .map_err(|e| Status::internal(format!("mesh TLS config: {e}")))?;
         // No .timeout(): a volume stream is one long call and a per-call
         // bound would sever a big transfer mid-flight.
         let ch = ep.connect().await.map_err(|e| {
@@ -63,7 +57,7 @@ impl super::super::Svc {
                 "dialing peer [{peer_addr}]:{MESH_RPC_PORT} over the mesh: {e}"
             ))
         })?;
-        Ok(PodControlClient::with_interceptor(ch, ClusterAuth(tok_val)))
+        Ok(PodControlClient::new(ch))
     }
 
     /// `volume send <name> --to <peer>` — the sending half. Resolves the
@@ -122,9 +116,7 @@ impl super::super::Svc {
             .ping(PingRequest {})
             .await
             .map_err(|e| {
-                Status::unavailable(format!(
-                    "peer {peer_disp} unreachable or token rejected: {e}"
-                ))
+                Status::unavailable(format!("peer {peer_disp} unreachable or TLS rejected: {e}"))
             })?
             .into_inner()
             .storage_driver;

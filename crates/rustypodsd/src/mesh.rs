@@ -607,6 +607,15 @@ impl Mesh {
         found
     }
 
+    /// WireGuard public key of the peer whose host address is `host`.
+    pub async fn pubkey_for_host(&self, host: std::net::Ipv6Addr) -> Option<String> {
+        let conf = self.conf.lock().await;
+        conf.peers.iter().find_map(|peer| {
+            let prefix = prefix_of(&peer.pubkey).ok()?;
+            (host_addr(prefix) == host).then(|| peer.pubkey.clone())
+        })
+    }
+
     /// Add/replace a peer live: session, endpoint map, route, conf.
     pub async fn add_peer(
         &self,

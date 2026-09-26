@@ -15,10 +15,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use sha2::{Digest, Sha256};
 
 /// DNS zone this CA is allowed to issue. Not the ingress zone.
-pub const MESH_NODE_ZONE: &str = "node.mesh.rustypods";
+pub use rustypods_proto::MESH_NODE_ZONE;
 const NODE_DAYS: i64 = 7;
 const RENEW_WITHIN_DAYS: i64 = 1;
 
@@ -54,12 +53,7 @@ impl MeshCa {
 /// DNS name bound to a WireGuard public key. The label is hex, so it
 /// cannot carry the base64 key itself, and it stays under 63 characters.
 pub fn node_dns(wg_pubkey_b64: &str) -> String {
-    let dig = Sha256::digest(wg_pubkey_b64.trim().as_bytes());
-    let mut label = String::with_capacity(30);
-    for byte in &dig[..15] {
-        label.push_str(&format!("{byte:02x}"));
-    }
-    format!("{label}.{MESH_NODE_ZONE}")
+    rustypods_proto::node_dns(wg_pubkey_b64)
 }
 
 fn ca_params() -> Result<rcgen::CertificateParams> {
@@ -323,6 +317,119 @@ fn verify_node(
     Ok(())
 }
 
+/// PEM the mesh listener and outbound dials present.
+pub struct MeshMaterial {
+    pub ca_crt: Vec<u8>,
+    pub node_crt: Vec<u8>,
+    pub node_key: Vec<u8>,
+}
+
+pub fn load_material(data_dir: &Path) -> Result<MeshMaterial> {
+    let paths = MeshCa::at(data_dir.join("mesh-pki"));
+    Ok(MeshMaterial {
+        ca_crt: std::fs::read(&paths.ca_crt).context("mesh ca.crt")?,
+        node_crt: std::fs::read(&paths.node_crt).context("mesh node.crt")?,
+        node_key: std::fs::read(&paths.node_key).context("mesh node.key")?,
+    })
+}
+
+/// Identity rustls already proved was signed by the mesh CA. The DNS
+/// label is the WireGuard binding; the address is `fd<host>::1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeshNodeId {
+    pub dns: String,
+    pub addr: Ipv6Addr,
+}
+
+pub fn identity_from_der(der: &[u8]) -> Result<MeshNodeId> {
+    use x509_parser::certificate::X509Certificate;
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::FromDer;
+    let (_, cert) =
+        X509Certificate::from_der(der).map_err(|e| anyhow::anyhow!("peer cert: {e}"))?;
+    let san = cert
+        .tbs_certificate
+        .subject_alternative_name()
+        .map_err(|e| anyhow::anyhow!("peer SAN: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("peer certificate has no SAN"))?;
+    let mut dns = None;
+    let mut addr = None;
+    for name in &san.value.general_names {
+        match name {
+            GeneralName::DNSName(n) => {
+                if dns.is_some() {
+                    bail!("peer certificate has multiple DNS names");
+                }
+                dns = Some((*n).to_string());
+            }
+            GeneralName::IPAddress(ip) if ip.len() == 16 => {
+                if addr.is_some() {
+                    bail!("peer certificate has multiple IP names");
+                }
+                let mut oct = [0u8; 16];
+                oct.copy_from_slice(ip);
+                addr = Some(Ipv6Addr::from(oct));
+            }
+            _ => bail!("peer certificate has an unexpected SAN"),
+        }
+    }
+    let dns = dns.ok_or_else(|| anyhow::anyhow!("peer certificate has no DNS SAN"))?;
+    let addr = addr.ok_or_else(|| anyhow::anyhow!("peer certificate has no IP SAN"))?;
+    let Some(label) = dns.strip_suffix(&format!(".{MESH_NODE_ZONE}")) else {
+        bail!("peer DNS name is outside the mesh zone");
+    };
+    if label.len() != 30 || label.contains('.') || !label.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("peer DNS name is outside the mesh zone");
+    }
+    if addr.octets()[0] != 0xfd {
+        bail!("peer IP is outside fd00::/8");
+    }
+    Ok(MeshNodeId { dns, addr })
+}
+
+/// Let `--allowed-uid` read `node.key` so `rustypods --host` can present
+/// it. `ca.key` stays mode 0600. Uid 0 needs no change.
+pub fn share_node_key(data_dir: &Path, uid: u32) -> Result<()> {
+    if uid == 0 {
+        return Ok(());
+    }
+    let gid = primary_gid(uid)?;
+    let dir = data_dir.join("mesh-pki");
+    crate::pki::ensure_dir(&dir)?;
+    chown_mode(&dir, gid, 0o750)?;
+    chown_mode(&dir.join("node.key"), gid, 0o640)?;
+    Ok(())
+}
+
+fn primary_gid(uid: u32) -> Result<u32> {
+    let text = std::fs::read_to_string("/etc/passwd").context("read /etc/passwd")?;
+    gid_from_passwd(&text, uid).with_context(|| format!("uid {uid} has no primary group"))
+}
+
+pub(crate) fn gid_from_passwd(text: &str, uid: u32) -> Option<u32> {
+    let want = uid.to_string();
+    for line in text.lines() {
+        let mut parts = line.split(':');
+        let (Some(_), Some(_), Some(u), Some(g)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if u == want {
+            return g.parse().ok();
+        }
+    }
+    None
+}
+
+fn chown_mode(path: &Path, gid: u32, mode: u32) -> Result<()> {
+    use std::os::unix::fs::{chown, PermissionsExt};
+    chown(path, Some(0), Some(gid)).with_context(|| format!("chown {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +516,26 @@ mod tests {
         let err = ensure(&dir, "k", Ipv6Addr::LOCALHOST).unwrap_err();
         assert!(err.to_string().contains("partial"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaf_identity_matches_wireguard_san() {
+        let dir = scratch();
+        let host: Ipv6Addr = "fd12:3456:789a::1".parse().unwrap();
+        let paths = ensure(&dir, "pubkey", host).unwrap();
+        let pem = std::fs::read_to_string(&paths.node_crt).unwrap();
+        let id = identity_from_der(&pem_der(&pem).unwrap()).unwrap();
+        assert_eq!(id.dns, node_dns("pubkey"));
+        assert_eq!(id.addr, host);
+        assert!(identity_from_der(b"not-a-cert").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn passwd_gid_lookup() {
+        let text = "root:x:0:0:root:/root:/bin/bash\nnick:x:1000:1000::/home/nick:/bin/bash\n";
+        assert_eq!(super::gid_from_passwd(text, 1000), Some(1000));
+        assert_eq!(super::gid_from_passwd(text, 0), Some(0));
+        assert_eq!(super::gid_from_passwd(text, 7), None);
     }
 }

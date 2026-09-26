@@ -707,7 +707,7 @@ async fn mesh_rm_peer_http(
 /// Constant-time equality. Length is part of the compare so a short
 /// guess doesn't return early; both sides are hashed to a fixed width
 /// first so the loop count doesn't depend on the attacker-controlled
-/// input length.
+/// input length. Shared with the mesh CA's certificate compare.
 pub(crate) fn token_eq(presented: &str, expected: &str) -> bool {
     use sha2::{Digest, Sha256};
     let a = Sha256::digest(presented.as_bytes());

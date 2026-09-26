@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tower::service_fn;
 
 use rustypods_proto::rpc::pod_control_client::PodControlClient;
@@ -19,20 +19,17 @@ use rustypods_proto::rpc::{Empty, MeshPeerInfo, PingRequest};
 /// Daemon-to-daemon PodControl port inside the encrypted mesh.
 pub const MESH_RPC_PORT: u16 = 5306;
 
-/// Optional cluster credential. The same client type is used for UDS, SSH,
-/// and mesh transports so CLI/GUI callers do not need transport-specific
-/// generics.
-#[derive(Clone)]
-pub struct ClusterAuth(Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>);
+/// Pass-through so UDS, SSH, and mesh share one client type. Mesh calls
+/// authenticate in the TLS handshake; UDS calls authenticate with
+/// SO_PEERCRED on the daemon.
+#[derive(Clone, Default)]
+pub struct ClusterAuth;
 
 impl tonic::service::Interceptor for ClusterAuth {
     fn call(
         &mut self,
-        mut req: tonic::Request<()>,
+        req: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        if let Some(token) = &self.0 {
-            req.metadata_mut().insert("x-cluster-token", token.clone());
-        }
         Ok(req)
     }
 }
@@ -231,7 +228,7 @@ async fn connect_direct(
         }))
         .await
         .context(err_hint)?;
-    let mut client = PodControlClient::with_interceptor(ch, ClusterAuth(None));
+    let mut client = PodControlClient::with_interceptor(ch, ClusterAuth);
     // Once per process, not once per RPC. A later connect in the same
     // invocation (start after stop, export then load) reuses the result.
     static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -265,8 +262,9 @@ fn peer_matches(peer: &MeshPeerInfo, selector: &str) -> bool {
         || peer_host_addr(peer).is_some_and(|a| a.to_string() == selector)
 }
 
-/// Resolve a peer through the local UDS and dial its token-authenticated
-/// PodControl listener over the WireGuard mesh.
+/// Resolve a peer through the local UDS and dial its mTLS PodControl
+/// listener over the WireGuard mesh. The server name is that peer's
+/// WireGuard DNS SAN. The local identity is `<data>/mesh-pki`.
 pub async fn connect_mesh(
     path: &Path,
     selector: &str,
@@ -280,10 +278,6 @@ pub async fn connect_mesh(
         .context("reading local mesh registry")?
         .into_inner();
     anyhow::ensure!(status.enabled, "mesh is not enabled on this host");
-    anyhow::ensure!(
-        !status.cluster_token.is_empty(),
-        "local mesh has no cluster token"
-    );
     let matches: Vec<&MeshPeerInfo> = status
         .peers
         .iter()
@@ -300,19 +294,30 @@ pub async fn connect_mesh(
     let peer = matches[0];
     let addr = peer_host_addr(peer)
         .with_context(|| format!("peer '{selector}' has no valid mesh gRPC address"))?;
-    let token = status
-        .cluster_token
-        .parse()
-        .context("cluster token is not valid gRPC metadata")?;
-    let ch = Endpoint::try_from(format!("http://[{addr}]:{MESH_RPC_PORT}"))?
+    let pki = Path::new(rustypods_proto::DATA_DIR).join("mesh-pki");
+    let ca = std::fs::read(pki.join("ca.crt")).context("mesh CA certificate")?;
+    let cert = std::fs::read(pki.join("node.crt")).context("mesh node certificate")?;
+    let key = std::fs::read(pki.join("node.key")).with_context(|| {
+        format!(
+            "mesh node key {} — the daemon shares it with the allowed uid",
+            pki.join("node.key").display()
+        )
+    })?;
+    let tls = ClientTlsConfig::new()
+        .domain_name(rustypods_proto::node_dns(&peer.pubkey))
+        .ca_certificate(Certificate::from_pem(ca))
+        .identity(Identity::from_pem(cert, key));
+    let ch = Endpoint::try_from(format!("https://[{addr}]:{MESH_RPC_PORT}"))?
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(timeout)
+        .tls_config(tls)
+        .context("mesh TLS")?
         .connect()
         .await
         .with_context(|| {
             format!("connecting to mesh peer '{selector}' at [{addr}]:{MESH_RPC_PORT}")
         })?;
-    let mut client = PodControlClient::with_interceptor(ch, ClusterAuth(Some(token)));
+    let mut client = PodControlClient::with_interceptor(ch, ClusterAuth);
     if let Ok(info) = client.ping(PingRequest {}).await {
         warn_version_mismatch(&info.into_inner().version, true);
     }

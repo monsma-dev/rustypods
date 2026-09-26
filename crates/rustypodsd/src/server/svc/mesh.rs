@@ -1,5 +1,34 @@
 use super::super::*;
 use crate::{mesh, net};
+use std::net::SocketAddr;
+
+/// rustls already required a mesh-CA client certificate. This records
+/// which node it is, and refuses a certificate whose IP SAN is not the
+/// TCP source. Handlers can read [`crate::meshca::MeshNodeId`].
+fn require_mesh_peer(mut req: Request<()>) -> Result<Request<()>, Status> {
+    let der = req
+        .peer_certs()
+        .and_then(|certs| certs.first().cloned())
+        .ok_or_else(|| Status::unauthenticated("mesh peer certificate required"))?;
+    let id = crate::meshca::identity_from_der(der.as_ref()).map_err(|e| {
+        tracing::debug!("mesh peer certificate rejected: {e:#}");
+        Status::unauthenticated("mesh peer certificate rejected")
+    })?;
+    let src = req
+        .remote_addr()
+        .ok_or_else(|| Status::unauthenticated("mesh peer address missing"))?;
+    let SocketAddr::V6(src) = src else {
+        return Err(Status::unauthenticated("mesh peer is not IPv6"));
+    };
+    if *src.ip() != id.addr {
+        return Err(Status::unauthenticated(
+            "mesh peer certificate does not match the source address",
+        ));
+    }
+    tracing::debug!(dns = %id.dns, addr = %id.addr, "mesh peer authenticated");
+    req.extensions_mut().insert(id);
+    Ok(req)
+}
 
 impl super::super::Svc {
     /// Give every running standalone pod its mesh /128 — used after
@@ -193,10 +222,11 @@ impl super::super::Svc {
     pub(crate) const MESH_RPC_PORT: u16 = 5306;
 
     /// Start the cluster-plane listener on [fd<host>::1]:5306 if the
-    /// mesh is up and it isn't already. Every request must carry the
-    /// `x-cluster-token` metadata matching conf/mesh.conf — the nft
-    /// guard narrows sources to peer daemon addrs but a pod on a peer
-    /// can forge an ::1 source, so the token is the real gate.
+    /// mesh is up and it isn't already. The TCP listener requires mTLS
+    /// with the mesh CA; the UDS listener stays plaintext. A handshake
+    /// that cannot present a mesh-CA client certificate never reaches
+    /// HTTP/2. Gossip still uses the cluster token, which is why that
+    /// token is minted here even though RPC no longer reads it.
     pub(crate) async fn spawn_mesh_rpc(&self) {
         {
             // A dead task must not block a respawn forever — clear a
@@ -212,13 +242,12 @@ impl super::super::Svc {
             }
         }
         let Some(m) = self.mesh() else { return };
-        let token = match m.ensure_cluster_token().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("cluster token init failed — mesh-RPC listener off: {e:#}");
-                return;
-            }
-        };
+        if let Err(e) = m.ensure_cluster_token().await {
+            tracing::error!("cluster token init failed — mesh-RPC listener off: {e:#}");
+            return;
+        }
+        let data_dir = self.cfg.data_dir.clone();
+        let allowed_uid = self.cfg.allowed_uid;
         let (tx, rx) = tokio::sync::watch::channel(false);
         let svc = self.clone();
         let handle = tokio::spawn(async move {
@@ -252,32 +281,45 @@ impl super::super::Svc {
                 );
                 return;
             };
+            if let Err(e) = crate::meshca::share_node_key(&data_dir, allowed_uid) {
+                tracing::warn!(
+                    "mesh node key stays root-only; `rustypods --host` cannot present it: {e:#}"
+                );
+            }
+            let material = match crate::meshca::load_material(&data_dir) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("mesh-RPC TLS material missing — listener off: {e:#}");
+                    return;
+                }
+            };
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let tls = tonic::transport::ServerTlsConfig::new()
+                .identity(tonic::transport::Identity::from_pem(
+                    material.node_crt,
+                    material.node_key,
+                ))
+                .client_ca_root(tonic::transport::Certificate::from_pem(material.ca_crt));
+            let mut server = match Server::builder()
+                .concurrency_limit_per_connection(32)
+                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256))
+                .tls_config(tls)
+            {
+                Ok(server) => server,
+                Err(e) => {
+                    tracing::error!("mesh-RPC TLS config refused — listener off: {e:#}");
+                    return;
+                }
+            };
             tracing::info!(
-                "mesh-RPC listening on [{}]:{}",
+                "mesh-RPC listening on [{}]:{} (mTLS)",
                 m.host_addr,
                 Self::MESH_RPC_PORT
             );
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let mut rx = rx;
-            let res = Server::builder()
-                .concurrency_limit_per_connection(32)
-                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256))
-                .add_service(PodControlServer::with_interceptor(
-                    svc,
-                    move |req: Request<()>| {
-                        let ok = req
-                            .metadata()
-                            .get("x-cluster-token")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|v| v == token)
-                            .unwrap_or(false);
-                        if ok {
-                            Ok(req)
-                        } else {
-                            Err(Status::unauthenticated("missing/invalid x-cluster-token"))
-                        }
-                    },
-                ))
+            let res = server
+                .add_service(PodControlServer::with_interceptor(svc, require_mesh_peer))
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = rx.changed().await;
                 })
@@ -387,5 +429,36 @@ impl super::super::Svc {
             pod: "/etc/resolv.conf".into(),
             ro: true,
         })
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn missing_peer_cert_is_rejected() {
+        let err = super::require_mesh_peer(tonic::Request::new(())).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn server_tls_config_builds_from_mesh_material() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("rp-mtls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = "fd12:3456:789a::1".parse().unwrap();
+        crate::meshca::ensure(&dir, "pubkey", host).unwrap();
+        let material = crate::meshca::load_material(&dir).unwrap();
+        let tls = tonic::transport::ServerTlsConfig::new()
+            .identity(tonic::transport::Identity::from_pem(
+                &material.node_crt,
+                &material.node_key,
+            ))
+            .client_ca_root(tonic::transport::Certificate::from_pem(&material.ca_crt));
+        tonic::transport::Server::builder()
+            .tls_config(tls)
+            .expect("mesh material must build a client-authenticated TLS acceptor");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

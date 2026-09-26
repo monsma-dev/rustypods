@@ -569,14 +569,20 @@ from pods on other hosts. L3, end-to-end encrypted, no NAT.
 peer daemon over the mesh — the placement primitive. Resolution happens
 client-side: the CLI asks the LOCAL daemon's GetMeshStatus for the peer
 registry (matching `name`, pubkey, or `fd<peer>::1`), then dials
-`http://[fd<peer>::1]:5306` over the WG tunnel (h2c — WireGuard already
-encrypts).
+`https://[fd<peer>::1]:5306` over the WG tunnel. The server name is
+that peer's WireGuard DNS SAN, not the zone apex.
 
 - The cluster-plane listener lives on `[fd<host>::1]:5306`, spawned by
   `mesh_up`/startup-restore and torn down by `mesh_down` (watch channel
   `svc.mesh_rpc_stop` — Arc-wrapped std Mutex since Svc is Clone).
-- Auth: shared `cluster_token` in conf/mesh.conf (0600), sent as
-  `x-cluster-token` gRPC metadata, enforced by a server interceptor.
+- Auth on that TCP listener is mutual TLS. It presents `node.crt` and
+  requires a client certificate signed by `mesh-pki/ca.crt`. Invalid
+  peers die in the rustls handshake. The interceptor then reads
+  `peer_certs()` and keeps the request only when the certificate's IP
+  SAN is the TCP source. The UDS listener stays plaintext; SO_PEERCRED
+  is its gate. `node.key` is group-readable by `--allowed-uid` so
+  `rustypods --host` can present it; `ca.key` stays mode 0600.
+  Gossip still uses the shared `cluster_token`.
   The mesh identity CA lives in `<data>/mesh-pki`, separate from the
   ingress CA in `<data>/pki`. It may sign leaves only, and only names
   under `node.mesh.rustypods` plus `fd00::/8`. `Mesh::start` mints it.
@@ -589,7 +595,8 @@ encrypts).
   tcp/5306 from anything but the peers' `fd<peer>::1` addrs (rebuilt on
   every add/remove-peer and mesh start). nft alone is NOT sufficient —
   a pod on a peer can spoof `fd<peer>::1` as source (cryptokey routing
-  accepts any src inside the peer /48); the token is the real gate.
+  accepts any src inside the peer /48); the certificate's IP SAN must
+  match that source.
 - `--host` and `--remote` are mutually exclusive; `--remote` stays the
   escape for hosts without mesh.
 - `mesh add-peer --name s2` stores the alias in conf (MeshPeerConf.name
@@ -630,8 +637,8 @@ pipeline sits on (snapshot → volume → `send --to`).
 - Mesh listener state holds (stop-signal, JoinHandle): stop awaits the
   task so a following init rebinds cleanly; a dead listener is respawned
   by the next spawn_mesh_rpc. mesh_up/mesh_down hold `mesh_lifecycle`.
-- Cluster token = full PodControl on every peer (needed for `--host`);
-  it is the cluster-admin credential, same model as kubectl client certs.
+- The node certificate is full PodControl on every peer (needed for
+  `--host`). The cluster token remains the gossip HMAC key.
 
 ### Stack placement: `placement = "<peer>"` in stack.toml
 
