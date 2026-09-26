@@ -213,7 +213,13 @@ impl super::super::Svc {
         let Some(mut stdout) = child.stdout.take() else {
             return Err(Status::internal("export child has no stdout"));
         };
-        let stderr = child.stderr.take();
+        // Drain stderr while stdout is still being read. Waiting until
+        // the producer exits lets a full stderr pipe stall tar/btrfs
+        // before it closes stdout.
+        let stderr_task = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(transfer::drain_stderr(stderr)));
         let (tx, rx) = tokio::sync::mpsc::channel::<VolumeChunk>(8);
 
         // Producer: init frame, then raw payload bytes until EOF or
@@ -267,18 +273,8 @@ impl super::super::Svc {
         let (bytes, read_err, child_status) = producer
             .await
             .map_err(|e| Status::internal(format!("producer task: {e}")))?;
-        let err_tail = match stderr {
-            Some(mut s) => {
-                let mut b: Vec<u8> = Vec::new();
-                let mut tmp = [0u8; 512];
-                loop {
-                    match s.read(&mut tmp).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => transfer::push_capped(&mut b, &tmp[..n], transfer::STDERR_CAP),
-                    }
-                }
-                String::from_utf8_lossy(&b).trim().to_string()
-            }
+        let err_tail = match stderr_task {
+            Some(task) => task.await.unwrap_or_default(),
             None => String::new(),
         };
         clean_staging(&staging_dir, &self.storage).await;

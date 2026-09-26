@@ -106,13 +106,11 @@ fn image_bin(rootfs: &Path, name: &str) -> Option<String> {
     ]
     .iter()
     .find(|d| {
-        // safe_join_if_exists refuses symlinked intermediates; the leaf
-        // check is symlink_metadata (not exists()) so an absolute leaf
-        // symlink can't be resolved against the HOST fs.
-        matches!(
-            crate::rootfs::safe_join_if_exists(rootfs, format!("{d}/{name}")),
-            Ok(Some(p)) if p.symlink_metadata().is_ok()
-        )
+        // classify refuses symlinked intermediates and does not follow a
+        // leaf symlink out onto the host.
+        crate::rootfs::classify(rootfs, format!("{d}/{name}"))
+            .map(|l| l.exists())
+            .unwrap_or(false)
     })
     .map(|d| format!("/{d}/{name}"))
 }
@@ -121,31 +119,28 @@ fn image_bin(rootfs: &Path, name: &str) -> Option<String> {
 /// or a hardlink to the same inode? BusyBox's setpriv lacks --bounding-set
 /// and --reuid entirely, so it counts as "no usable setpriv".
 fn is_busybox_applet(rootfs: &Path, path: &str) -> bool {
-    let Some(f) = crate::rootfs::safe_join_if_exists(rootfs, path.trim_start_matches('/'))
+    let rel = path.trim_start_matches('/');
+    if crate::rootfs::read_link_in_rootfs(rootfs, rel)
         .ok()
         .flatten()
-    else {
-        return false;
-    };
-    if std::fs::read_link(&f)
-        .map(|t| t.file_name() == Some(std::ffi::OsStr::new("busybox")))
-        .unwrap_or(false)
+        .as_ref()
+        .and_then(|t| t.file_name())
+        == Some(std::ffi::OsStr::new("busybox"))
     {
         return true;
     }
-    use std::os::unix::fs::MetadataExt;
-    let Some(bb) = crate::rootfs::safe_join_if_exists(rootfs, "bin/busybox")
+    // Hardlink to the busybox inode. Neither stat follows a symlink, so
+    // a leaf that points at a host file cannot match.
+    let Some(a) = crate::rootfs::inode_in_rootfs(rootfs, rel).ok().flatten() else {
+        return false;
+    };
+    let Some(b) = crate::rootfs::inode_in_rootfs(rootfs, "bin/busybox")
         .ok()
         .flatten()
     else {
         return false;
     };
-    // symlink_metadata for the leaf: symlinks were handled above, and
-    // following one could stat a host file.
-    match (f.symlink_metadata(), std::fs::metadata(&bb)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
+    a == b
 }
 
 /// Is locale `loc` (e.g. "nl_NL.UTF-8") usable inside `rootfs`?
@@ -156,10 +151,9 @@ fn is_busybox_applet(rootfs: &Path, path: &str) -> bool {
 /// `/etc/locale.gen` line is the evidence.
 fn locale_available(rootfs: &Path, loc: &str) -> bool {
     let exists = |rel: &str| -> bool {
-        matches!(
-            crate::rootfs::safe_join_if_exists(rootfs, rel),
-            Ok(Some(p)) if p.exists()
-        )
+        crate::rootfs::classify(rootfs, rel)
+            .map(|l| l.exists())
+            .unwrap_or(false)
     };
     if exists(&format!("usr/lib/locale/{loc}")) {
         return true;
@@ -174,10 +168,10 @@ fn locale_available(rootfs: &Path, loc: &str) -> bool {
     if !exists("etc/debian_version") {
         return true;
     }
-    let gen = crate::rootfs::safe_join_if_exists(rootfs, "etc/locale.gen")
+    let gen = crate::rootfs::read_file_in_rootfs(rootfs, "etc/locale.gen")
         .ok()
         .flatten()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_default();
     gen.lines().any(|l| {
         let l = l.trim_start();
@@ -190,17 +184,13 @@ fn locale_available(rootfs: &Path, loc: &str) -> bool {
 }
 
 /// Read a colon-separated database (`etc/passwd`, `etc/group`) from the
-/// image. The leaf must be a real file — an image-planted symlink (`etc ->
-/// /host/etc` is covered by safe_join, but a leaf `passwd -> /etc/passwd`
-/// isn't) would make the daemon read a host file.
+/// image. The leaf must be a regular file. A symlinked parent or a leaf
+/// symlink (`passwd -> /etc/passwd`) does not become a host-file read.
 fn image_db(rootfs: &Path, rel: &str) -> Option<String> {
-    let p = crate::rootfs::safe_join_if_exists(rootfs, rel)
+    let bytes = crate::rootfs::read_file_in_rootfs(rootfs, rel)
         .ok()
         .flatten()?;
-    if !p.symlink_metadata().ok()?.is_file() {
-        return None;
-    }
-    std::fs::read_to_string(p).ok()
+    String::from_utf8(bytes).ok()
 }
 
 /// name → (uid, gid, home, shell), parsed from the image's own /etc/passwd.

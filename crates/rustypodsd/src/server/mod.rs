@@ -1796,11 +1796,11 @@ impl PodControl for Svc {
                     let rf = rootfs.clone();
                     let want = tls_crt.clone();
                     let drift = Self::blocking(move || -> Result<bool> {
-                        match crate::rootfs::safe_join_if_exists(
+                        match crate::rootfs::read_file_in_rootfs(
                             &rf,
                             "etc/rustypods-ingress/tls.crt",
                         )? {
-                            Some(p) => Ok(std::fs::read(&p)? != want),
+                            Some(p) => Ok(p != want),
                             None => Ok(true),
                         }
                     })
@@ -2601,18 +2601,16 @@ fn mask_host_tmpfiles(rootfs: &Path, binds: &[proto::BindSpec]) -> Result<()> {
 /// replaced with an empty regular file.
 fn ensure_resolv_target(rootfs: &Path) -> Result<()> {
     crate::rootfs::mkdir_in_rootfs(rootfs, "etc")?;
-    let target = crate::rootfs::safe_join(rootfs, "etc/resolv.conf")?;
-    match std::fs::symlink_metadata(&target) {
-        Ok(md) if md.file_type().is_file() => Ok(()),
-        Ok(md) if md.file_type().is_symlink() => {
-            std::fs::remove_file(&target)?;
+    match crate::rootfs::classify(rootfs, "etc/resolv.conf")? {
+        crate::rootfs::Leaf::File => Ok(()),
+        crate::rootfs::Leaf::Symlink => {
+            crate::rootfs::remove_in_rootfs(rootfs, "etc/resolv.conf")?;
             crate::rootfs::write_in_rootfs(rootfs, "etc/resolv.conf", b"", Some(0o644))
         }
-        Ok(_) => bail!("{} is not a regular file", target.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        crate::rootfs::Leaf::Absent => {
             crate::rootfs::write_in_rootfs(rootfs, "etc/resolv.conf", b"", Some(0o644))
         }
-        Err(e) => Err(e.into()),
+        _ => bail!("etc/resolv.conf is not a regular file"),
     }
 }
 
@@ -2653,10 +2651,8 @@ fn has_systemd_init(rootfs: &Path) -> bool {
     ]
     .iter()
     .any(|p| {
-        crate::rootfs::safe_join_if_exists(rootfs, p)
-            .ok()
-            .flatten()
-            .map(|p| std::fs::symlink_metadata(&p).is_ok())
+        crate::rootfs::classify(rootfs, p)
+            .map(|l| l.exists())
             .unwrap_or(false)
     })
 }
@@ -2671,10 +2667,8 @@ fn resolve_in_rootfs(rootfs: &Path, prog: &str) -> Option<String> {
     // Leaf policy: symlink_metadata — a leaf symlink counts as existing
     // (it resolves inside the container), and is never followed host-side.
     let exists = |rel: &str| -> bool {
-        crate::rootfs::safe_join_if_exists(rootfs, rel)
-            .ok()
-            .flatten()
-            .map(|p| std::fs::symlink_metadata(&p).is_ok())
+        crate::rootfs::classify(rootfs, rel)
+            .map(|l| l.exists())
             .unwrap_or(false)
     };
     if prog.contains('/') {
@@ -2760,22 +2754,15 @@ fn sanitize_rootfs(root: &Path, container_id: &str) -> Result<()> {
     rfs::write_in_rootfs(root, "etc/machine-id", b"", None)?;
     rfs::remove_in_rootfs(root, "run/host")?;
     // Read-only enumeration — never list host dirs through a symlink.
-    if let Some(profile_d) = rfs::safe_join_if_exists(root, "etc/profile.d")? {
-        if let Ok(rd) = std::fs::read_dir(&profile_d) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().contains("distrobox") {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
-    }
+    rfs::remove_children_containing(root, "etc/profile.d", "distrobox")?;
     // distrobox-export wrappers in ~/.local/bin branch on CONTAINER_ID:
     // matching the source box name makes them exec the real /usr/bin binary.
     // Fallback for unset CONTAINER_ID: a shim at the absolute path the
     // wrappers call, stripping "-n <box> --" and exec'ing the payload.
-    let mut envf = rfs::safe_join(root, "etc/environment")
+    let mut envf = rfs::read_file_in_rootfs(root, "etc/environment")
         .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_default();
     if !envf.contains("CONTAINER_ID=") {
         envf.push_str(&format!("CONTAINER_ID={container_id}\n"));

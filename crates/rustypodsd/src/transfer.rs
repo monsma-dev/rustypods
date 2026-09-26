@@ -678,6 +678,22 @@ pub fn unfreeze_cgroup(path: &Path, attempts: u32) -> bool {
     false
 }
 
+/// Drain `stderr` until EOF, keeping at most [`STDERR_CAP`] bytes.
+/// Bytes past the cap are still read and discarded so a noisy producer
+/// cannot fill the pipe and stall before stdout reaches EOF.
+pub async fn drain_stderr(mut stderr: impl tokio::io::AsyncRead + Unpin) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut tmp = [0u8; 512];
+    loop {
+        match stderr.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => push_capped(&mut kept, &tmp[..n], STDERR_CAP),
+        }
+    }
+    String::from_utf8_lossy(&kept).trim().to_string()
+}
+
 /// Append to a capped byte buffer. Extra bytes are dropped.
 pub fn push_capped(buf: &mut Vec<u8>, data: &[u8], cap: usize) {
     let room = cap.saturating_sub(buf.len());
@@ -705,6 +721,36 @@ pub fn read_capped<R: Read>(r: &mut R, cap: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A producer that fills stderr before closing stdout must still
+    /// finish. Draining only after stdout EOF deadlocks on a full pipe.
+    #[tokio::test]
+    async fn stderr_drain_unblocks_a_noisy_producer() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("dd if=/dev/zero bs=1024 count=2048 >&2; printf done")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+        let drain = tokio::spawn(drain_stderr(stderr));
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            use tokio::io::AsyncReadExt;
+            stdout.read_to_end(&mut buf).await
+        })
+        .await
+        .expect("stdout blocked while stderr filled the pipe");
+        read.expect("read stdout");
+        assert_eq!(buf, b"done");
+        let tail = drain.await.expect("stderr task");
+        assert!(tail.len() <= STDERR_CAP);
+        let _ = child.wait().await;
+    }
 
     fn manifest() -> Manifest {
         Manifest {

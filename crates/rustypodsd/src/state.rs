@@ -11,10 +11,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustypods_proto::{fmt_bytes, parse_bytes};
 
-/// On-disk conf schema this binary writes. Older files omit `format` and
-/// load as 1. A newer `format` is loaded but never rewritten: serde would
-/// drop unknown fields on save.
+/// On-disk conf schema this binary writes for pods, images and volumes.
+/// Older files omit `format` and load as 1. A newer `format` is loaded
+/// but never rewritten: serde would drop unknown fields on save.
 pub const CONF_FORMAT: u32 = 1;
+
+/// `mesh.conf` schema. 2 is the first revision that stores
+/// `cluster_token` and `MeshPeerConf.name`. Saves stamp this value so a
+/// daemon whose ceiling is 1 refuses to rewrite the file and therefore
+/// cannot drop those fields on a downgrade.
+pub const MESH_CONF_FORMAT: u32 = 2;
 
 fn default_format() -> u32 {
     CONF_FORMAT
@@ -634,16 +640,18 @@ pub fn save_mesh(data_dir: &Path, m: &MeshConf) -> Result<()> {
     secure_conf_dirs(data_dir)?;
     // 0600 comes from write_conf — the file holds the host's WG private key.
     let path = mesh_conf_path(data_dir);
-    refuse_newer_conf(&path)?;
-    if m.format > CONF_FORMAT {
+    refuse_newer_than(&path, MESH_CONF_FORMAT)?;
+    if m.format > MESH_CONF_FORMAT {
         anyhow::bail!(
-            "{} format {} is newer than supported {CONF_FORMAT}; refusing to overwrite",
+            "{} format {} is newer than supported {MESH_CONF_FORMAT}; refusing to overwrite",
             path.display(),
             m.format
         );
     }
     let mut m = m.clone();
-    m.format = canonical_format(m.format)?;
+    // Always stamp 2. Keeping a loaded 1 would let an older daemon
+    // rewrite the file and drop cluster_token / peer names.
+    m.format = MESH_CONF_FORMAT;
     write_conf(&path, &toml::to_string_pretty(&m)?)
 }
 
@@ -684,6 +692,10 @@ fn canonical_format(format: u32) -> Result<u32> {
 
 /// A conf written by a newer daemon stays on disk untouched.
 fn refuse_newer_conf(path: &Path) -> Result<()> {
+    refuse_newer_than(path, CONF_FORMAT)
+}
+
+fn refuse_newer_than(path: &Path, supported: u32) -> Result<()> {
     let Ok(s) = std::fs::read_to_string(path) else {
         return Ok(());
     };
@@ -691,9 +703,9 @@ fn refuse_newer_conf(path: &Path) -> Result<()> {
         return Ok(());
     };
     let fmt = v.get("format").and_then(|x| x.as_integer()).unwrap_or(1);
-    if fmt > CONF_FORMAT as i64 {
+    if fmt > supported as i64 {
         anyhow::bail!(
-            "{} format {fmt} is newer than supported {CONF_FORMAT}; refusing to overwrite (loaded read-only)",
+            "{} format {fmt} is newer than supported {supported}; refusing to overwrite (loaded read-only)",
             path.display()
         );
     }
@@ -1575,10 +1587,29 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "mesh.conf holds a private key");
+        let raw = std::fs::read_to_string(dir.join("conf/mesh.conf")).unwrap();
+        assert!(
+            raw.contains("format = 2"),
+            "mesh save must stamp format 2, got {raw}"
+        );
+        assert!(raw.contains("deadbeef"));
+        assert!(raw.contains("name = \"s2\""));
         let back = load_mesh(&dir).unwrap().unwrap();
+        assert_eq!(back.format, MESH_CONF_FORMAT);
         assert_eq!(back.private_key, conf.private_key);
+        assert_eq!(back.cluster_token, "deadbeef");
         assert_eq!(back.peers.len(), 1);
         assert_eq!(back.peers[0].endpoint, "192.0.2.1:51820");
+        assert_eq!(back.peers[0].name.as_deref(), Some("s2"));
+        // A file this binary does not understand stays byte-for-byte.
+        let future = "format = 9\nprivate_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\ncluster_token = \"keep-me\"\n";
+        std::fs::write(dir.join("conf/mesh.conf"), future).unwrap();
+        let err = save_mesh(&dir, &conf).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:#}");
+        let kept = std::fs::read_to_string(dir.join("conf/mesh.conf")).unwrap();
+        assert!(kept.contains("keep-me"));
+        assert!(kept.contains("format = 9"));
+        std::fs::write(dir.join("conf/mesh.conf"), &raw).unwrap();
         // Empty key = uninitialized even if the file exists.
         save_mesh(&dir, &MeshConf::default()).unwrap();
         assert!(load_mesh(&dir).unwrap().is_none());
