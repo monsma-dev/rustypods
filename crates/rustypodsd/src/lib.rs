@@ -5,6 +5,7 @@ pub mod exec;
 pub mod http;
 pub mod ingress;
 pub mod mesh;
+pub mod meshca;
 pub mod net;
 pub mod notify;
 pub mod oci;

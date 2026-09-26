@@ -708,7 +708,7 @@ async fn mesh_rm_peer_http(
 /// guess doesn't return early; both sides are hashed to a fixed width
 /// first so the loop count doesn't depend on the attacker-controlled
 /// input length.
-fn token_eq(presented: &str, expected: &str) -> bool {
+pub(crate) fn token_eq(presented: &str, expected: &str) -> bool {
     use sha2::{Digest, Sha256};
     let a = Sha256::digest(presented.as_bytes());
     let b = Sha256::digest(expected.as_bytes());

@@ -76,7 +76,7 @@ fn leaf_params() -> Result<rcgen::CertificateParams> {
 
 /// Durably write one file: temp + fsync + rename + dir fsync, mode set
 /// at create time, never following a planted symlink (O_NOFOLLOW).
-fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let dir = path
         .parent()
         .with_context(|| format!("{} has no parent", path.display()))?;
@@ -112,7 +112,7 @@ fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
 
 /// The pki dir must be a REAL directory owned by root with 0700 — a
 /// symlink or a mode that leaks the CA key fails closed.
-fn ensure_dir(dir: &Path) -> Result<()> {
+pub(crate) fn ensure_dir(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Ok(md) => {
             if !md.file_type().is_dir() {

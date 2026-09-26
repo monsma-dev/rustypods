@@ -379,6 +379,9 @@ impl Mesh {
         let privkey = conf.private_key.clone();
         let pubkey = pubkey_of(&privkey)?;
         let prefix = prefix_of(&pubkey)?;
+        // Identity for anything that crosses the NIC. Local UDS auth is
+        // unchanged. A failure here refuses to bring the tunnel up.
+        crate::meshca::ensure(data_dir, &pubkey, host_addr(prefix)).context("mesh identity CA")?;
         let port = if conf.listen_port == 0 {
             DEFAULT_PORT
         } else {

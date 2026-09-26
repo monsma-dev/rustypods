@@ -577,6 +577,11 @@ encrypts).
   `svc.mesh_rpc_stop` — Arc-wrapped std Mutex since Svc is Clone).
 - Auth: shared `cluster_token` in conf/mesh.conf (0600), sent as
   `x-cluster-token` gRPC metadata, enforced by a server interceptor.
+  The mesh identity CA lives in `<data>/mesh-pki`, separate from the
+  ingress CA in `<data>/pki`. It may sign leaves only, and only names
+  under `node.mesh.rustypods` plus `fd00::/8`. `Mesh::start` mints it.
+  Node certificates last 7 days; renewal keeps `node.prev.crt` acceptable
+  until `meshca::retire_previous`. Local UDS auth does not use these certs.
   Generate on the FIRST host (`mesh init` auto-mints when absent);
   `mesh init --token <tok>` on joiners. `mesh status` prints it — UDS
   is uid-gated so that's safe. Debug-redacted in MeshConf.
