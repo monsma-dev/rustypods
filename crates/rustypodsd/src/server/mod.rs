@@ -3327,20 +3327,22 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 cfg.allowed_uid,
                 http_token_rotate(),
             ) {
-                Ok((auth, token_path, ro_path)) => {
-                    tracing::info!(
-                        "http api listening on http://{} — bearer token in {} (read-only {})",
-                        cfg.http_addr,
-                        token_path.display(),
-                        ro_path.display()
-                    );
-                    let router = crate::http::router(svc.clone(), auth);
-                    spawn_critical("http server", async move {
-                        if let Err(e) = crate::http::listen(l, router).await {
-                            tracing::error!("http api: {e}");
-                        }
-                    });
-                }
+                Ok((auth, token_path, ro_path)) => match crate::http::router(svc.clone(), auth) {
+                    Ok(router) => {
+                        tracing::info!(
+                            "http api listening on http://{} — bearer token in {} (read-only {})",
+                            cfg.http_addr,
+                            token_path.display(),
+                            ro_path.display()
+                        );
+                        spawn_critical("http server", async move {
+                            if let Err(e) = crate::http::listen(l, router).await {
+                                tracing::error!("http api: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::error!("http api disabled — {e:#}"),
+                },
                 Err(e) => tracing::warn!("http api disabled — token setup failed: {e:#}"),
             },
             Err(e) => tracing::warn!("http api bind {}: {e}", cfg.http_addr),

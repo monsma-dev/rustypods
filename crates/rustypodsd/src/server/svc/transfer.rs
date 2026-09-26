@@ -398,7 +398,8 @@ impl super::super::Svc {
         };
         let payload_path = staging.join(".payload");
         let mut file = tokio::fs::File::create(&payload_path).await.map_err(int)?;
-        let mut acc = transfer::PayloadWriter::new(version, transfer::import_max_bytes());
+        let mut acc =
+            transfer::PayloadWriter::new(version, transfer::import_max_bytes().map_err(int)?);
         let first = acc.push(&payload).map_err(bad)?;
         if !first.is_empty() {
             file.write_all(&first).await.map_err(int)?;

@@ -843,7 +843,9 @@ impl super::super::Svc {
             name: name.clone(),
             image,
             created_unix: state::now_unix(),
-            limits: limits_from(req.limits).with_create_defaults(),
+            limits: limits_from(req.limits)
+                .with_create_defaults()
+                .map_err(|e| Status::internal(format!("daemon environment: {e:#}")))?,
             ephemeral: false,
             // userns on by default; desktop pods share the home dir and need
             // host-uid identity, so they opt out.

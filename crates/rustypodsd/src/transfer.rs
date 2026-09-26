@@ -277,14 +277,11 @@ impl PayloadWriter {
     }
 }
 
-/// `RUSTYPODS_IMPORT_MAX_BYTES`, or [`DEFAULT_IMPORT_MAX_BYTES`] when
-/// unset, empty, or not a positive integer.
-pub fn import_max_bytes() -> u64 {
-    match std::env::var("RUSTYPODS_IMPORT_MAX_BYTES") {
-        Ok(s) => s.parse::<u64>().ok().filter(|n| *n > 0),
-        Err(_) => None,
-    }
-    .unwrap_or(DEFAULT_IMPORT_MAX_BYTES)
+/// `RUSTYPODS_IMPORT_MAX_BYTES`, or [`DEFAULT_IMPORT_MAX_BYTES`] when the
+/// variable is unset. A set value that is empty, zero, or not a plain
+/// integer fails — `100MB` must not silently become the default.
+pub fn import_max_bytes() -> Result<u64> {
+    Ok(crate::envcfg::load()?.import_max_bytes)
 }
 
 /// `requested` is `""` (auto), `"tar"`, or `"btrfs"`. Returns whether

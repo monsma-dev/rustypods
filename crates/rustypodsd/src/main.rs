@@ -72,6 +72,10 @@ async fn run(notify: rustypodsd::notify::Notifier) -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
+    // Fail before any listener, nft script, or pod create if a set
+    // RUSTYPODS_* value does not parse. Missing variables keep defaults.
+    rustypodsd::envcfg::load().context("daemon environment")?;
+    rustypodsd::net::load_pool().context("pod address pool")?;
     // reqwest (oci-client) is built with rustls-no-provider — install the
     // ring backend process-wide before any OCI pull touches TLS.
     rustls::crypto::ring::default_provider()

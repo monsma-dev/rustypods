@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         })?;
 
     let routes = Arc::new(control::RouteState::new());
-    let limits = proxy::ProxyLimits::from_env();
+    let limits = proxy::ProxyLimits::from_env().context("ingress environment")?;
     let state = proxy::proxy_state_with(routes.clone(), limits.clone());
     let http_listener = net::dual_stack_listener(cli.http_addr)
         .with_context(|| format!("bind http {}", cli.http_addr))?;

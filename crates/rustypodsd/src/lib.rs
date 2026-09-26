@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod dbus;
+pub mod envcfg;
 pub mod exec;
 pub mod http;
 pub mod ingress;

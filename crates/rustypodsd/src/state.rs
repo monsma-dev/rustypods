@@ -51,27 +51,24 @@ impl LimitsSpec {
     /// Fill defaults for a pod that does not exist on disk yet. Explicit
     /// non-zero limits win. MemoryMax and CPUQuota are applied only when
     /// `RUSTYPODS_DEFAULT_MEMORY_MAX` / `RUSTYPODS_DEFAULT_CPU` are set
-    /// (typically via `/etc/rustypods/daemon.env`). TasksMax is always set.
-    pub fn with_create_defaults(mut self) -> Self {
+    /// (typically via `/etc/rustypods/daemon.env`). A set value that does
+    /// not parse is an error. TasksMax is always set.
+    pub fn with_create_defaults(mut self) -> Result<Self> {
         if self.tasks_max == 0 {
             self.tasks_max = DEFAULT_TASKS_MAX;
         }
+        let env = crate::envcfg::DaemonEnv::from_env()?;
         if self.memory_max_bytes == 0 {
-            if let Ok(s) = std::env::var("RUSTYPODS_DEFAULT_MEMORY_MAX") {
-                if let Ok(b) = parse_bytes(s.trim()) {
-                    self.memory_max_bytes = b;
-                }
+            if let Some(b) = env.default_memory_max {
+                self.memory_max_bytes = b;
             }
         }
         if self.cpu_quota_percent == 0 {
-            if let Ok(s) = std::env::var("RUSTYPODS_DEFAULT_CPU") {
-                let t = s.trim().trim_end_matches('%');
-                if let Ok(n) = t.parse::<u32>() {
-                    self.cpu_quota_percent = n;
-                }
+            if let Some(n) = env.default_cpu_percent {
+                self.cpu_quota_percent = n;
             }
         }
-        self
+        Ok(self)
     }
 }
 
@@ -1629,7 +1626,7 @@ mod tests {
     fn create_defaults_explicit_override_and_newer_format_is_readonly() {
         std::env::set_var("RUSTYPODS_DEFAULT_MEMORY_MAX", "64M");
         std::env::set_var("RUSTYPODS_DEFAULT_CPU", "50%");
-        let d = LimitsSpec::default().with_create_defaults();
+        let d = LimitsSpec::default().with_create_defaults().unwrap();
         assert_eq!(d.tasks_max, DEFAULT_TASKS_MAX);
         assert_eq!(d.memory_max_bytes, 64 << 20);
         assert_eq!(d.cpu_quota_percent, 50);
@@ -1639,13 +1636,14 @@ mod tests {
             tasks_max: 3,
             ..LimitsSpec::default()
         }
-        .with_create_defaults();
+        .with_create_defaults()
+        .unwrap();
         assert_eq!(custom.memory_max_bytes, 1);
         assert_eq!(custom.cpu_quota_percent, 10);
         assert_eq!(custom.tasks_max, 3);
         std::env::remove_var("RUSTYPODS_DEFAULT_MEMORY_MAX");
         std::env::remove_var("RUSTYPODS_DEFAULT_CPU");
-        let bare = LimitsSpec::default().with_create_defaults();
+        let bare = LimitsSpec::default().with_create_defaults().unwrap();
         assert_eq!(bare.tasks_max, DEFAULT_TASKS_MAX);
         assert_eq!(bare.memory_max_bytes, 0);
         assert_eq!(bare.cpu_quota_percent, 0);

@@ -381,7 +381,7 @@ impl super::super::Svc {
         };
         let payload_path = staging.join(".payload");
         let mut file = tokio::fs::File::create(&payload_path).await.map_err(int)?;
-        let max_bytes = transfer::import_max_bytes();
+        let max_bytes = transfer::import_max_bytes().map_err(int)?;
         let mut bytes = 0u64;
         while let Some(c) = stream.next().await {
             let c = c?;

@@ -16,12 +16,8 @@ use std::path::{Path, PathBuf};
 /// Default live-file cap. Override with `RUSTYPODS_LOG_MAX_BYTES` (bytes).
 pub const DEFAULT_LOG_MAX_BYTES: u64 = 10 << 20;
 
-pub fn log_max_bytes() -> u64 {
-    std::env::var("RUSTYPODS_LOG_MAX_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_LOG_MAX_BYTES)
+pub fn log_max_bytes() -> Result<u64> {
+    Ok(crate::envcfg::load()?.log_max_bytes)
 }
 
 fn rotated_path(log: &Path) -> PathBuf {
@@ -132,7 +128,13 @@ pub fn sweep_orphan_logs(logs_dir: &Path, live: &std::collections::BTreeSet<Stri
 /// Background copytruncate pass. One task for the daemon lifetime; a quiet
 /// failure is logged, never fatal.
 pub fn spawn_rotator(logs_dir: PathBuf) {
-    let max = log_max_bytes();
+    let max = match log_max_bytes() {
+        Ok(max) => max,
+        Err(e) => {
+            tracing::error!("console log rotation disabled: {e:#}");
+            return;
+        }
+    };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

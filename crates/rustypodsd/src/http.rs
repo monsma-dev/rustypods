@@ -63,8 +63,6 @@ const EXEC_REQUEST_TIMEOUT: Duration = Duration::from_secs(910);
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Matches the gRPC server's global in-flight cap.
 pub const MAX_CONNECTIONS: usize = 256;
-const IMPORT_MAX_DEFAULT: u64 = 64 << 30;
-
 /// Read-write plus optional read-only bearer tokens.
 #[derive(Clone)]
 pub struct HttpAuth {
@@ -72,17 +70,11 @@ pub struct HttpAuth {
     pub ro: Arc<str>,
 }
 
-/// `RUSTYPODS_IMPORT_MAX_BYTES`, default 64 GiB. Shared with the transfer
-/// path — same variable, same default. Non-numeric or zero falls back.
-pub fn import_max_bytes() -> u64 {
-    match std::env::var("RUSTYPODS_IMPORT_MAX_BYTES") {
-        Ok(s) => s
-            .parse::<u64>()
-            .ok()
-            .filter(|n| *n > 0)
-            .unwrap_or(IMPORT_MAX_DEFAULT),
-        Err(_) => IMPORT_MAX_DEFAULT,
-    }
+/// `RUSTYPODS_IMPORT_MAX_BYTES`, default 64 GiB. Same parse as the
+/// transfer path: unset keeps the default, anything else must be a
+/// positive integer byte count.
+pub fn import_max_bytes() -> anyhow::Result<u64> {
+    crate::transfer::import_max_bytes()
 }
 
 /// `POST /v1/pods` body — local request struct (proto types are
@@ -794,8 +786,8 @@ async fn limit_request_time(req: AxumRequest, next: Next) -> Response {
     }
 }
 
-pub fn router(svc: Svc, auth: HttpAuth) -> Router {
-    router_with(svc, auth, import_max_bytes())
+pub fn router(svc: Svc, auth: HttpAuth) -> anyhow::Result<Router> {
+    Ok(router_with(svc, auth, import_max_bytes()?))
 }
 
 pub fn router_with(svc: Svc, auth: HttpAuth, import_max: u64) -> Router {

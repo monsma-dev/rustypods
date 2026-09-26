@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{bail, Context, Result};
+
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
@@ -61,31 +63,57 @@ pub struct ProxyLimits {
 
 impl Default for ProxyLimits {
     fn default() -> Self {
-        Self::from_env()
+        Self {
+            body_max: 32 << 20,
+            upstream_headers: Duration::from_secs(30),
+            ws_idle: Duration::from_secs(60),
+            max_inflight: 1024,
+            tls_handshake: Duration::from_secs(10),
+            header_read: Duration::from_secs(10),
+        }
     }
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(default)
+/// Positive integer. Unset keeps `default`. A set value that is empty,
+/// zero, or not a plain integer (no `100MB`) is an error.
+fn env_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("{name} is set but is not valid Unicode")
+        }
+        Ok(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                bail!("{name} is set but empty");
+            }
+            let n: u64 = t.parse().with_context(|| {
+                format!("{name} must be a positive integer (no unit suffix), got {t:?}")
+            })?;
+            if n == 0 {
+                bail!("{name} must be greater than 0");
+            }
+            Ok(n)
+        }
+    }
 }
 
 impl ProxyLimits {
-    pub fn from_env() -> Self {
-        Self {
-            body_max: env_u64("RUSTYPODS_INGRESS_MAX_BODY", 32 << 20),
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            body_max: env_u64("RUSTYPODS_INGRESS_MAX_BODY", 32 << 20)?,
             upstream_headers: Duration::from_secs(env_u64(
                 "RUSTYPODS_INGRESS_UPSTREAM_TIMEOUT_SECS",
                 30,
-            )),
-            ws_idle: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_WS_IDLE_SECS", 60)),
-            max_inflight: env_u64("RUSTYPODS_INGRESS_MAX_CONNS", 1024) as usize,
-            tls_handshake: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_TLS_HANDSHAKE_SECS", 10)),
-            header_read: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_HEADER_TIMEOUT_SECS", 10)),
-        }
+            )?),
+            ws_idle: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_WS_IDLE_SECS", 60)?),
+            max_inflight: env_u64("RUSTYPODS_INGRESS_MAX_CONNS", 1024)? as usize,
+            tls_handshake: Duration::from_secs(env_u64(
+                "RUSTYPODS_INGRESS_TLS_HANDSHAKE_SECS",
+                10,
+            )?),
+            header_read: Duration::from_secs(env_u64("RUSTYPODS_INGRESS_HEADER_TIMEOUT_SECS", 10)?),
+        })
     }
 }
 
@@ -100,7 +128,8 @@ pub struct ProxyState {
 }
 
 pub fn proxy_state(routes: Arc<RouteState>) -> Arc<ProxyState> {
-    proxy_state_with(routes, ProxyLimits::from_env())
+    let limits = ProxyLimits::from_env().unwrap_or_else(|e| panic!("ingress environment: {e:#}"));
+    proxy_state_with(routes, limits)
 }
 
 pub fn proxy_state_with(routes: Arc<RouteState>, limits: ProxyLimits) -> Arc<ProxyState> {
@@ -920,5 +949,20 @@ mod tests {
         let _ = tokio::time::timeout(T, &mut btask).await;
         ftask.abort();
         btask.abort();
+    }
+
+    #[test]
+    fn body_cap_rejects_a_unit_suffix() {
+        let prev = std::env::var("RUSTYPODS_INGRESS_MAX_BODY").ok();
+        std::env::set_var("RUSTYPODS_INGRESS_MAX_BODY", "100MB");
+        let err = ProxyLimits::from_env().unwrap_err();
+        match prev {
+            Some(v) => std::env::set_var("RUSTYPODS_INGRESS_MAX_BODY", v),
+            None => std::env::remove_var("RUSTYPODS_INGRESS_MAX_BODY"),
+        }
+        assert!(
+            err.to_string().contains("RUSTYPODS_INGRESS_MAX_BODY"),
+            "{err:#}"
+        );
     }
 }

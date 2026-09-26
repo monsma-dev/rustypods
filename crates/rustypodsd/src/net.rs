@@ -67,7 +67,9 @@ pub fn parse_pod_pool(v4: &str, v6: &str) -> Result<PodPool> {
 }
 
 /// Fail the daemon on a bad pool instead of carving addresses out of
-/// the wrong range. Tests use [`pool`], which falls back to the defaults.
+/// the wrong range. Unset variables keep the defaults; a set value that
+/// does not parse is an error. [`pool`] panics on that error if `load_pool`
+/// was not consulted first.
 pub fn load_pool() -> Result<&'static PodPool> {
     if let Some(p) = POD_POOL.get() {
         return Ok(p);
@@ -78,20 +80,14 @@ pub fn load_pool() -> Result<&'static PodPool> {
 }
 
 fn pool_from_env() -> Result<PodPool> {
-    let v4 = std::env::var("RUSTYPODS_POD_NET4").unwrap_or_else(|_| "10.220.0.0/16".into());
-    let v6 = std::env::var("RUSTYPODS_POD_NET6").unwrap_or_else(|_| "fd22:220::/32".into());
-    parse_pod_pool(&v4, &v6)
+    let env = crate::envcfg::DaemonEnv::from_env()?;
+    parse_pod_pool(&env.pod_net4, &env.pod_net6)
 }
 
 static POD_POOL: std::sync::OnceLock<PodPool> = std::sync::OnceLock::new();
 
 pub fn pool() -> &'static PodPool {
-    POD_POOL.get_or_init(|| {
-        pool_from_env().unwrap_or_else(|e| {
-            tracing::warn!("{e:#} — using 10.220.0.0/16 and fd22:220::/32");
-            parse_pod_pool("10.220.0.0/16", "fd22:220::/32").expect("default pool")
-        })
-    })
+    POD_POOL.get_or_init(|| pool_from_env().unwrap_or_else(|e| panic!("pod address pool: {e:#}")))
 }
 
 /// Host iface for a pod's veth pair (nspawn truncates to IFNAMSIZ-1 chars).

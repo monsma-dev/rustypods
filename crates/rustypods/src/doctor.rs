@@ -589,7 +589,14 @@ fn ca_pem_unconstrained(pem: &str) -> bool {
 /// route. Default routes and routes that sit entirely inside the pool
 /// (the daemon's own /30s) are ignored.
 fn pod_pool_overlap() -> Result<Option<String>> {
-    let spec = std::env::var("RUSTYPODS_POD_NET4").unwrap_or_else(|_| "10.220.0.0/16".into());
+    let spec = match std::env::var("RUSTYPODS_POD_NET4") {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => anyhow::bail!("RUSTYPODS_POD_NET4 is set but empty"),
+        Err(std::env::VarError::NotPresent) => "10.220.0.0/16".to_string(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("RUSTYPODS_POD_NET4 is set but is not valid Unicode")
+        }
+    };
     let (addr, prefix) = spec
         .split_once('/')
         .context("RUSTYPODS_POD_NET4 must look like 10.220.0.0/16")?;

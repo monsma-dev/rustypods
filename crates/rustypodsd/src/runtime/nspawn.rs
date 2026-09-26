@@ -135,7 +135,7 @@ fn host_env(env: &[String]) -> impl Iterator<Item = (&str, &str)> {
 async fn spawn(argv: &[OsString], log: &Path, env: &[String]) -> Result<u32> {
     // Cap before handing nspawn the O_APPEND fd. Rotation truncates that
     // same inode later (see runtime::logs) while nspawn keeps writing.
-    super::logs::rotate_console_log(log, super::logs::log_max_bytes())?;
+    super::logs::rotate_console_log(log, super::logs::log_max_bytes()?)?;
     let f = super::logs::open_console_log(log)?;
     let err = f.try_clone()?;
     let mut cmd = Command::new(&argv[0]);
