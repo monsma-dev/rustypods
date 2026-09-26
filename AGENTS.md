@@ -647,9 +647,12 @@ rides inside the encrypted tunnel.
   registry) and DNS `:53` (pod-facing). Both only reachable after
   WireGuard decap or from local pods — no port-53 conflict with
   systemd-resolved's 127.0.0.53 stub.
-- Registry wire format: JSON `{"names": {pod: fd<host>:<idx>::2}}`,
-  full-state replace every 30s + Notify-triggered pushes on
-  pod/peer lifecycle edges (set_local_names diffs to stay quiet).
+- Registry wire format: JSON `{"names": {pod: fd<host>:<idx>::2}}`
+  inside an HMAC frame of at most 1200 bytes. A full registry is several
+  chunks; the receiver refreshes each name's own TTL instead of replacing
+  the peer's map, so a lost chunk does not drop the names that arrived.
+  Announce every 30s, plus Notify-triggered pushes on pod/peer lifecycle
+  edges (set_local_names diffs to stay quiet).
 - Trust boundary: datagrams must arrive decapsulated AND with src ==
   exactly `fd<peer>::1`; registry values are sanitized to the
   announcer's own /48 AND valid ≤63-char DNS labels, capped at 1024

@@ -25,7 +25,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -75,9 +75,22 @@ const DNS_TCP_MAX_CONNS: usize = 32;
 const DNS_TCP_MAX_MSG: usize = 4096;
 /// Per-read idle timeout on a DNS TCP connection.
 const DNS_TCP_IDLE: Duration = Duration::from_secs(5);
-/// Announce cadence; remote registries expire after 3 intervals.
+/// Announce cadence; remote names expire after 3 intervals.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 const NAME_TTL: Duration = Duration::from_secs(95);
+/// Signed gossip datagram cap. 1200 stays under a 1420-byte WireGuard
+/// path MTU once the HMAC wrapper is included, so a chunk is never
+/// fragmented inside the tunnel.
+const GOSSIP_MAX_FRAME: usize = 1200;
+/// Unknown WireGuard sources may attempt this many handshakes per second.
+const UNKNOWN_HANDSHAKES_PER_SEC: u8 = 5;
+/// Curve25519 decapsulations tried for one unknown datagram. The rest of
+/// the peer set waits for a later packet, so one frame cannot walk every
+/// session while the pump holds the peer lock.
+const HANDSHAKE_SCAN_BUDGET: usize = 4;
+/// Cap on tracked unknown sources. A fresh address past the cap evicts one
+/// existing entry so the map cannot grow with spoofed source IPs.
+const HANDSHAKE_SOURCE_CAP: usize = 4096;
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const IFF_TUN: i16 = 0x0001;
 const IFF_NO_PI: i16 = 0x1000;
@@ -174,6 +187,71 @@ pub fn in_prefix(prefix: Ipv6Addr, addr: Ipv6Addr) -> bool {
 /// pod name → mesh address.
 type NameMap = std::collections::BTreeMap<String, Ipv6Addr>;
 
+/// One announced pod. `seen` is refreshed by every chunk that names it.
+struct RemotePod {
+    addr: Ipv6Addr,
+    seen: Instant,
+}
+
+type RemoteReg = HashMap<String, RemotePod>;
+
+struct SrcTokens {
+    tokens: u8,
+    updated: Instant,
+}
+
+/// Token bucket per unknown WireGuard source, plus the rotating cursor
+/// for the bounded handshake scan.
+#[derive(Default)]
+struct HandshakeGate {
+    sources: HashMap<SocketAddr, SrcTokens>,
+    cursor: usize,
+}
+
+impl HandshakeGate {
+    /// One handshake attempt. A new source starts with
+    /// [`UNKNOWN_HANDSHAKES_PER_SEC`] tokens; they refill at that rate.
+    fn allow(&mut self, src: SocketAddr, now: Instant) -> bool {
+        if !self.sources.contains_key(&src) && self.sources.len() >= HANDSHAKE_SOURCE_CAP {
+            if let Some(old) = self.sources.keys().next().copied() {
+                self.sources.remove(&old);
+            }
+        }
+        let entry = self.sources.entry(src).or_insert(SrcTokens {
+            tokens: UNKNOWN_HANDSHAKES_PER_SEC,
+            updated: now,
+        });
+        let per = Duration::from_millis(1000 / u64::from(UNKNOWN_HANDSHAKES_PER_SEC));
+        let elapsed = now.saturating_duration_since(entry.updated);
+        let steps = elapsed.as_millis() / per.as_millis();
+        if steps > 0 {
+            let credit = steps.min(u128::from(UNKNOWN_HANDSHAKES_PER_SEC));
+            entry.tokens = entry
+                .tokens
+                .saturating_add(credit as u8)
+                .min(UNKNOWN_HANDSHAKES_PER_SEC);
+            let remainder = Duration::from_millis((elapsed.as_millis() % per.as_millis()) as u64);
+            entry.updated = now.checked_sub(remainder).unwrap_or(now);
+        }
+        if entry.tokens == 0 {
+            return false;
+        }
+        entry.tokens -= 1;
+        true
+    }
+
+    /// Index of the first peer to try. Advances by the scan budget so the
+    /// next unknown datagram continues where this one stopped.
+    fn scan_start(&mut self, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let start = self.cursor % len;
+        self.cursor = self.cursor.wrapping_add(HANDSHAKE_SCAN_BUDGET);
+        start
+    }
+}
+
 /// Per-peer WG session + its announced endpoint.
 struct Peer {
     tunn: Tunn,
@@ -231,9 +309,13 @@ pub struct Mesh {
     gossip: UdpSocket,
     /// name → mesh addr for THIS host's running pods (fed by Svc).
     local_names: Mutex<std::collections::BTreeMap<String, Ipv6Addr>>,
-    /// peer /48 → (last refresh, its registry). Entries expire after
-    /// NAME_TTL without an announce — a dead peer's names decay.
-    remote_names: Mutex<HashMap<Ipv6Addr, (std::time::Instant, NameMap)>>,
+    /// peer /48 → pod name → addr and last refresh. A chunk refreshes
+    /// only the names it carries; the rest keep their own timestamps and
+    /// drop out after NAME_TTL.
+    remote_names: Mutex<HashMap<Ipv6Addr, RemoteReg>>,
+    /// Per-source handshake tokens and the rotating scan cursor. Checked
+    /// before `peers` is locked.
+    handshake: std::sync::Mutex<HandshakeGate>,
     /// Set by set_local_names/add_peer/remove_peer — wakes the
     /// announcer for an immediate push instead of waiting out the
     /// interval.
@@ -403,6 +485,7 @@ impl Mesh {
             gossip,
             local_names: Mutex::new(Default::default()),
             remote_names: Mutex::new(Default::default()),
+            handshake: std::sync::Mutex::new(HandshakeGate::default()),
             announce: tokio::sync::Notify::new(),
             upstream,
             tasks: Mutex::new(Vec::new()),
@@ -836,6 +919,16 @@ impl Mesh {
         tracing::trace!("mesh: no peer route for {dst}");
     }
 
+    fn allow_unknown_handshake(&self, src: SocketAddr) -> bool {
+        let mut gate = self.handshake.lock().unwrap_or_else(|err| err.into_inner());
+        gate.allow(src, Instant::now())
+    }
+
+    fn handshake_scan_start(&self, len: usize) -> usize {
+        let mut gate = self.handshake.lock().unwrap_or_else(|err| err.into_inner());
+        gate.scan_start(len)
+    }
+
     /// Wire → TUN: attribute the datagram to a peer session (endpoint
     /// map first, key-scan fallback for roaming sources), decapsulate,
     /// and write resulting plaintext packets into the TUN. Chained
@@ -846,20 +939,37 @@ impl Mesh {
             let eps = self.endpoints.lock().await;
             eps.get(&src).copied()
         };
+        // Unknown sources spend a handshake token before the peer lock.
+        // A flood of junk never reaches Curve25519.
+        if key.is_none() && !self.allow_unknown_handshake(src) {
+            tracing::debug!("mesh: handshake budget exceeded for {src}");
+            return;
+        }
         let mut peers = self.peers.lock().await;
         // Resolve which peer this datagram belongs to: known endpoint
-        // first; unknown sources try each session — only the right key
-        // will verify. On success we (re)bind the endpoint (roaming).
+        // first; unknown sources try a bounded window of sessions — only
+        // the right key will verify. On success we (re)bind the endpoint
+        // (roaming). The window rotates so a later packet tries the peers
+        // this one skipped.
         let pk = match key {
             Some(k) if peers.contains_key(&k) => Some(k),
             _ => {
                 let mut found = None;
-                for (k, p) in peers.iter_mut() {
+                let keys: Vec<[u8; 32]> = peers.keys().copied().collect();
+                let start = self.handshake_scan_start(keys.len());
+                let mut tried = 0usize;
+                for offset in 0..keys.len() {
+                    if tried >= HANDSHAKE_SCAN_BUDGET {
+                        break;
+                    }
+                    let k = keys[(start + offset) % keys.len()];
+                    let Some(p) = peers.get_mut(&k) else { continue };
+                    tried += 1;
                     match p.tunn.decapsulate(Some(src.ip()), dgram, out) {
                         TunnResult::Err(_) => continue,
                         r => {
                             self.dispatch_result(r, src).await;
-                            found = Some(*k);
+                            found = Some(k);
                             break;
                         }
                     }
@@ -954,10 +1064,13 @@ impl Mesh {
         if let Some(a) = self.local_names.lock().await.get(name) {
             return Some(*a);
         }
+        let now = Instant::now();
         let r = self.remote_names.lock().await;
         r.iter()
-            .filter(|(_, (t, _))| t.elapsed() < NAME_TTL)
-            .filter_map(|(p, (_, reg))| reg.get(name).map(|a| (*p, *a)))
+            .filter_map(|(p, reg)| {
+                let pod = reg.get(name)?;
+                (now.saturating_duration_since(pod.seen) < NAME_TTL).then_some((*p, pod.addr))
+            })
             .min_by_key(|(p, _)| *p)
             .map(|(_, a)| a)
     }
@@ -970,37 +1083,45 @@ impl Mesh {
         }
         // Sort peers by prefix so the displayed winner matches the
         // deterministic resolution in resolve().
+        let now = Instant::now();
         let remote = self.remote_names.lock().await;
         let mut remotes: Vec<_> = remote.iter().map(|(p, v)| (*p, v)).collect();
         remotes.sort_by_key(|(p, _)| *p);
-        for (_, (t, reg)) in remotes {
-            if t.elapsed() < NAME_TTL {
-                for (n, a) in reg {
-                    out.entry(n.clone()).or_insert_with(|| a.to_string());
+        for (_, reg) in remotes {
+            for (n, pod) in reg {
+                if now.saturating_duration_since(pod.seen) < NAME_TTL {
+                    out.entry(n.clone()).or_insert_with(|| pod.addr.to_string());
                 }
             }
         }
         out
     }
 
-    /// Push the local registry to every peer: an HMAC-signed JSON frame
-    /// over the tunnel to fd<peer>::1:5305. Full-state (not delta) —
-    /// replace semantics heal missed updates and pod removals. The
-    /// cluster token is cloned before the peer lock so signing never
-    /// holds the conf lock across the UDP send.
+    /// Push the local registry to every peer as HMAC-signed chunks of at
+    /// most [`GOSSIP_MAX_FRAME`] bytes. Each chunk is a subset. A name
+    /// that stops being announced expires on its own TTL, so a lost
+    /// chunk does not wipe the names that did arrive. The cluster token
+    /// is cloned before the peer lock, and destinations are snapshotted
+    /// before the sends.
     async fn send_announces(&self) {
         let names = self.local_names.lock().await.clone();
-        let payload = serde_json::json!({ "names": names }).to_string();
         let token = self.cluster_token().await;
-        let Some(body) = seal_gossip(&token, &payload) else {
-            tracing::debug!("mesh gossip: not sending (no cluster token)");
+        let frames = gossip_chunks(&token, &names);
+        if frames.is_empty() {
             return;
+        }
+        let dsts: Vec<SocketAddr> = {
+            let peers = self.peers.lock().await;
+            peers
+                .values()
+                .map(|p| SocketAddr::new(IpAddr::V6(host_addr(p.prefix)), GOSSIP_PORT))
+                .collect()
         };
-        let peers = self.peers.lock().await;
-        for p in peers.values() {
-            let dst = SocketAddr::new(IpAddr::V6(host_addr(p.prefix)), GOSSIP_PORT);
-            if let Err(e) = self.gossip.send_to(&body, dst).await {
-                tracing::debug!("mesh gossip → {dst}: {e}");
+        for dst in dsts {
+            for frame in &frames {
+                if let Err(e) = self.gossip.send_to(frame, dst).await {
+                    tracing::debug!("mesh gossip → {dst}: {e}");
+                }
             }
         }
     }
@@ -1011,7 +1132,9 @@ impl Mesh {
     /// payload to the cluster. A missing or wrong tag is dropped
     /// before the registry JSON is parsed.
     async fn gossip_rx(self: Arc<Self>) {
-        let mut buf = vec![0u8; 8192];
+        // One byte past the cap so a truncated oversized datagram is
+        // distinguishable from a frame that fits.
+        let mut buf = vec![0u8; GOSSIP_MAX_FRAME + 1];
         let mut shutdown = self.shutdown_tx.subscribe();
         loop {
             tokio::select! {
@@ -1031,6 +1154,10 @@ impl Mesh {
                         let segs = src6.segments();
                         Ipv6Addr::new(segs[0], segs[1], segs[2], 0, 0, 0, 0, 0)
                     };
+                    if n > GOSSIP_MAX_FRAME {
+                        tracing::debug!("mesh gossip: dropped oversized frame from {src}");
+                        continue;
+                    }
                     let token = self.cluster_token().await;
                     let Some(payload) = open_signed_gossip(&token, &buf[..n]) else {
                         tracing::debug!("mesh gossip: rejected frame from {src}");
@@ -1039,10 +1166,9 @@ impl Mesh {
                     match serde_json::from_str::<Ann>(&payload) {
                         Ok(a) => {
                             let names = sanitize_registry(peer_prefix, a.names);
-                            self.remote_names
-                                .lock()
-                                .await
-                                .insert(peer_prefix, (std::time::Instant::now(), names));
+                            let mut remote = self.remote_names.lock().await;
+                            let reg = remote.entry(peer_prefix).or_default();
+                            refresh_remote(reg, names, Instant::now());
                         }
                         Err(e) => tracing::debug!("mesh gossip parse: {e}"),
                     }
@@ -1060,10 +1186,10 @@ impl Mesh {
                 _ = shutdown.changed() => break,
                 _ = self.announce.notified() => self.send_announces().await,
                 _ = tick.tick() => {
-                    self.remote_names
-                        .lock()
-                        .await
-                        .retain(|_, (t, _)| t.elapsed() < NAME_TTL);
+                    {
+                        let mut remote = self.remote_names.lock().await;
+                        expire_remote(&mut remote, Instant::now());
+                    }
                     self.send_announces().await;
                 }
             }
@@ -1362,6 +1488,63 @@ fn gossip_mac(token: &str, payload: &str) -> Option<String> {
     mac.update(payload.as_bytes());
     let tag = mac.finalize().into_bytes();
     Some(hex_encode(&tag))
+}
+
+/// Signed frames for `names`, each at most [`GOSSIP_MAX_FRAME`] bytes.
+/// The union of the chunks is `names`. An empty map sends nothing; removed
+/// pods disappear when their TTL elapses.
+fn gossip_chunks(token: &str, names: &NameMap) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    let mut batch = NameMap::new();
+    for (name, addr) in names {
+        batch.insert(name.clone(), *addr);
+        let Some(frame) = sealed_names(token, &batch) else {
+            return Vec::new();
+        };
+        if frame.len() <= GOSSIP_MAX_FRAME {
+            continue;
+        }
+        batch.remove(name);
+        if let Some(prev) = sealed_names(token, &batch) {
+            frames.push(prev);
+        }
+        batch.clear();
+        batch.insert(name.clone(), *addr);
+        match sealed_names(token, &batch) {
+            Some(one) if one.len() <= GOSSIP_MAX_FRAME => {}
+            _ => batch.clear(),
+        }
+    }
+    if let Some(frame) = sealed_names(token, &batch) {
+        if frame.len() <= GOSSIP_MAX_FRAME {
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+fn sealed_names(token: &str, names: &NameMap) -> Option<Vec<u8>> {
+    if names.is_empty() {
+        return None;
+    }
+    let payload = serde_json::json!({ "names": names }).to_string();
+    seal_gossip(token, &payload)
+}
+
+/// Refresh the names a chunk carried. Names absent from this chunk keep
+/// the timestamp of the chunk that last mentioned them.
+fn refresh_remote(reg: &mut RemoteReg, names: NameMap, now: Instant) {
+    for (name, addr) in names {
+        reg.insert(name, RemotePod { addr, seen: now });
+    }
+}
+
+/// Drop pods that have not been refreshed within [`NAME_TTL`].
+fn expire_remote(regs: &mut HashMap<Ipv6Addr, RemoteReg>, now: Instant) {
+    for reg in regs.values_mut() {
+        reg.retain(|_, pod| now.saturating_duration_since(pod.seen) < NAME_TTL);
+    }
+    regs.retain(|_, reg| !reg.is_empty());
 }
 
 /// Wrap `payload` in a [`SignedGossip`] frame. Fails closed without a token.
@@ -1871,5 +2054,77 @@ mod tests {
         assert!(open_signed_gossip(token, payload.as_bytes()).is_none());
         assert!(open_signed_gossip("", &frame).is_none());
         assert!(seal_gossip("", &payload).is_none());
+    }
+
+    #[test]
+    fn gossip_chunks_fit_the_tunnel_and_cover_every_name() {
+        let token = "cluster-token";
+        let mut names = NameMap::new();
+        for i in 0..200u16 {
+            names.insert(
+                format!("pod{i:04}"),
+                Ipv6Addr::new(0xfdab, 0x1, 0x2, i, 0, 0, 0, 2),
+            );
+        }
+        let frames = gossip_chunks(token, &names);
+        assert!(frames.len() > 1, "200 names must span more than one MTU");
+        let mut got = NameMap::new();
+        for frame in &frames {
+            assert!(frame.len() <= GOSSIP_MAX_FRAME, "{}", frame.len());
+            let payload = open_signed_gossip(token, frame).unwrap();
+            let ann: Ann = serde_json::from_str(&payload).unwrap();
+            got.extend(ann.names);
+        }
+        assert_eq!(got, names);
+        assert!(gossip_chunks("", &names).is_empty());
+    }
+
+    #[test]
+    fn gossip_chunk_refreshes_without_erasing_other_names() {
+        let peer = Ipv6Addr::new(0xfdab, 0x1, 0x2, 0, 0, 0, 0, 0);
+        let mut regs = HashMap::new();
+        let t0 = Instant::now();
+        let mut first = NameMap::new();
+        first.insert("db".into(), Ipv6Addr::LOCALHOST);
+        refresh_remote(regs.entry(peer).or_default(), first, t0);
+        let mut second = NameMap::new();
+        second.insert("web".into(), Ipv6Addr::LOCALHOST);
+        refresh_remote(regs.entry(peer).or_default(), second, t0);
+        assert!(regs[&peer].contains_key("db"));
+        assert!(regs[&peer].contains_key("web"));
+        expire_remote(&mut regs, t0 + NAME_TTL);
+        assert!(regs.is_empty());
+    }
+
+    #[test]
+    fn unknown_handshake_budget_is_five_per_second_and_bounded() {
+        let mut gate = HandshakeGate::default();
+        let src: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..UNKNOWN_HANDSHAKES_PER_SEC {
+            assert!(gate.allow(src, t0));
+        }
+        assert!(!gate.allow(src, t0));
+        let later = t0 + Duration::from_millis(200);
+        assert!(gate.allow(src, later));
+        assert!(!gate.allow(src, later));
+
+        let start = gate.scan_start(10);
+        assert_eq!(start, 0);
+        assert_eq!(gate.scan_start(10), HANDSHAKE_SCAN_BUDGET);
+
+        for i in 0..HANDSHAKE_SOURCE_CAP + 32 {
+            let addr = SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(
+                    203,
+                    0,
+                    (i / 256) as u8,
+                    (i % 256) as u8,
+                )),
+                1,
+            );
+            gate.allow(addr, t0);
+        }
+        assert!(gate.sources.len() <= HANDSHAKE_SOURCE_CAP);
     }
 }
