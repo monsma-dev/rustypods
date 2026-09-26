@@ -35,6 +35,8 @@ pub struct DaemonEnv {
     pub http_insecure: bool,
     /// `RUSTYPODS_HTTP_TOKEN_ROTATE` is present.
     pub http_token_rotate: bool,
+    /// `RUSTYPODS_READ_ONLY_UIDS`, comma-separated. Missing means nobody.
+    pub read_only_uids: Vec<u32>,
 }
 
 static LOADED: OnceLock<DaemonEnv> = OnceLock::new();
@@ -51,6 +53,7 @@ impl DaemonEnv {
             default_cpu_percent: var_cpu("RUSTYPODS_DEFAULT_CPU")?,
             http_insecure: std::env::var_os("RUSTYPODS_HTTP_INSECURE").is_some(),
             http_token_rotate: std::env::var_os("RUSTYPODS_HTTP_TOKEN_ROTATE").is_some(),
+            read_only_uids: var_uids("RUSTYPODS_READ_ONLY_UIDS")?,
         })
     }
 }
@@ -81,6 +84,32 @@ fn var_present(name: &str) -> Result<Option<String>> {
             Ok(Some(t.to_string()))
         }
     }
+}
+
+/// Comma-separated uids. Missing keeps an empty list. Empty, `0`, or a
+/// non-numeric entry fails the parse — uid 0 is already an administrator.
+fn var_uids(name: &str) -> Result<Vec<u32>> {
+    let Some(s) = var_present(name)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            bail!("{name} contains an empty uid");
+        }
+        let uid: u32 = part
+            .parse()
+            .with_context(|| format!("{name} has a non-numeric uid {part:?}"))?;
+        if uid == 0 {
+            bail!("{name} must not list uid 0 — root is already an administrator");
+        }
+        if out.contains(&uid) {
+            bail!("{name} lists uid {uid} more than once");
+        }
+        out.push(uid);
+    }
+    Ok(out)
 }
 
 fn var_string(name: &str, default: &str) -> Result<String> {
@@ -163,11 +192,40 @@ mod tests {
         let _b = Restore::clear("RUSTYPODS_LOG_MAX_BYTES");
         let _c = Restore::clear("RUSTYPODS_DEFAULT_MEMORY_MAX");
         let _d = Restore::clear("RUSTYPODS_DEFAULT_CPU");
+        let _e = Restore::clear("RUSTYPODS_READ_ONLY_UIDS");
         let env = DaemonEnv::from_env().unwrap();
         assert_eq!(env.import_max_bytes, DEFAULT_IMPORT_MAX_BYTES);
         assert_eq!(env.log_max_bytes, DEFAULT_LOG_MAX_BYTES);
         assert_eq!(env.default_memory_max, None);
         assert_eq!(env.default_cpu_percent, None);
+        assert!(env.read_only_uids.is_empty());
+    }
+
+    #[test]
+    fn read_only_uids_parse_and_reject_garbage() {
+        let _restore = Restore::set("RUSTYPODS_READ_ONLY_UIDS", "1001, 1002");
+        assert_eq!(
+            DaemonEnv::from_env().unwrap().read_only_uids,
+            vec![1001, 1002]
+        );
+        drop(_restore);
+        let _restore = Restore::set("RUSTYPODS_READ_ONLY_UIDS", "1001,,1002");
+        assert!(DaemonEnv::from_env()
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
+        drop(_restore);
+        let _restore = Restore::set("RUSTYPODS_READ_ONLY_UIDS", "0");
+        assert!(DaemonEnv::from_env()
+            .unwrap_err()
+            .to_string()
+            .contains("uid 0"));
+        drop(_restore);
+        let _restore = Restore::set("RUSTYPODS_READ_ONLY_UIDS", "");
+        assert!(DaemonEnv::from_env()
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
     }
 
     #[test]

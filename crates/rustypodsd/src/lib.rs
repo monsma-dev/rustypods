@@ -26,8 +26,11 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Unix socket the daemon listens on.
     pub socket: PathBuf,
-    /// Besides uid 0, this uid may talk to the daemon (single-user box).
+    /// Besides uid 0, this uid may mutate the daemon (single-user box).
     pub allowed_uid: u32,
+    /// Uids that may connect and call read RPCs. Mutating calls are
+    /// rejected. Empty unless `RUSTYPODS_READ_ONLY_UIDS` is set.
+    pub read_only_uids: Vec<u32>,
     /// Host user that owns the rootless podman store (for distrobox import).
     pub import_user: String,
     /// REST/JSON API bind address; "" disables the HTTP listener.

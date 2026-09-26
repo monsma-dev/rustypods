@@ -1,5 +1,7 @@
 //! tonic server on a Unix socket. Peer credentials gate access:
-//! uid 0 or Config::allowed_uid may connect; everyone else is dropped.
+//! uid 0 or Config::allowed_uid may mutate; uids in
+//! `Config::read_only_uids` may connect for the read RPCs only.
+//! Everyone else is dropped. Mutating calls are appended to `audit.log`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -27,6 +29,7 @@ use crate::state::{self, ImageMeta, IngressSpec, LimitsSpec, PodMeta, State, Vol
 use crate::storage::StorageDriver;
 use crate::{ingress, mesh, net, pki, runtime, storage, transfer, Config};
 
+mod access;
 mod svc;
 use svc::transfer::import_distrobox;
 
@@ -2933,6 +2936,7 @@ impl Svc {
                 data_dir,
                 socket: std::path::PathBuf::from("/tmp/rustypods-test.sock"),
                 allowed_uid: 1000,
+                read_only_uids: Vec::new(),
                 import_user: "test".into(),
                 http_addr: String::new(),
                 gc_interval_secs: 300,
@@ -3367,7 +3371,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
         });
     }
 
+    let audit = access::AuditLog::open(&cfg.data_dir).context("mutation audit log")?;
+    let readers: Arc<BTreeSet<u32>> = Arc::new(cfg.read_only_uids.iter().copied().collect());
     let allowed = cfg.allowed_uid;
+    let readers_accept = Arc::clone(&readers);
     let (tx, rx) = tokio::sync::mpsc::channel::<tokio::net::UnixStream>(32);
     let (shut_tx, shut_rx) = tokio::sync::watch::channel(false);
     {
@@ -3407,7 +3414,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 }
                 acc = listener.accept() => match acc {
                     Ok((s, _)) => match s.peer_cred() {
-                        Ok(c) if c.uid() == 0 || c.uid() == allowed => {
+                        Ok(c)
+                            if c.uid() == 0
+                                || c.uid() == allowed
+                                || readers_accept.contains(&c.uid()) =>
+                        {
                             if tx.try_send(s).is_err() {
                                 tracing::warn!("accept queue full, connection dropped");
                             }
@@ -3428,14 +3439,19 @@ pub async fn serve(cfg: Config) -> Result<()> {
     tracing::info!("rustypodsd listening on {}", cfg.socket.display());
     cfg.notify.ready();
     let mut shut_serve = shut_rx.clone();
+    let readers_gate = Arc::clone(&readers);
     let grpc = Server::builder()
-        // The socket admits uid 0 and the allowed uid — both can spawn
-        // streaming RPCs (journalctl/tail/nsenter). Cap in-flight requests
-        // per connection and across the whole server so one chatty client
-        // can't exhaust the subprocess/desc budget.
+        // The socket admits uid 0, the admin uid, and the read-only
+        // uids. Streaming RPCs (journalctl/tail/exec) stay admin-only.
+        // Cap in-flight requests per connection and across the whole
+        // server so one chatty client can't exhaust the subprocess budget.
         .concurrency_limit_per_connection(32)
         .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256))
-        .add_service(PodControlServer::new(svc))
+        .layer(access::StampPathLayer)
+        .add_service(PodControlServer::with_interceptor(
+            svc,
+            move |req: Request<()>| access::authorize(&audit, allowed, &readers_gate, req),
+        ))
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shut_serve.wait_for(|v| *v).await;
         });

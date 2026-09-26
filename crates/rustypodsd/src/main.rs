@@ -150,6 +150,10 @@ async fn run(notify: rustypodsd::notify::Notifier) -> Result<()> {
         data_dir: args.data_dir,
         socket: args.socket,
         allowed_uid: args.allowed_uid,
+        read_only_uids: rustypodsd::envcfg::load()
+            .context("daemon environment")?
+            .read_only_uids
+            .clone(),
         import_user,
         http_addr: args.http_addr,
         gc_interval_secs: args.gc_interval_secs,

@@ -582,7 +582,12 @@ that peer's WireGuard DNS SAN, not the zone apex.
   SAN is the TCP source. The UDS listener stays plaintext; SO_PEERCRED
   is its gate. `node.key` is group-readable by `--allowed-uid` so
   `rustypods --host` can present it; `ca.key` stays mode 0600.
-  Gossip still uses the shared `cluster_token`.
+  Gossip still uses `cluster_token`. Current and previous HMAC keys are
+  both verified; an empty grace token does not authorize.
+  `POST /v1/mesh/rotate-token`
+  moves the current token into `cluster_token_prev` (mesh.conf format 3)
+  and installs the new one; `POST /v1/mesh/retire-token` drops the grace
+  token. Gossip verifies both keys and still signs with the current one.
   The mesh identity CA lives in `<data>/mesh-pki`, separate from the
   ingress CA in `<data>/pki`. It may sign leaves only, and only names
   under `node.mesh.rustypods` plus `fd00::/8`. `Mesh::start` mints it.
@@ -591,6 +596,10 @@ that peer's WireGuard DNS SAN, not the zone apex.
   Generate on the FIRST host (`mesh init` auto-mints when absent);
   `mesh init --token <tok>` on joiners. `mesh status` prints it — UDS
   is uid-gated so that's safe. Debug-redacted in MeshConf.
+  Local socket: uid 0 and `--allowed-uid` may mutate. `RUSTYPODS_READ_ONLY_UIDS`
+  may connect for the read RPCs only. Mutating calls append a JSON line
+  to `<data>/audit.log` (0600). `GET /metrics` (read-only bearer) is
+  OpenMetrics for the mesh pump counters.
 - Defense in depth: nftables `rustypods-mesh-rpc` input chain drops
   tcp/5306 from anything but the peers' `fd<peer>::1` addrs (rebuilt on
   every add/remove-peer and mesh start). nft alone is NOT sufficient —

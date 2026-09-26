@@ -8,7 +8,9 @@
 //! `http-token-ro` (both mode 0400, owned by the allowed uid). They are
 //! created once and reused across restarts (the unit sets
 //! `RuntimeDirectoryPreserve=yes`; /run is tmpfs, so a reboot still mints
-//! new ones); `RUSTYPODS_HTTP_TOKEN_ROTATE=1` rotates on demand. The read-only token may only call GET. Requests carrying
+//! new ones); `RUSTYPODS_HTTP_TOKEN_ROTATE=1` rotates on demand. The
+//! read-only token may only call GET, including `GET /metrics`
+//! (OpenMetrics for the mesh pump counters). Requests carrying
 //! `Origin` or `Sec-Fetch-Site` are rejected — browsers have no business
 //! here. `/healthz` stays open and reports whether daemon state can be
 //! locked. The bind is loopback-only unless `RUSTYPODS_HTTP_INSECURE=1`;
@@ -645,6 +647,71 @@ async fn mesh_status_http(State(s): State<Svc>) -> Result<Json<MeshStatus>, ApiE
     Ok(Json(st))
 }
 
+/// OpenMetrics text for the mesh pump counters. Scrapers use the
+/// read-only bearer; the cluster token is not included.
+pub(crate) fn render_mesh_metrics(st: &MeshStatus) -> String {
+    format!(
+        "# HELP rustypods_mesh_up 1 when the WireGuard mesh is running.\n\
+         # TYPE rustypods_mesh_up gauge\n\
+         rustypods_mesh_up {up}\n\
+         # HELP rustypods_mesh_peers Configured mesh peers.\n\
+         # TYPE rustypods_mesh_peers gauge\n\
+         rustypods_mesh_peers {peers}\n\
+         # TYPE rustypods_mesh_pump_ticks counter\n\
+         rustypods_mesh_pump_ticks {ticks}\n\
+         # TYPE rustypods_mesh_udp_packets counter\n\
+         rustypods_mesh_udp_packets {udp}\n\
+         # TYPE rustypods_mesh_tun_packets counter\n\
+         rustypods_mesh_tun_packets {tun}\n\
+         # TYPE rustypods_mesh_tun_drops counter\n\
+         rustypods_mesh_tun_drops {drops}\n\
+         # EOF\n",
+        up = u8::from(st.enabled),
+        peers = st.peers.len(),
+        ticks = st.pump_ticks,
+        udp = st.udp_pkts,
+        tun = st.tun_pkts,
+        drops = st.tun_drops,
+    )
+}
+
+async fn metrics_http(State(s): State<Svc>) -> Result<Response, ApiErr> {
+    let st = s
+        .get_mesh_status(Request::new(Empty {}))
+        .await
+        .map(|r| r.into_inner())
+        .map_err(api_err)?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        render_mesh_metrics(&st),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct RotateTokenIn {
+    #[serde(default)]
+    token: String,
+}
+
+/// `POST /v1/mesh/rotate-token?token=…` — empty token mints a new one.
+/// The previous token stays valid until retire-token.
+async fn rotate_token_http(
+    State(s): State<Svc>,
+    Query(q): Query<RotateTokenIn>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let token = s.rotate_cluster_token(&q.token).await.map_err(api_err)?;
+    Ok(Json(serde_json::json!({ "cluster_token": token })))
+}
+
+async fn retire_token_http(State(s): State<Svc>) -> Result<StatusCode, ApiErr> {
+    s.retire_cluster_token().await.map_err(api_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn mesh_init_http(
     State(s): State<Svc>,
     Query(q): Query<MeshInitIn>,
@@ -815,6 +882,9 @@ pub fn router_with(svc: Svc, auth: HttpAuth, import_max: u64) -> Router {
         .route("/v1/mesh/init", post(mesh_init_http))
         .route("/v1/mesh/peers", post(mesh_add_peer_http))
         .route("/v1/mesh/peers/{*pubkey}", delete(mesh_rm_peer_http))
+        .route("/v1/mesh/rotate-token", post(rotate_token_http))
+        .route("/v1/mesh/retire-token", post(retire_token_http))
+        .route("/metrics", get(metrics_http))
         .route_layer(axum::middleware::from_fn_with_state(auth, require_token));
     Router::new()
         .route("/healthz", get(healthz))
@@ -1012,6 +1082,26 @@ mod tests {
     }
 
     #[test]
+    fn mesh_metrics_are_openmetrics_without_the_token() {
+        let text = render_mesh_metrics(&MeshStatus {
+            enabled: true,
+            pump_ticks: 3,
+            udp_pkts: 4,
+            tun_pkts: 5,
+            tun_drops: 6,
+            peers: vec![MeshPeerInfo::default()],
+            cluster_token: "secret-token".into(),
+            ..Default::default()
+        });
+        assert!(text.contains("rustypods_mesh_up 1\n"), "{text}");
+        assert!(text.contains("rustypods_mesh_peers 1\n"), "{text}");
+        assert!(text.contains("rustypods_mesh_pump_ticks 3\n"), "{text}");
+        assert!(text.contains("rustypods_mesh_tun_drops 6\n"), "{text}");
+        assert!(text.ends_with("# EOF\n"), "{text}");
+        assert!(!text.contains("secret-token"), "{text}");
+    }
+
+    #[test]
     fn tokens_persist_until_rotate() {
         let dir = std::env::temp_dir().join(format!(
             "rp-tok-{}-{}",
@@ -1112,6 +1202,58 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn metrics_require_a_bearer_and_rotate_needs_a_mesh() {
+        let res = call(
+            app(),
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = call(
+            app(),
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", "Bearer ro-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("rustypods_mesh_up 0"), "{text}");
+        assert!(text.contains("# EOF"), "{text}");
+
+        let res = call(
+            app(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mesh/rotate-token")
+                .header("authorization", "Bearer ro-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let res = call(
+            app(),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mesh/rotate-token")
+                .header("authorization", "Bearer rw-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]

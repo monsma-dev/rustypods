@@ -181,7 +181,13 @@ pub fn host_addr(prefix: Ipv6Addr) -> Ipv6Addr {
 
 /// Whether `addr` sits under `prefix` (/48 = first 6 bytes).
 pub fn in_prefix(prefix: Ipv6Addr, addr: Ipv6Addr) -> bool {
-    addr.segments()[..3] == prefix.segments()[..3]
+    prefix_key(addr) == prefix_key(prefix)
+}
+
+/// First 48 bits, the route key for a peer prefix and every address under it.
+fn prefix_key(addr: Ipv6Addr) -> [u16; 3] {
+    let s = addr.segments();
+    [s[0], s[1], s[2]]
 }
 
 /// pod name → mesh address.
@@ -260,6 +266,85 @@ struct Peer {
     prefix: Ipv6Addr,
 }
 
+/// Sessions keyed by WG pubkey, plus a /48 index so outbound routing
+/// does not scan every peer.
+#[derive(Default)]
+struct PeerSet {
+    by_key: HashMap<[u8; 32], Peer>,
+    by_prefix: HashMap<[u16; 3], [u8; 32]>,
+}
+
+impl PeerSet {
+    fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    fn insert(&mut self, pk: [u8; 32], peer: Peer) -> Option<Peer> {
+        let route = prefix_key(peer.prefix);
+        let old = self.by_key.insert(pk, peer);
+        if let Some(prev) = &old {
+            let prev_route = prefix_key(prev.prefix);
+            if prev_route != route {
+                self.by_prefix.remove(&prev_route);
+            }
+        }
+        self.by_prefix.insert(route, pk);
+        old
+    }
+
+    fn remove(&mut self, pk: &[u8; 32]) -> Option<Peer> {
+        let old = self.by_key.remove(pk)?;
+        let route = prefix_key(old.prefix);
+        if self.by_prefix.get(&route) == Some(pk) {
+            self.by_prefix.remove(&route);
+        }
+        Some(old)
+    }
+
+    fn get_mut(&mut self, pk: &[u8; 32]) -> Option<&mut Peer> {
+        self.by_key.get_mut(pk)
+    }
+
+    fn contains_key(&self, pk: &[u8; 32]) -> bool {
+        self.by_key.contains_key(pk)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.by_key.keys()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Peer> {
+        self.by_key.values()
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut Peer> {
+        self.by_key.values_mut()
+    }
+
+    /// The peer that owns `dst`'s /48.
+    fn by_dst(&mut self, dst: Ipv6Addr) -> Option<&mut Peer> {
+        let pk = *self.by_prefix.get(&prefix_key(dst))?;
+        self.by_key.get_mut(&pk)
+    }
+
+    /// True when `src` is exactly `fd<peer>::1` for a live session.
+    fn is_daemon_source(&self, src: Ipv6Addr) -> bool {
+        let Some(pk) = self.by_prefix.get(&prefix_key(src)) else {
+            return false;
+        };
+        self.by_key
+            .get(pk)
+            .is_some_and(|p| host_addr(p.prefix) == src)
+    }
+}
+
+/// Owned pump output. Copied out of the reusable encapsulate buffer so
+/// the peer lock can drop before the socket or TUN write.
+enum Outbound {
+    Udp(Vec<u8>, SocketAddr),
+    Tun(Vec<u8>),
+}
+
 /// The live mesh: one TUN, one UDP socket, N boringtun sessions.
 pub struct Mesh {
     /// This host's fd…::/48 — the prefix remote pods dial into.
@@ -270,7 +355,10 @@ pub struct Mesh {
     pub port: u16,
     data_dir: PathBuf,
     conf: Mutex<MeshConf>,
-    peers: Mutex<HashMap<[u8; 32], Peer>>,
+    /// Current and previous cluster tokens. A std lock so the mesh-RPC
+    /// interceptor can compare both without awaiting `conf`.
+    cluster_tokens: std::sync::RwLock<(String, String)>,
+    peers: Mutex<PeerSet>,
     /// src endpoint → peer key; updated on roaming so NAT'd peers keep
     /// working after their source address changes mid-session.
     endpoints: Mutex<HashMap<SocketAddr, [u8; 32]>>,
@@ -446,7 +534,7 @@ impl Mesh {
             .with_context(|| format!("bind mesh gossip [{host}]:{GOSSIP_PORT}"))?;
         let upstream = net::upstream_resolver();
 
-        let mut peers = HashMap::new();
+        let mut peers = PeerSet::default();
         let mut endpoints = HashMap::new();
         for (i, pc) in conf.peers.iter().enumerate() {
             let (p, ep) = build_peer(&secret, pc, i as u32)?;
@@ -464,12 +552,14 @@ impl Mesh {
         }
 
         let (shutdown_tx, _) = watch::channel(false);
+        let token_pair = (conf.cluster_token.clone(), conf.cluster_token_prev.clone());
         let mesh = Arc::new(Mesh {
             prefix,
             pubkey,
             port,
             data_dir: data_dir.to_path_buf(),
             conf: Mutex::new(conf),
+            cluster_tokens: std::sync::RwLock::new(token_pair),
             peers: Mutex::new(peers),
             endpoints: Mutex::new(endpoints),
             tun: AsyncFd::new(tun)?,
@@ -563,6 +653,63 @@ impl Mesh {
         self.conf.lock().await.cluster_token.clone()
     }
 
+    /// Current token, then the grace token. Cheap clone for the interceptor.
+    pub fn cluster_tokens(&self) -> (String, String) {
+        self.cluster_tokens
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn store_tokens(&self, conf: &MeshConf) {
+        let mut guard = self
+            .cluster_tokens
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = (conf.cluster_token.clone(), conf.cluster_token_prev.clone());
+    }
+
+    /// Move the current token into the grace slot and install `next`.
+    /// An empty `next` mints a new token. Passing the current token is a
+    /// no-op so a retry does not demote it into the grace slot.
+    pub async fn rotate_cluster_token(&self, next: &str) -> Result<String> {
+        let next = next.trim();
+        let mut conf = self.conf.lock().await;
+        if !next.is_empty() && next == conf.cluster_token {
+            self.store_tokens(&conf);
+            return Ok(conf.cluster_token.clone());
+        }
+        let mut updated = conf.clone();
+        updated.cluster_token_prev = std::mem::take(&mut updated.cluster_token);
+        updated.cluster_token = if next.is_empty() {
+            let mut raw = [0u8; 32];
+            rand_core::OsRng.fill_bytes(&mut raw);
+            raw.iter().map(|b| format!("{b:02x}")).collect()
+        } else {
+            next.to_string()
+        };
+        crate::state::save_mesh(&self.data_dir, &updated)?;
+        self.store_tokens(&updated);
+        let token = updated.cluster_token.clone();
+        *conf = updated;
+        Ok(token)
+    }
+
+    /// Drop the grace token. Mesh-RPC and gossip then accept only the
+    /// current token.
+    pub async fn retire_cluster_token(&self) -> Result<()> {
+        let mut conf = self.conf.lock().await;
+        if conf.cluster_token_prev.is_empty() {
+            return Ok(());
+        }
+        let mut updated = conf.clone();
+        updated.cluster_token_prev.clear();
+        crate::state::save_mesh(&self.data_dir, &updated)?;
+        self.store_tokens(&updated);
+        *conf = updated;
+        Ok(())
+    }
+
     /// Older mesh.conf files have no token. Mint and persist one exactly once
     /// when the cluster-plane listener first starts.
     pub async fn ensure_cluster_token(&self) -> Result<String> {
@@ -573,6 +720,7 @@ impl Mesh {
             conf.cluster_token = raw.iter().map(|b| format!("{b:02x}")).collect();
             crate::state::save_mesh(&self.data_dir, &conf)?;
         }
+        self.store_tokens(&conf);
         Ok(conf.cluster_token.clone())
     }
 
@@ -741,13 +889,18 @@ impl Mesh {
     /// before traffic flows.
     async fn kick(&self, pk: [u8; 32]) {
         let mut buf = [0u8; 148];
-        let mut peers = self.peers.lock().await;
-        if let Some(p) = peers.get_mut(&pk) {
-            if let TunnResult::WriteToNetwork(d) =
-                p.tunn.format_handshake_initiation(&mut buf, false)
-            {
-                let _ = self.udp.send_to(d, p.endpoint).await;
+        let pending = {
+            let mut peers = self.peers.lock().await;
+            let Some(p) = peers.get_mut(&pk) else {
+                return;
+            };
+            match p.tunn.format_handshake_initiation(&mut buf, false) {
+                TunnResult::WriteToNetwork(d) => Some((d.to_vec(), p.endpoint)),
+                _ => None,
             }
+        };
+        if let Some((dgram, endpoint)) = pending {
+            let _ = self.udp.send_to(&dgram, endpoint).await;
         }
     }
 
@@ -902,7 +1055,9 @@ impl Mesh {
         }
     }
 
-    /// TUN → wire: find the peer owning the dst /48 and encapsulate.
+    /// TUN → wire: the /48 index names the peer, encapsulate, then send
+    /// after the peer lock is released. Holding that lock across
+    /// `send_to` stalls handshake handling for every other peer.
     async fn route_out(&self, pkt: &[u8], out: &mut [u8]) {
         let Some(IpAddr::V6(dst)) = Tunn::dst_address(pkt) else {
             return; // v4 has no place on the mesh — pods speak ULA v6
@@ -910,25 +1065,26 @@ impl Mesh {
         if in_prefix(self.prefix, dst) {
             return; // local space never re-enters the tunnel
         }
-        let mut peers = self.peers.lock().await;
-        for p in peers.values_mut() {
-            if !in_prefix(p.prefix, dst) {
-                continue;
-            }
+        let pending = {
+            let mut peers = self.peers.lock().await;
+            let Some(p) = peers.by_dst(dst) else {
+                tracing::trace!("mesh: no peer route for {dst}");
+                return;
+            };
             match p.tunn.encapsulate(pkt, out) {
-                TunnResult::WriteToNetwork(dgram) => {
-                    if let Err(e) = self.udp.send_to(dgram, p.endpoint).await {
-                        tracing::debug!("mesh udp send {}: {e}", p.endpoint);
-                    }
-                }
+                TunnResult::WriteToNetwork(dgram) => Some((dgram.to_vec(), p.endpoint)),
                 TunnResult::Err(e) => {
                     tracing::debug!("mesh encapsulate: {e:?}");
+                    None
                 }
-                _ => {}
+                _ => None,
             }
-            return;
+        };
+        if let Some((dgram, endpoint)) = pending {
+            if let Err(e) = self.udp.send_to(&dgram, endpoint).await {
+                tracing::debug!("mesh udp send {endpoint}: {e}");
+            }
         }
-        tracing::trace!("mesh: no peer route for {dst}");
     }
 
     fn allow_unknown_handshake(&self, src: SocketAddr) -> bool {
@@ -957,6 +1113,7 @@ impl Mesh {
             tracing::debug!("mesh: handshake budget exceeded for {src}");
             return;
         }
+        let mut outbound = Vec::new();
         let mut peers = self.peers.lock().await;
         // Resolve which peer this datagram belongs to: known endpoint
         // first; unknown sources try a bounded window of sessions — only
@@ -980,7 +1137,9 @@ impl Mesh {
                     match p.tunn.decapsulate(Some(src.ip()), dgram, out) {
                         TunnResult::Err(_) => continue,
                         r => {
-                            self.dispatch_result(r, src).await;
+                            if let Some(item) = self.classify(r, src) {
+                                outbound.push(item);
+                            }
                             found = Some(k);
                             break;
                         }
@@ -1002,56 +1161,93 @@ impl Mesh {
                 found
             }
         };
-        let Some(pk) = pk else { return };
+        let Some(pk) = pk else {
+            drop(peers);
+            self.flush(&outbound).await;
+            return;
+        };
         // We already consumed the datagram in the fallback branch; for
         // the known-endpoint path decapsulate it now.
         if key.is_some() {
-            let Some(p) = peers.get_mut(&pk) else { return };
+            let Some(p) = peers.get_mut(&pk) else {
+                drop(peers);
+                self.flush(&outbound).await;
+                return;
+            };
             let r = p.tunn.decapsulate(Some(src.ip()), dgram, out);
-            self.dispatch_result(r, src).await;
+            if let Some(item) = self.classify(r, src) {
+                outbound.push(item);
+            }
         }
         // Drain queued protocol messages until Done (boringtun contract).
         if let Some(p) = peers.get_mut(&pk) {
             loop {
                 match p.tunn.decapsulate(None, &[], out) {
                     TunnResult::Done => break,
-                    r => self.dispatch_result(r, src).await,
-                }
-            }
-        }
-    }
-
-    /// Handle one TunnResult: protocol messages go back to the wire,
-    /// plaintext goes into the TUN — but only when its dst sits inside
-    /// OUR /48 (a peer may not inject routes for foreign space).
-    async fn dispatch_result<'a>(&'a self, r: TunnResult<'a>, src: SocketAddr) {
-        match r {
-            TunnResult::WriteToNetwork(d) => {
-                let _ = self.udp.send_to(d, src).await;
-            }
-            TunnResult::WriteToTunnelV6(pkt, _src_addr) => {
-                if let Some(IpAddr::V6(dst)) = Tunn::dst_address(pkt) {
-                    if in_prefix(self.prefix, dst) {
-                        self.tun_write(pkt).await;
-                    } else {
-                        tracing::warn!("mesh: dropping injected packet for foreign dst {dst}");
+                    r => {
+                        if let Some(item) = self.classify(r, src) {
+                            outbound.push(item);
+                        }
                     }
                 }
             }
-            TunnResult::WriteToTunnelV4(_, _) => {} // v6-only mesh
-            TunnResult::Err(e) => tracing::debug!("mesh decapsulate: {e:?}"),
-            TunnResult::Done => {}
+        }
+        drop(peers);
+        self.flush(&outbound).await;
+    }
+
+    /// Copy one TunnResult out of the reusable `out` buffer. The peer
+    /// lock is still held here; the socket write happens in [`flush`].
+    fn classify(&self, r: TunnResult<'_>, src: SocketAddr) -> Option<Outbound> {
+        match r {
+            TunnResult::WriteToNetwork(d) => Some(Outbound::Udp(d.to_vec(), src)),
+            TunnResult::WriteToTunnelV6(pkt, _src_addr) => {
+                if let Some(IpAddr::V6(dst)) = Tunn::dst_address(pkt) {
+                    if in_prefix(self.prefix, dst) {
+                        Some(Outbound::Tun(pkt.to_vec()))
+                    } else {
+                        tracing::warn!("mesh: dropping injected packet for foreign dst {dst}");
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            TunnResult::WriteToTunnelV4(_, _) => None, // v6-only mesh
+            TunnResult::Err(e) => {
+                tracing::debug!("mesh decapsulate: {e:?}");
+                None
+            }
+            TunnResult::Done => None,
+        }
+    }
+
+    async fn flush(&self, items: &[Outbound]) {
+        for item in items {
+            match item {
+                Outbound::Udp(dgram, dst) => {
+                    let _ = self.udp.send_to(dgram, *dst).await;
+                }
+                Outbound::Tun(pkt) => self.tun_write(pkt).await,
+            }
         }
     }
 
     /// Per-second timer pass — drives rekey, keepalive and handshake
     /// retransmits for every peer.
     async fn update_timers(&self, out: &mut [u8]) {
-        let mut peers = self.peers.lock().await;
-        for p in peers.values_mut() {
-            if let TunnResult::WriteToNetwork(d) = p.tunn.update_timers(out) {
-                let _ = self.udp.send_to(d, p.endpoint).await;
+        let pending = {
+            let mut peers = self.peers.lock().await;
+            let mut batch = Vec::new();
+            for p in peers.values_mut() {
+                if let TunnResult::WriteToNetwork(d) = p.tunn.update_timers(out) {
+                    batch.push((d.to_vec(), p.endpoint));
+                }
             }
+            batch
+        };
+        for (dgram, endpoint) in pending {
+            let _ = self.udp.send_to(&dgram, endpoint).await;
         }
     }
 
@@ -1156,7 +1352,7 @@ impl Mesh {
                     let IpAddr::V6(src6) = src.ip() else { continue };
                     let from_peer = {
                         let peers = self.peers.lock().await;
-                        peers.values().any(|p| host_addr(p.prefix) == src6)
+                        peers.is_daemon_source(src6)
                     };
                     if !from_peer {
                         tracing::debug!("mesh gossip: dropped non-peer src {src}");
@@ -1170,8 +1366,8 @@ impl Mesh {
                         tracing::debug!("mesh gossip: dropped oversized frame from {src}");
                         continue;
                     }
-                    let token = self.cluster_token().await;
-                    let Some(payload) = open_signed_gossip(&token, &buf[..n]) else {
+                    let (token, prev) = self.cluster_tokens();
+                    let Some(payload) = open_signed_gossip_keys(&token, &prev, &buf[..n]) else {
                         tracing::debug!("mesh gossip: rejected frame from {src}");
                         continue;
                     };
@@ -1569,19 +1765,44 @@ fn seal_gossip(token: &str, payload: &str) -> Option<Vec<u8>> {
     .ok()
 }
 
-/// Split a frame and check the tag in constant time. The payload string
-/// is returned only after `Mac::verify_slice` succeeds — callers parse
-/// the registry JSON from that string, never from the raw datagram.
+#[cfg(test)]
 fn open_signed_gossip(token: &str, frame: &[u8]) -> Option<String> {
-    if token.is_empty() {
+    open_signed_gossip_keys(token, "", frame)
+}
+
+/// Split a frame and check the tag against the current token and, when
+/// set, the grace token. Both tags are verified. The payload string is
+/// returned only after a tag matches — callers parse the registry JSON
+/// from that string, never from the raw datagram.
+fn open_signed_gossip_keys(current: &str, previous: &str, frame: &[u8]) -> Option<String> {
+    if current.is_empty() && previous.is_empty() {
         return None;
     }
     let frame: SignedGossip = serde_json::from_slice(frame).ok()?;
     let sig = hex_decode_32(&frame.signature)?;
-    let mut mac = HmacSha256::new_from_slice(token.as_bytes()).ok()?;
-    mac.update(frame.payload.as_bytes());
-    mac.verify_slice(&sig).ok()?;
-    Some(frame.payload)
+    let ok_cur = gossip_tag_ok(current, frame.payload.as_bytes(), &sig);
+    let ok_prev = gossip_tag_ok(previous, frame.payload.as_bytes(), &sig);
+    if ok_cur || ok_prev {
+        Some(frame.payload)
+    } else {
+        None
+    }
+}
+
+/// HMAC-SHA256 verify. An empty token still runs the MAC against a
+/// stand-in key and then rejects, so a missing grace token does not
+/// skip the second check.
+fn gossip_tag_ok(token: &str, payload: &[u8], sig: &[u8]) -> bool {
+    let key: &[u8] = if token.is_empty() {
+        b"\0"
+    } else {
+        token.as_bytes()
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        return false;
+    };
+    mac.update(payload);
+    mac.verify_slice(sig).is_ok() && !token.is_empty()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1731,6 +1952,39 @@ mod tests {
         assert!(in_prefix(p, ip));
         let other = Ipv6Addr::new(0xfdff, 0x1234, 0x5678, 4, 0, 0, 0, 2);
         assert!(!in_prefix(p, other));
+    }
+
+    #[test]
+    fn route_index_resolves_a_prefix_and_drops_it_on_remove() {
+        let (priv_b64, _) = keygen();
+        let raw: [u8; 32] = WG_B64.decode(priv_b64).unwrap().try_into().unwrap();
+        let secret = StaticSecret::from(raw);
+        let (_, pub_a) = keygen();
+        let (_, pub_b) = keygen();
+        let a = MeshPeerConf {
+            endpoint: "192.0.2.1:51820".into(),
+            pubkey: pub_a,
+            name: None,
+        };
+        let b = MeshPeerConf {
+            endpoint: "192.0.2.2:51820".into(),
+            pubkey: pub_b,
+            name: None,
+        };
+        let (peer_a, _) = build_peer(&secret, &a, 0).unwrap();
+        let (peer_b, _) = build_peer(&secret, &b, 1).unwrap();
+        let prefix_a = peer_a.prefix;
+        let mut set = PeerSet::default();
+        let key_a = parse_pubkey(&a.pubkey).unwrap();
+        set.insert(key_a, peer_a);
+        set.insert(parse_pubkey(&b.pubkey).unwrap(), peer_b);
+        let dst = mesh_ip(prefix_a, 9);
+        assert_eq!(set.by_dst(dst).unwrap().pubkey_b64, a.pubkey);
+        assert!(set.is_daemon_source(host_addr(prefix_a)));
+        assert!(!set.is_daemon_source(dst));
+        set.remove(&key_a);
+        assert!(set.by_dst(dst).is_none());
+        assert!(!set.is_daemon_source(host_addr(prefix_a)));
     }
 
     /// The dataplane's core assumption: a tokio UdpSocket bound to [::]
@@ -2066,6 +2320,14 @@ mod tests {
         assert!(open_signed_gossip(token, payload.as_bytes()).is_none());
         assert!(open_signed_gossip("", &frame).is_none());
         assert!(seal_gossip("", &payload).is_none());
+        // During rotation the previous token still opens a frame the
+        // peer sealed before it adopted the new token.
+        assert_eq!(
+            open_signed_gossip_keys("new-token", token, &frame).as_deref(),
+            Some(payload.as_str())
+        );
+        assert!(open_signed_gossip_keys("new-token", "", &frame).is_none());
+        assert!(open_signed_gossip_keys("new-token", "other", &frame).is_none());
     }
 
     #[test]

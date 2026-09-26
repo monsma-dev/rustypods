@@ -16,11 +16,11 @@ use rustypods_proto::{fmt_bytes, parse_bytes};
 /// but never rewritten: serde would drop unknown fields on save.
 pub const CONF_FORMAT: u32 = 1;
 
-/// `mesh.conf` schema. 2 is the first revision that stores
-/// `cluster_token` and `MeshPeerConf.name`. Saves stamp this value so a
-/// daemon whose ceiling is 1 refuses to rewrite the file and therefore
-/// cannot drop those fields on a downgrade.
-pub const MESH_CONF_FORMAT: u32 = 2;
+/// `mesh.conf` schema. 2 stored `cluster_token` and `MeshPeerConf.name`.
+/// 3 adds `cluster_token_prev`, the previous token still accepted
+/// during rotation. Saves stamp this value so an older daemon refuses
+/// to rewrite the file and therefore cannot drop the grace token.
+pub const MESH_CONF_FORMAT: u32 = 3;
 
 fn default_format() -> u32 {
     CONF_FORMAT
@@ -573,6 +573,10 @@ pub struct MeshConf {
     /// token via `mesh init --token`.
     #[serde(default)]
     pub cluster_token: String,
+    /// Previous cluster token. Still accepted by mesh-RPC and gossip
+    /// until `retire-token` clears it. Empty means no grace window.
+    #[serde(default)]
+    pub cluster_token_prev: String,
     #[serde(default)]
     pub peers: Vec<MeshPeerConf>,
 }
@@ -598,6 +602,7 @@ impl std::fmt::Debug for MeshConf {
             .field("format", &self.format)
             .field("private_key", &"<redacted>")
             .field("cluster_token", &"<redacted>")
+            .field("cluster_token_prev", &"<redacted>")
             .field("listen_port", &self.listen_port)
             .field("peers", &self.peers)
             .finish()
@@ -646,8 +651,9 @@ pub fn save_mesh(data_dir: &Path, m: &MeshConf) -> Result<()> {
         );
     }
     let mut m = m.clone();
-    // Always stamp 2. Keeping a loaded 1 would let an older daemon
-    // rewrite the file and drop cluster_token / peer names.
+    // Always stamp the current mesh format. Keeping a loaded older
+    // number would let a daemon that does not know `cluster_token_prev`
+    // rewrite the file and drop the grace token.
     m.format = MESH_CONF_FORMAT;
     write_conf(&path, &toml::to_string_pretty(&m)?)
 }
@@ -1570,6 +1576,7 @@ mod tests {
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             listen_port: 51820,
             cluster_token: "deadbeef".into(),
+            cluster_token_prev: "prevtoken".into(),
             peers: vec![MeshPeerConf {
                 endpoint: "192.0.2.1:51820".into(),
                 pubkey: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=".into(),
@@ -1586,18 +1593,26 @@ mod tests {
         assert_eq!(mode, 0o600, "mesh.conf holds a private key");
         let raw = std::fs::read_to_string(dir.join("conf/mesh.conf")).unwrap();
         assert!(
-            raw.contains("format = 2"),
-            "mesh save must stamp format 2, got {raw}"
+            raw.contains("format = 3"),
+            "mesh save must stamp format 3, got {raw}"
         );
         assert!(raw.contains("deadbeef"));
+        assert!(raw.contains("prevtoken"));
         assert!(raw.contains("name = \"s2\""));
         let back = load_mesh(&dir).unwrap().unwrap();
         assert_eq!(back.format, MESH_CONF_FORMAT);
         assert_eq!(back.private_key, conf.private_key);
         assert_eq!(back.cluster_token, "deadbeef");
+        assert_eq!(back.cluster_token_prev, "prevtoken");
         assert_eq!(back.peers.len(), 1);
         assert_eq!(back.peers[0].endpoint, "192.0.2.1:51820");
         assert_eq!(back.peers[0].name.as_deref(), Some("s2"));
+        // Format 2 has no grace token. It still loads; the field defaults empty.
+        let legacy = "format = 2\nprivate_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\ncluster_token = \"old\"\nlisten_port = 51820\npeers = []\n";
+        std::fs::write(dir.join("conf/mesh.conf"), legacy).unwrap();
+        let legacy_conf = load_mesh(&dir).unwrap().unwrap();
+        assert_eq!(legacy_conf.cluster_token, "old");
+        assert!(legacy_conf.cluster_token_prev.is_empty());
         // A file this binary does not understand stays byte-for-byte.
         let future = "format = 9\nprivate_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\ncluster_token = \"keep-me\"\n";
         std::fs::write(dir.join("conf/mesh.conf"), future).unwrap();
@@ -1615,6 +1630,7 @@ mod tests {
         assert!(shown.contains("<redacted>"));
         assert!(!shown.contains(&conf.private_key));
         assert!(!shown.contains(&conf.cluster_token));
+        assert!(!shown.contains(&conf.cluster_token_prev));
         // A truncated file is an error, not "uninitialized".
         std::fs::write(dir.join("conf/mesh.conf"), "private_key = \"abc\n").unwrap();
         let err = load_mesh(&dir).unwrap_err();

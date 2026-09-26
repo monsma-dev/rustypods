@@ -431,6 +431,21 @@ impl super::super::Svc {
         })
     }
 
+    /// Install a new cluster token and keep the previous one valid.
+    pub(crate) async fn rotate_cluster_token(&self, next: &str) -> Result<String, Status> {
+        let Some(m) = self.mesh() else {
+            return Err(Status::failed_precondition("mesh is not up"));
+        };
+        m.rotate_cluster_token(next).await.map_err(int)
+    }
+
+    /// Stop accepting the previous cluster token.
+    pub(crate) async fn retire_cluster_token(&self) -> Result<(), Status> {
+        let Some(m) = self.mesh() else {
+            return Err(Status::failed_precondition("mesh is not up"));
+        };
+        m.retire_cluster_token().await.map_err(int)
+    }
 }
 
 #[cfg(test)]
