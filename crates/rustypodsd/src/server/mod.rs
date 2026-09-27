@@ -1174,6 +1174,33 @@ impl PodControl for Svc {
         ))
     }
 
+    async fn mesh_create_csr(
+        &self,
+        req: Request<Empty>,
+    ) -> Result<Response<MeshCreateCsrResponse>, Status> {
+        Svc::local_bootstrap(
+            req.extensions()
+                .get::<crate::meshca::MeshNodeId>()
+                .is_some(),
+        )?;
+        Ok(Response::new(self.create_csr_work()?))
+    }
+
+    async fn mesh_sign_csr(
+        &self,
+        req: Request<MeshSignCsrRequest>,
+    ) -> Result<Response<MeshSignCsrResponse>, Status> {
+        Svc::local_bootstrap(
+            req.extensions()
+                .get::<crate::meshca::MeshNodeId>()
+                .is_some(),
+        )?;
+        let req = req.into_inner();
+        Ok(Response::new(
+            self.sign_csr_work(&req.wg_pubkey, &req.csr_pem)?,
+        ))
+    }
+
     async fn get_mesh_status(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
         match self.mesh() {
             Some(m) => Ok(Response::new(m.status().await)),
@@ -1194,7 +1221,7 @@ impl PodControl for Svc {
     async fn mesh_add_peer(&self, req: Request<MeshPeer>) -> Result<Response<MeshStatus>, Status> {
         let p = req.into_inner();
         Ok(Response::new(
-            self.apply_mesh_peer(&p.endpoint, &p.pubkey, &p.name)
+            self.apply_mesh_peer(&p.endpoint, &p.pubkey, &p.name, p.is_witness)
                 .await?,
         ))
     }
@@ -3174,7 +3201,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // persistent rp-mesh0 — routes and pod addrs survive intact. Bring
     // it up BEFORE autostart so those pods get mesh addresses.
     match state::load_mesh(&cfg.data_dir) {
-        Ok(Some(conf)) => match mesh::Mesh::start(&cfg.data_dir, conf).await {
+        Ok(Some(conf)) => match mesh::Mesh::start_as(&cfg.data_dir, conf, cfg.role).await {
             Ok(m) => {
                 tracing::info!("mesh up: {} on [::]:{}", m.prefix, m.port);
                 match svc.mesh.write() {

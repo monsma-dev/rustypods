@@ -147,10 +147,25 @@ impl Node {
         self.last_from_leader.elapsed() >= timeout
     }
 
+    pub fn state_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn save(&self) -> Result<()> {
         let body = serde_json::to_vec(&self.persistent)?;
         crate::pki::atomic_write(&self.path, &body, 0o600)
     }
+}
+
+/// fsync `state` without holding the election mutex. `tokio::fs::write`
+/// returns before the bytes are durable, so a crash could grant the
+/// same term twice.
+pub async fn persist(path: &Path, state: &Persistent) -> Result<()> {
+    let body = serde_json::to_vec(state)?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::pki::atomic_write(&path, &body, 0o600))
+        .await
+        .context("raft state write")?
 }
 
 /// `jitter` is any integer. The result stays inside 150–300ms.

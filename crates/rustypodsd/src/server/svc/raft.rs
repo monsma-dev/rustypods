@@ -31,20 +31,41 @@ pub(crate) async fn request_vote(
             "candidate id does not match the peer certificate",
         ));
     }
-    let (term, granted) = {
+    let (term, granted, previous, snap, path) = {
         let mut node = svc.raft.lock().await;
         let previous = node.persistent.clone();
-        let answer = node.persistent.request_vote(body.term, &body.candidate_id);
-        if let Err(e) = node.save() {
-            node.persistent = previous;
-            return Err(Status::internal(format!("raft state: {e:#}")));
-        }
-        answer
+        let (term, granted) = node.persistent.request_vote(body.term, &body.candidate_id);
+        let snap = node.persistent.clone();
+        let path = node.state_path().to_path_buf();
+        (term, granted, previous, snap, path)
     };
+    commit_state(svc, previous, snap, path).await?;
     Ok(Response::new(RequestVoteResponse {
         term,
         vote_granted: granted,
     }))
+}
+
+/// Persist `snap` after the mutex is released. A failed write puts
+/// `previous` back when memory still holds `snap`, and the caller must
+/// not send the vote.
+async fn commit_state(
+    svc: &Svc,
+    previous: crate::raft::Persistent,
+    snap: crate::raft::Persistent,
+    path: std::path::PathBuf,
+) -> Result<(), Status> {
+    if previous == snap {
+        return Ok(());
+    }
+    if let Err(e) = crate::raft::persist(&path, &snap).await {
+        let mut node = svc.raft.lock().await;
+        if node.persistent == snap {
+            node.persistent = previous;
+        }
+        return Err(Status::internal(format!("raft state: {e:#}")));
+    }
+    Ok(())
 }
 
 pub(crate) async fn append_entries(
@@ -58,21 +79,23 @@ pub(crate) async fn append_entries(
             "leader id does not match the peer certificate",
         ));
     }
-    let (term, success) = {
+    let (term, success, previous, snap, path) = {
         let mut node = svc.raft.lock().await;
         let previous = node.persistent.clone();
-        let answer =
+        let (term, success) =
             node.persistent
                 .append_entries(body.term, body.prev_log_index, body.entries.len());
-        if let Err(e) = node.save() {
-            node.persistent = previous;
-            return Err(Status::internal(format!("raft state: {e:#}")));
-        }
-        if answer.1 {
+        let snap = node.persistent.clone();
+        let path = node.state_path().to_path_buf();
+        (term, success, previous, snap, path)
+    };
+    commit_state(svc, previous, snap, path).await?;
+    if success {
+        let mut node = svc.raft.lock().await;
+        if node.persistent.current_term == term {
             node.heard_leader();
         }
-        answer
-    };
+    }
     Ok(Response::new(AppendEntriesResponse { term, success }))
 }
 
@@ -112,22 +135,27 @@ async fn campaign(svc: &Svc) -> Result<(), Status> {
     let Some(me) = self_id(svc) else {
         return Ok(());
     };
-    let term = {
+    let (term, previous, snap, path) = {
         let mut node = svc.raft.lock().await;
         let previous = node.persistent.clone();
         let term = node.persistent.begin_election(&me);
-        if let Err(e) = node.save() {
-            node.persistent = previous;
-            return Err(Status::internal(format!("raft state: {e:#}")));
-        }
         node.set_leader(false);
-        term
+        let snap = node.persistent.clone();
+        let path = node.state_path().to_path_buf();
+        (term, previous, snap, path)
     };
+    commit_state(svc, previous, snap, path).await?;
     let peers = peer_addrs(svc).await;
     let mut grants = 0usize;
     for addr in &peers {
-        if vote_one(svc, *addr, term, &me).await {
-            grants += 1;
+        match vote_one(svc, *addr, term, &me).await {
+            Vote::Grant => grants += 1,
+            Vote::Deny => {}
+            Vote::Stop => {
+                let mut node = svc.raft.lock().await;
+                node.arm_timer();
+                return Ok(());
+            }
         }
     }
     let voters = 1 + peers.len();
@@ -160,6 +188,7 @@ async fn heartbeat(svc: &Svc) -> Result<(), Status> {
         }
     }
     let voters = 1 + peers.len();
+    let roles = voters_of(svc, &me, &peers).await;
     let mut node = svc.raft.lock().await;
     if step_down || node.persistent.current_term != term {
         node.set_leader(false);
@@ -173,7 +202,7 @@ async fn heartbeat(svc: &Svc) -> Result<(), Status> {
     }
     if quorum {
         let alive = alive_ids(&me, &acked);
-        let decision = crate::ha::plan(&voters_of(&me, &peers), &alive, &[]);
+        let decision = crate::ha::plan(&roles, &alive, &[]);
         // Publishing the resulting DNS waits until the log carries workloads.
         // The witness drops the generation here; a host leader keeps it.
         let _effect = crate::ha::local_effect(decision, svc.cfg.role);
@@ -181,16 +210,23 @@ async fn heartbeat(svc: &Svc) -> Result<(), Status> {
     Ok(())
 }
 
-fn voters_of(me: &str, peers: &[Ipv6Addr]) -> Vec<crate::ha::Voter> {
+async fn voters_of(svc: &Svc, me: &str, peers: &[Ipv6Addr]) -> Vec<crate::ha::Voter> {
+    let witnesses = match svc.mesh() {
+        Some(m) => m.witness_ids().await,
+        None => std::collections::BTreeSet::new(),
+    };
     let mut out = vec![crate::ha::Voter {
         id: me.to_string(),
-        role: crate::ha::Role::Host,
+        role: svc.cfg.role,
     }];
     for addr in peers {
-        out.push(crate::ha::Voter {
-            id: addr.to_string(),
-            role: crate::ha::Role::Host,
-        });
+        let id = addr.to_string();
+        let role = if witnesses.contains(&id) {
+            crate::ha::Role::Witness
+        } else {
+            crate::ha::Role::Host
+        };
+        out.push(crate::ha::Voter { id, role });
     }
     out
 }
@@ -210,7 +246,15 @@ enum Append {
     Miss,
 }
 
-async fn vote_one(svc: &Svc, addr: Ipv6Addr, term: u64, me: &str) -> bool {
+enum Vote {
+    Grant,
+    Deny,
+    /// A higher term was seen. Do not send another RequestVote and do
+    /// not become leader in the term we just campaigned for.
+    Stop,
+}
+
+async fn vote_one(svc: &Svc, addr: Ipv6Addr, term: u64, me: &str) -> Vote {
     let call = async {
         let ch = svc.mesh_channel(addr, RPC_BOUND).await?;
         let mut client = rustypods_proto::rpc::pod_control_client::PodControlClient::new(ch);
@@ -228,19 +272,32 @@ async fn vote_one(svc: &Svc, addr: Ipv6Addr, term: u64, me: &str) -> bool {
     match tokio::time::timeout(RPC_BOUND, call).await {
         Ok(Ok(res)) => {
             if res.term > term {
-                let mut node = svc.raft.lock().await;
-                if res.term > node.persistent.current_term {
-                    node.persistent.current_term = res.term;
-                    node.persistent.voted_for = None;
-                    node.set_leader(false);
-                    let _ = node.save();
-                }
-                false
+                let (previous, snap, path) = {
+                    let mut node = svc.raft.lock().await;
+                    if res.term > node.persistent.current_term {
+                        let previous = node.persistent.clone();
+                        node.persistent.current_term = res.term;
+                        node.persistent.voted_for = None;
+                        node.set_leader(false);
+                        (
+                            previous,
+                            node.persistent.clone(),
+                            node.state_path().to_path_buf(),
+                        )
+                    } else {
+                        let same = node.persistent.clone();
+                        (same.clone(), same, node.state_path().to_path_buf())
+                    }
+                };
+                let _ = commit_state(svc, previous, snap, path).await;
+                Vote::Stop
+            } else if res.vote_granted {
+                Vote::Grant
             } else {
-                res.vote_granted
+                Vote::Deny
             }
         }
-        _ => false,
+        _ => Vote::Deny,
     }
 }
 

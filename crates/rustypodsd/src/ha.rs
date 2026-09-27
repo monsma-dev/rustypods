@@ -136,6 +136,8 @@ pub fn plan(voters: &[Voter], alive: &BTreeSet<String>, workloads: &[Workload]) 
             stranded: Vec::new(),
         };
     }
+    // Placement looks only at hosts. A witness counts for quorum and
+    // is never a restart target.
     let survivors: Vec<&Voter> = voters
         .iter()
         .filter(|v| v.role == Role::Host && alive.contains(&v.id))
@@ -174,7 +176,14 @@ pub fn plan(voters: &[Voter], alive: &BTreeSet<String>, workloads: &[Workload]) 
             .filter(|w| host_live(w, &dead_hosts, &restart))
             .collect();
         if let Some(chosen) = pick(&live) {
-            published.insert(name, running_host(chosen, &restart));
+            let host = running_host(chosen, &restart);
+            if voters
+                .iter()
+                .any(|v| v.id == host && v.role == Role::Witness)
+            {
+                continue;
+            }
+            published.insert(name, host);
             continue;
         }
         if let Some(pinned) = group
@@ -288,6 +297,39 @@ mod tests {
         assert!(d.restart.is_empty());
         assert_eq!(d.dns.unwrap().get("orders").map(String::as_str), Some("b"));
         assert!(d.stranded.is_empty());
+    }
+
+    #[test]
+    fn witnesses_hold_quorum_and_receive_no_workload() {
+        let voters = vec![
+            Voter {
+                id: "a".into(),
+                role: Role::Host,
+            },
+            Voter {
+                id: "w1".into(),
+                role: Role::Witness,
+            },
+            Voter {
+                id: "w2".into(),
+                role: Role::Witness,
+            },
+        ];
+        let parked = Workload {
+            name: "orders-w1".into(),
+            host: "w1".into(),
+            ha: HaMode::Pinned,
+            replicates: Replication::Mesh,
+            serves: Some("orders".into()),
+            primary: true,
+        };
+        let d = plan(&voters, &alive(&["w1", "w2"]), &[web(), parked]);
+        assert!(d.quorum);
+        assert!(d.restart.is_empty(), "a witness is not a restart target");
+        assert!(
+            d.dns.as_ref().is_some_and(|m| m.is_empty()),
+            "a witness is not a published address"
+        );
     }
 
     #[test]

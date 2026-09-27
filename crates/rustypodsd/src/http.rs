@@ -739,6 +739,8 @@ struct MeshPeerIn {
     pubkey: String,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    is_witness: bool,
 }
 
 async fn mesh_add_peer_http(
@@ -749,6 +751,7 @@ async fn mesh_add_peer_http(
         endpoint: b.endpoint,
         pubkey: b.pubkey,
         name: b.name,
+        is_witness: b.is_witness,
     }))
     .await
     .map(|r| Json(r.into_inner()))
@@ -765,6 +768,7 @@ async fn mesh_rm_peer_http(
         endpoint: String::new(),
         pubkey,
         name: String::new(),
+        is_witness: false,
     }))
     .await
     .map(|r| Json(r.into_inner()))

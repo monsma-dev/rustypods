@@ -108,6 +108,19 @@ pub fn pubkey_of(private_b64: &str) -> Result<String> {
     Ok(WG_B64.encode(PublicKey::from(&secret).as_bytes()))
 }
 
+/// Load the host WireGuard key from `conf/mesh.conf`, or mint one and
+/// persist it. A later `mesh init` reuses this key, so the /48 stamped
+/// into a signed leaf still matches. This does not create a CA.
+pub fn ensure_identity(data_dir: &Path) -> Result<String> {
+    let mut conf = crate::state::load_mesh(data_dir)?.unwrap_or_default();
+    if conf.private_key.trim().is_empty() {
+        let (priv_key, _) = keygen();
+        conf.private_key = priv_key;
+        crate::state::save_mesh(data_dir, &conf)?;
+    }
+    pubkey_of(&conf.private_key)
+}
+
 /// Generate a fresh WG identity (priv, pub), both base64.
 pub fn keygen() -> (String, String) {
     let secret = StaticSecret::random_from_rng(rand_core::OsRng);
@@ -455,6 +468,19 @@ fn open_tun(name: &str) -> Result<std::fs::File> {
 impl Mesh {
     /// Bring the mesh up on the standard `rp-mesh0` device.
     pub async fn start(data_dir: &Path, conf: MeshConf) -> Result<Arc<Mesh>> {
+        Self::start_as(data_dir, conf, crate::ha::Role::Host).await
+    }
+
+    /// Same as [`start`](Self::start). A witness with an empty `mesh-pki`
+    /// refuses to come up, so it cannot mint a CA.
+    pub async fn start_as(
+        data_dir: &Path,
+        conf: MeshConf,
+        role: crate::ha::Role,
+    ) -> Result<Arc<Mesh>> {
+        if role == crate::ha::Role::Witness {
+            crate::meshca::reject_witness_mint(data_dir)?;
+        }
         Self::start_named(data_dir, conf, TUN_NAME).await
     }
 
@@ -770,6 +796,7 @@ impl Mesh {
         endpoint: &str,
         pubkey_b64: &str,
         name: Option<&str>,
+        is_witness: bool,
     ) -> Result<()> {
         let pk = parse_pubkey(pubkey_b64)?;
         let _ep: SocketAddr = canon_ep(
@@ -792,6 +819,7 @@ impl Mesh {
             endpoint: endpoint.to_string(),
             pubkey: pubkey_b64.to_string(),
             name,
+            is_witness,
         };
         if let Some(name) = pc.name.as_deref() {
             let conf = self.conf.lock().await;
@@ -843,6 +871,20 @@ impl Mesh {
         // a full interval to learn our pod names.
         self.announce.notify_one();
         Ok(())
+    }
+
+    /// Host addresses of peers registered with `is_witness`. A workload
+    /// must never be placed on one of these.
+    pub async fn witness_ids(&self) -> std::collections::BTreeSet<String> {
+        let conf = self.conf.lock().await;
+        conf.peers
+            .iter()
+            .filter(|p| p.is_witness)
+            .filter_map(|p| {
+                let prefix = prefix_of(&p.pubkey).ok()?;
+                Some(host_addr(prefix).to_string())
+            })
+            .collect()
     }
 
     /// `fd<peer>::1` for every live session. The nft guard accepts only
@@ -912,6 +954,12 @@ impl Mesh {
             .iter()
             .filter_map(|p| p.name.as_deref().map(|name| (p.pubkey.as_str(), name)))
             .collect();
+        let witnesses: std::collections::HashSet<&str> = conf
+            .peers
+            .iter()
+            .filter(|p| p.is_witness)
+            .map(|p| p.pubkey.as_str())
+            .collect();
         let peers = self.peers.lock().await;
         let infos = peers
             .values()
@@ -939,6 +987,7 @@ impl Mesh {
                         .unwrap_or_default()
                         .to_string(),
                     grpc_addr: host_addr(p.prefix).to_string(),
+                    is_witness: witnesses.contains(p.pubkey_b64.as_str()),
                 }
             })
             .collect();
@@ -1965,11 +2014,13 @@ mod tests {
             endpoint: "192.0.2.1:51820".into(),
             pubkey: pub_a,
             name: None,
+            is_witness: false,
         };
         let b = MeshPeerConf {
             endpoint: "192.0.2.2:51820".into(),
             pubkey: pub_b,
             name: None,
+            is_witness: false,
         };
         let (peer_a, _) = build_peer(&secret, &a, 0).unwrap();
         let (peer_b, _) = build_peer(&secret, &b, 1).unwrap();
@@ -2015,6 +2066,24 @@ mod tests {
         let (priv_, pub_) = keygen();
         assert_eq!(pubkey_of(&priv_).unwrap(), pub_);
         assert!(pubkey_of("not-b64!!!").is_err());
+    }
+
+    #[test]
+    fn ensure_identity_is_stable() {
+        let dir = std::env::temp_dir().join(format!(
+            "rp-ident-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = ensure_identity(&dir).unwrap();
+        let second = ensure_identity(&dir).unwrap();
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

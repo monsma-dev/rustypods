@@ -171,33 +171,156 @@ fn sign_node(
         .context("sign mesh node certificate")
 }
 
+#[derive(PartialEq, Eq)]
+enum Layout {
+    Empty,
+    Root,
+    Leaf,
+    Corrupt,
+}
+
+/// Root is the four-file CA. Leaf is a joiner: `ca.crt`, `node.crt`,
+/// `node.key`, and no `ca.key`. Anything in between is corrupt — never
+/// mint a CA over a half-written set.
+fn layout(paths: &MeshCa) -> Layout {
+    match (
+        paths.ca_crt.exists(),
+        paths.ca_key.exists(),
+        paths.node_crt.exists(),
+        paths.node_key.exists(),
+    ) {
+        (false, false, false, false) => Layout::Empty,
+        (true, true, true, true) => Layout::Root,
+        (true, false, true, true) => Layout::Leaf,
+        _ => Layout::Corrupt,
+    }
+}
+
+fn node_cert_matches(crt_pem: &str, wg_pubkey_b64: &str) -> Result<()> {
+    let der = pem_der(crt_pem)?;
+    let dns = node_dns(wg_pubkey_b64);
+    if !der.windows(dns.len()).any(|w| w == dns.as_bytes()) {
+        bail!("mesh node certificate is not for this WireGuard identity ({dns})");
+    }
+    Ok(())
+}
+
+fn check_files(paths: &[&PathBuf]) -> Result<()> {
+    for path in paths {
+        let md =
+            std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        if !md.file_type().is_file() {
+            bail!("{} is not a regular file", path.display());
+        }
+        if md.len() == 0 {
+            bail!("{} is empty", path.display());
+        }
+    }
+    Ok(())
+}
+
+const STAGING: &str = ".mesh-pki.tmp";
+const BACKUP: &str = ".mesh-pki.bak";
+
+/// A crash between parking the live directory and installing the new
+/// one leaves `.mesh-pki.bak` and no `mesh-pki`. Put the backup back.
+/// A leftover staging directory is incomplete and is removed.
+fn recover_mesh_pki(data_dir: &Path) -> Result<()> {
+    let live = data_dir.join("mesh-pki");
+    let bak = data_dir.join(BACKUP);
+    let tmp = data_dir.join(STAGING);
+    if !live.exists() && bak.exists() {
+        std::fs::rename(&bak, &live)
+            .with_context(|| format!("restore {} from {}", live.display(), bak.display()))?;
+    } else if live.exists() && bak.exists() {
+        std::fs::remove_dir_all(&bak).with_context(|| format!("remove {}", bak.display()))?;
+    }
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp).with_context(|| format!("remove {}", tmp.display()))?;
+    }
+    Ok(())
+}
+
+/// A witness with an empty `mesh-pki` must not mint a CA. A partial
+/// set is left for [`ensure`] to refuse as corrupt.
+pub fn reject_witness_mint(data_dir: &Path) -> Result<()> {
+    recover_mesh_pki(data_dir)?;
+    let paths = MeshCa::at(data_dir.join("mesh-pki"));
+    if layout(&paths) == Layout::Empty {
+        bail!("a witness does not mint a mesh CA — bootstrap with mesh create-csr");
+    }
+    Ok(())
+}
+
+/// Write a complete PKI into `.mesh-pki.tmp`, then rename it into
+/// place. The previous directory is parked as `.mesh-pki.bak` and
+/// removed only after the new directory is the live one. A crash
+/// leaves either the original directory or no directory plus the
+/// backup, which the next [`ensure`] restores.
+fn install_mesh_pki(data_dir: &Path, files: &[(&str, &[u8], u32)]) -> Result<MeshCa> {
+    use std::os::unix::fs::PermissionsExt;
+    let live = data_dir.join("mesh-pki");
+    let tmp = data_dir.join(STAGING);
+    let bak = data_dir.join(BACKUP);
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp).context("clear mesh-pki staging")?;
+    }
+    std::fs::create_dir(&tmp).context("create mesh-pki staging")?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))
+        .context("mode mesh-pki staging")?;
+    for (name, bytes, mode) in files {
+        crate::pki::atomic_write(&tmp.join(name), bytes, *mode)?;
+    }
+    if bak.exists() {
+        std::fs::remove_dir_all(&bak).context("clear mesh-pki backup")?;
+    }
+    let had_live = live.exists();
+    if had_live {
+        std::fs::rename(&live, &bak).context("park mesh-pki")?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &live) {
+        if had_live {
+            let _ = std::fs::rename(&bak, &live);
+        }
+        return Err(e).context("install mesh-pki");
+    }
+    if bak.exists() {
+        std::fs::remove_dir_all(&bak).context("drop mesh-pki backup")?;
+    }
+    Ok(MeshCa::at(live))
+}
+
 /// Create the mesh CA and this host's node certificate, or reuse them.
-/// A node certificate inside the renewal window is rotated in place and
-/// the previous one stays acceptable.
+/// A root whose node certificate is inside the renewal window is rotated
+/// in place. A leaf is accepted as-is: this host has no `ca.key`, so it
+/// cannot mint or rotate, and a near-expiry leaf waits for a new
+/// `sign-csr` from the root.
 pub fn ensure(data_dir: &Path, wg_pubkey_b64: &str, host: Ipv6Addr) -> Result<MeshCa> {
+    recover_mesh_pki(data_dir)?;
     let dir = data_dir.join("mesh-pki");
     crate::pki::ensure_dir(&dir)?;
     let paths = MeshCa::at(dir);
-    let present = paths.required().into_iter().filter(|p| p.exists()).count();
-    match present {
-        4 => {
+    match layout(&paths) {
+        Layout::Root => {
             check_required(&paths)?;
             let crt = std::fs::read_to_string(&paths.node_crt)?;
-            let der = pem_der(&crt)?;
-            let dns = node_dns(wg_pubkey_b64);
-            if !der.windows(dns.len()).any(|w| w == dns.as_bytes()) {
-                bail!(
-                    "mesh node certificate is not for this WireGuard identity ({dns})"
-                );
-            }
+            node_cert_matches(&crt, wg_pubkey_b64)?;
             let expiry = crate::pki::cert_not_after(&crt)?;
-            let renew_at = time::OffsetDateTime::now_utc() + time::Duration::days(RENEW_WITHIN_DAYS);
+            let renew_at =
+                time::OffsetDateTime::now_utc() + time::Duration::days(RENEW_WITHIN_DAYS);
             if expiry < renew_at {
                 return rotate_node(data_dir, wg_pubkey_b64, host);
             }
             Ok(paths)
         }
-        0 => {
+        Layout::Leaf => {
+            check_files(&[&paths.ca_crt, &paths.node_crt, &paths.node_key])?;
+            key_not_open(&paths.node_key, 0o037, "group-writable or other-accessible")?;
+            let crt = std::fs::read_to_string(&paths.node_crt)?;
+            node_cert_matches(&crt, wg_pubkey_b64)?;
+            Ok(paths)
+        }
+        Layout::Empty => {
             let ca_key = rcgen::KeyPair::generate().context("generate mesh CA key")?;
             let ca_params = ca_params()?;
             let ca_cert = ca_params
@@ -209,17 +332,57 @@ pub fn ensure(data_dir: &Path, wg_pubkey_b64: &str, host: Ipv6Addr) -> Result<Me
                 .context("mesh CA issuer")?;
             let node_key = rcgen::KeyPair::generate().context("generate mesh node key")?;
             let node_cert = sign_node(&issuer, &node_key, wg_pubkey_b64, host)?;
-            crate::pki::atomic_write(&paths.ca_crt, ca_pem.as_bytes(), 0o644)?;
-            crate::pki::atomic_write(&paths.ca_key, ca_key_pem.as_bytes(), 0o600)?;
-            crate::pki::atomic_write(&paths.node_crt, node_cert.pem().as_bytes(), 0o644)?;
-            crate::pki::atomic_write(&paths.node_key, node_key.serialize_pem().as_bytes(), 0o600)?;
-            Ok(paths)
+            let node_pem = node_cert.pem();
+            let key_pem = node_key.serialize_pem();
+            install_mesh_pki(
+                data_dir,
+                &[
+                    ("ca.crt", ca_pem.as_bytes(), 0o644),
+                    ("ca.key", ca_key_pem.as_bytes(), 0o600),
+                    ("node.crt", node_pem.as_bytes(), 0o644),
+                    ("node.key", key_pem.as_bytes(), 0o600),
+                ],
+            )
         }
-        n => bail!(
-            "partial mesh PKI at {} ({n} of 4 files) — remove the whole set or restore the missing files",
+        Layout::Corrupt => bail!(
+            "corrupt mesh PKI at {} — a root holds ca.crt, ca.key, node.crt and node.key; a leaf holds ca.crt, node.crt and node.key",
             paths.dir.display()
         ),
     }
+}
+
+/// Write `node.key` at mode 0640 when it is absent, and return a CSR for
+/// that key. An existing key is reused so a second run does not orphan a
+/// certificate the root already signed. Names in the CSR are placeholders;
+/// the signing root discards them.
+pub fn create_node_csr(data_dir: &Path) -> Result<String> {
+    let dir = data_dir.join("mesh-pki");
+    crate::pki::ensure_dir(&dir)?;
+    let paths = MeshCa::at(dir);
+    if paths.node_key.exists() {
+        let pem = std::fs::read_to_string(&paths.node_key)
+            .with_context(|| format!("read {}", paths.node_key.display()))?;
+        let key = rcgen::KeyPair::from_pem(&pem).context("parse mesh node key")?;
+        return csr_pem(&key);
+    }
+    if paths.node_crt.exists() || paths.ca_crt.exists() || paths.ca_key.exists() {
+        bail!(
+            "corrupt mesh PKI at {} — refusing to mint a node key under an incomplete certificate set",
+            paths.dir.display()
+        );
+    }
+    let key = rcgen::KeyPair::generate().context("generate mesh node key")?;
+    crate::pki::atomic_write(&paths.node_key, key.serialize_pem().as_bytes(), 0o640)?;
+    csr_pem(&key)
+}
+
+fn csr_pem(key: &rcgen::KeyPair) -> Result<String> {
+    let params = rcgen::CertificateParams::new(vec!["ignored.invalid".to_string()])?;
+    params
+        .serialize_request(key)
+        .context("build mesh CSR")?
+        .pem()
+        .context("encode mesh CSR")
 }
 
 /// Issue a new node certificate and keep the current one as the grace
@@ -228,13 +391,23 @@ pub fn rotate_node(data_dir: &Path, wg_pubkey_b64: &str, host: Ipv6Addr) -> Resu
     let paths = MeshCa::at(data_dir.join("mesh-pki"));
     check_required(&paths)?;
     let previous = std::fs::read(&paths.node_crt)?;
+    let ca_crt = std::fs::read(&paths.ca_crt)?;
+    let ca_key = std::fs::read(&paths.ca_key)?;
     let issuer = load_issuer(&paths)?;
     let node_key = rcgen::KeyPair::generate().context("generate mesh node key")?;
     let node_cert = sign_node(&issuer, &node_key, wg_pubkey_b64, host)?;
-    crate::pki::atomic_write(&paths.node_prev_crt, &previous, 0o644)?;
-    crate::pki::atomic_write(&paths.node_key, node_key.serialize_pem().as_bytes(), 0o600)?;
-    crate::pki::atomic_write(&paths.node_crt, node_cert.pem().as_bytes(), 0o644)?;
-    Ok(paths)
+    let node_pem = node_cert.pem();
+    let key_pem = node_key.serialize_pem();
+    install_mesh_pki(
+        data_dir,
+        &[
+            ("ca.crt", &ca_crt, 0o644),
+            ("ca.key", &ca_key, 0o600),
+            ("node.crt", node_pem.as_bytes(), 0o644),
+            ("node.key", key_pem.as_bytes(), 0o600),
+            ("node.prev.crt", &previous, 0o644),
+        ],
+    )
 }
 
 /// Drop the grace certificate. Peers still presenting it are rejected.
@@ -522,8 +695,61 @@ mod tests {
         std::fs::create_dir(&pki).unwrap();
         std::fs::write(pki.join("ca.crt"), "x").unwrap();
         let err = ensure(&dir, "k", Ipv6Addr::LOCALHOST).unwrap_err();
-        assert!(err.to_string().contains("partial"), "{err:#}");
+        assert!(err.to_string().contains("corrupt"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaf_set_does_not_mint_a_ca_and_a_gap_is_corrupt() {
+        use std::os::unix::fs::PermissionsExt;
+        let root_dir = scratch();
+        let host = Ipv6Addr::new(0xfd12, 0x3456, 0x789a, 0, 0, 0, 0, 1);
+        let root = ensure(&root_dir, "leader-key", host).unwrap();
+        let before = std::fs::read(&root.node_crt).unwrap();
+
+        let join_dir = scratch();
+        let (priv_key, pub_key) = crate::mesh::keygen();
+        let _ = priv_key;
+        let join_host = crate::mesh::host_addr(crate::mesh::prefix_of(&pub_key).unwrap());
+        let csr = create_node_csr(&join_dir).unwrap();
+        assert!(csr.contains("BEGIN CERTIFICATE REQUEST"));
+        let key_before = std::fs::read(join_dir.join("mesh-pki/node.key")).unwrap();
+        let again = create_node_csr(&join_dir).unwrap();
+        assert!(again.contains("BEGIN CERTIFICATE REQUEST"));
+        assert_eq!(
+            std::fs::read(join_dir.join("mesh-pki/node.key")).unwrap(),
+            key_before,
+            "a second CSR must reuse node.key"
+        );
+        let key_mode = std::fs::metadata(join_dir.join("mesh-pki/node.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(key_mode, 0o640);
+        let err = ensure(&join_dir, &pub_key, join_host).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("corrupt"),
+            "node.key alone is not a leaf, got {err:#}"
+        );
+
+        let node_crt = issue_from_csr(&root_dir, &csr, &pub_key, join_host).unwrap();
+        assert!(!node_crt.contains("ignored.invalid"));
+        assert_eq!(std::fs::read(&root.node_crt).unwrap(), before);
+        let pki = join_dir.join("mesh-pki");
+        std::fs::write(pki.join("ca.crt"), std::fs::read(&root.ca_crt).unwrap()).unwrap();
+        std::fs::write(pki.join("node.crt"), &node_crt).unwrap();
+        let leaf = ensure(&join_dir, &pub_key, join_host).unwrap();
+        assert!(!leaf.ca_key.exists(), "a leaf must not gain a CA key");
+        let kept = std::fs::read_to_string(&leaf.node_crt).unwrap();
+        ensure(&join_dir, &pub_key, join_host).unwrap();
+        assert_eq!(std::fs::read_to_string(&leaf.node_crt).unwrap(), kept);
+
+        std::fs::remove_file(&leaf.node_crt).unwrap();
+        let err = ensure(&join_dir, &pub_key, join_host).unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&join_dir);
     }
 
     #[test]
@@ -560,6 +786,49 @@ mod tests {
             format!("{err:#}").contains("ca.key"),
             "group-readable CA key must be refused, got {err:#}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_witness_with_an_empty_pki_cannot_mint_a_ca() {
+        let dir = std::env::temp_dir().join(format!(
+            "rp-meshca-witness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = reject_witness_mint(&dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("create-csr"),
+            "empty witness must refuse to mint, got {err:#}"
+        );
+        assert!(!dir.join("mesh-pki").join("ca.key").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parked_pki_is_restored_and_staging_does_not_survive() {
+        let dir = std::env::temp_dir().join(format!(
+            "rp-meshca-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = Ipv6Addr::new(0xfd7e, 0x0f0a, 0xd1ae, 0, 0, 0, 0, 1);
+        let paths = ensure(&dir, "pubkey-a", host).unwrap();
+        let ca = std::fs::read(&paths.ca_crt).unwrap();
+        std::fs::rename(&paths.dir, dir.join(".mesh-pki.bak")).unwrap();
+        std::fs::create_dir(dir.join(".mesh-pki.tmp")).unwrap();
+        let again = ensure(&dir, "pubkey-a", host).unwrap();
+        assert_eq!(std::fs::read(&again.ca_crt).unwrap(), ca);
+        assert!(!dir.join(".mesh-pki.bak").exists());
+        assert!(!dir.join(".mesh-pki.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

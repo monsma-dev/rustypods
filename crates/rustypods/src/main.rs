@@ -437,6 +437,9 @@ enum MeshCmd {
         /// Optional stable alias used by `rustypods --host <name> …`.
         #[arg(long)]
         name: Option<String>,
+        /// This peer votes and must not receive a workload.
+        #[arg(long)]
+        witness: bool,
     },
     /// Remove a peer by its pubkey.
     RmPeer {
@@ -446,6 +449,18 @@ enum MeshCmd {
     /// Tear the mesh down: stop the pump, delete rp-mesh0, strip pod
     /// mesh addresses and forget the WG identity (conf/mesh.conf).
     Deinit,
+    /// Joiner: persist the WireGuard key and `node.key`, and print the
+    /// CSR plus the pubkey. Does not create a CA.
+    CreateCsr,
+    /// Root: sign a joiner. Names inside the CSR are discarded; the
+    /// certificate is stamped from the WireGuard pubkey. Prints
+    /// `ca.crt` then `node.crt`.
+    SignCsr {
+        /// Joiner's WireGuard public key (`create-csr` prints it).
+        pubkey: String,
+        /// CSR PEM, a path to that PEM, or `-` to read stdin.
+        csr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1236,7 +1251,8 @@ pub(crate) fn print_mesh_status(st: &MeshStatus) {
             format!("handshake {}s ago", p.handshake_secs_ago)
         };
         println!(
-            "peer {}{} {}  rpc=[{}]:{}  {}  tx={} rx={}",
+            "peer {}{}{} {}  rpc=[{}]:{}  {}  tx={} rx={}",
+            if p.is_witness { "witness " } else { "" },
             if p.name.is_empty() {
                 String::new()
             } else {
@@ -1470,6 +1486,24 @@ mod tests {
             Cli::try_parse_from(["rustypods", "--host", "s2", "--remote", "user@host", "ps",])
                 .is_err()
         );
+
+        let cli =
+            Cli::try_parse_from(["rustypods", "mesh", "sign-csr", "pubkey-value", "node.csr"])
+                .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Mesh {
+                sub: MeshCmd::SignCsr { ref pubkey, ref csr },
+            }) if pubkey == "pubkey-value" && csr == "node.csr"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["rustypods", "mesh", "create-csr"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::Mesh {
+                sub: MeshCmd::CreateCsr,
+            })
+        ));
 
         let cli = Cli::try_parse_from(["rustypods", "mesh", "init", "--token", "cluster-secret"])
             .unwrap();

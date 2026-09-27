@@ -83,6 +83,11 @@ service PodControl {
   // Tear the mesh down: cancel the pump, delete rp-mesh0, strip pod
   // mesh /128s and remove conf/mesh.conf. Returns enabled=false status.
   rpc MeshDeinit(Empty) returns (MeshStatus);
+  // Out-of-band join. The daemon refuses these on the mesh listener:
+  // the CSR and the CA key never cross the NIC. The operator copies
+  // the PEM over the SSH session that already reaches the local socket.
+  rpc MeshCreateCsr(Empty) returns (MeshCreateCsrResponse);
+  rpc MeshSignCsr(MeshSignCsrRequest) returns (MeshSignCsrResponse);
 
   // Provision/start the managed ingress gateway pod (local PKI + the
   // rustypods-ingress proxy), and report its health/route table.
@@ -388,12 +393,33 @@ message MeshInitRequest {
   string token = 2;
 }
 
+// Joiner output. wg_pubkey is the WireGuard identity the leader must
+// stamp; the CSR names are discarded at sign time.
+message MeshCreateCsrResponse {
+  string csr_pem = 1;
+  string wg_pubkey = 2;
+}
+
+message MeshSignCsrRequest {
+  string wg_pubkey = 1;
+  string csr_pem = 2;
+}
+
+// Leaf material. The joiner stores these next to its own node.key.
+// ca.key is not returned.
+message MeshSignCsrResponse {
+  string node_crt = 1;
+  string ca_crt = 2;
+}
+
 // Peer identity: a reachable UDP endpoint + its WG pubkey. The peer's
 // ULA /48 is derived from the pubkey — never configured separately.
 message MeshPeer {
   string endpoint = 1; // "ip:port" or "[v6]:port"
   string pubkey = 2;   // base64 x25519 (44 chars)
   string name = 3;     // optional alias used by --host (e.g. "s2")
+  // Counts toward quorum and never receives a workload.
+  bool is_witness = 4;
 }
 
 message MeshPeerInfo {
@@ -407,6 +433,7 @@ message MeshPeerInfo {
   // The peer daemon's gRPC-over-mesh address, e.g. "fd…::1" — dial
   // http://[addr]:5306 for remote pod ops.
   string grpc_addr = 8;
+  bool is_witness = 9;
 }
 
 message MeshStatus {

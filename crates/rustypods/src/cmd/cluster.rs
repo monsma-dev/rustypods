@@ -153,6 +153,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
                 endpoint,
                 pubkey,
                 name,
+                witness,
             } => {
                 let st = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
                     .await?
@@ -160,6 +161,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
                         endpoint,
                         pubkey,
                         name: name.unwrap_or_default(),
+                        is_witness: witness,
                     })
                     .await?
                     .into_inner();
@@ -172,6 +174,7 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
                         endpoint: String::new(),
                         pubkey,
                         name: String::new(),
+                        is_witness: false,
                     })
                     .await?
                     .into_inner();
@@ -183,6 +186,39 @@ pub(crate) async fn run(mut cli: Cli) -> Result<()> {
                     .mesh_deinit(Empty {})
                     .await?;
                 println!("mesh down — rp-mesh0 removed, identity forgotten");
+            }
+            MeshCmd::CreateCsr => {
+                let r = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
+                    .await?
+                    .mesh_create_csr(Empty {})
+                    .await?
+                    .into_inner();
+                println!("pubkey: {}", r.wg_pubkey);
+                print!("{}", r.csr_pem);
+                if !r.csr_pem.ends_with('\n') {
+                    println!();
+                }
+            }
+            MeshCmd::SignCsr { pubkey, csr } => {
+                let csr_pem = read_csr_arg(&csr)?;
+                let r = connect(cli.socket.clone(), cli.remote.clone(), cli.host.clone())
+                    .await?
+                    .mesh_sign_csr(MeshSignCsrRequest {
+                        wg_pubkey: pubkey,
+                        csr_pem,
+                    })
+                    .await?
+                    .into_inner();
+                println!("ca.crt");
+                print!("{}", r.ca_crt);
+                if !r.ca_crt.ends_with('\n') {
+                    println!();
+                }
+                println!("node.crt");
+                print!("{}", r.node_crt);
+                if !r.node_crt.ends_with('\n') {
+                    println!();
+                }
             }
         },
         Cmd::Ingress { sub } => match sub {
@@ -659,6 +695,23 @@ async fn apply_stack_fanout(cli: &Cli, groups: StackGroups) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn read_csr_arg(arg: &str) -> Result<String> {
+    use std::io::Read;
+    if arg == "-" {
+        let mut pem = String::new();
+        std::io::stdin().read_to_string(&mut pem)?;
+        return Ok(pem);
+    }
+    let path = std::path::Path::new(arg);
+    if path.is_file() {
+        return std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()));
+    }
+    if arg.contains("BEGIN CERTIFICATE REQUEST") {
+        return Ok(arg.to_string());
+    }
+    anyhow::bail!("csr is not a PEM and not a file");
 }
 
 #[cfg(test)]

@@ -17,10 +17,10 @@ use rustypods_proto::{fmt_bytes, parse_bytes};
 pub const CONF_FORMAT: u32 = 1;
 
 /// `mesh.conf` schema. 2 stored `cluster_token` and `MeshPeerConf.name`.
-/// 3 adds `cluster_token_prev`, the previous token still accepted
-/// during rotation. Saves stamp this value so an older daemon refuses
-/// to rewrite the file and therefore cannot drop the grace token.
-pub const MESH_CONF_FORMAT: u32 = 3;
+/// 3 adds `cluster_token_prev`. 4 adds `MeshPeerConf.is_witness`.
+/// Saves stamp this value so an older daemon refuses to rewrite the
+/// file and therefore cannot drop the grace token or the witness bit.
+pub const MESH_CONF_FORMAT: u32 = 4;
 
 fn default_format() -> u32 {
     CONF_FORMAT
@@ -590,6 +590,9 @@ pub struct MeshPeerConf {
     /// Optional alias for `--host <name>` resolution.
     #[serde(default)]
     pub name: Option<String>,
+    /// This peer votes and must not receive a restarted workload.
+    #[serde(default)]
+    pub is_witness: bool,
 }
 
 fn default_mesh_port() -> u16 {
@@ -1581,6 +1584,7 @@ mod tests {
                 endpoint: "192.0.2.1:51820".into(),
                 pubkey: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=".into(),
                 name: Some("s2".into()),
+                is_witness: true,
             }],
         };
         save_mesh(&dir, &conf).unwrap();
@@ -1593,8 +1597,8 @@ mod tests {
         assert_eq!(mode, 0o600, "mesh.conf holds a private key");
         let raw = std::fs::read_to_string(dir.join("conf/mesh.conf")).unwrap();
         assert!(
-            raw.contains("format = 3"),
-            "mesh save must stamp format 3, got {raw}"
+            raw.contains("format = 4"),
+            "mesh save must stamp format 4, got {raw}"
         );
         assert!(raw.contains("deadbeef"));
         assert!(raw.contains("prevtoken"));
@@ -1607,6 +1611,7 @@ mod tests {
         assert_eq!(back.peers.len(), 1);
         assert_eq!(back.peers[0].endpoint, "192.0.2.1:51820");
         assert_eq!(back.peers[0].name.as_deref(), Some("s2"));
+        assert!(back.peers[0].is_witness);
         // Format 2 has no grace token. It still loads; the field defaults empty.
         let legacy = "format = 2\nprivate_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\ncluster_token = \"old\"\nlisten_port = 51820\npeers = []\n";
         std::fs::write(dir.join("conf/mesh.conf"), legacy).unwrap();

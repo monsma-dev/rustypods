@@ -2,6 +2,16 @@ use super::super::*;
 use crate::{mesh, net};
 use std::net::SocketAddr;
 
+/// Sends `true` on drop so the Raft task stops with the listener,
+/// including when this task is aborted rather than returning.
+struct StopOnDrop(tokio::sync::watch::Sender<bool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 /// rustls already required a mesh-CA client certificate. This records
 /// which node it is, and refuses a certificate whose IP SAN is not the
 /// TCP source. Handlers can read [`crate::meshca::MeshNodeId`].
@@ -31,6 +41,55 @@ fn require_mesh_peer(mut req: Request<()>) -> Result<Request<()>, Status> {
 }
 
 impl super::super::Svc {
+    pub(crate) fn local_bootstrap(req_has_peer: bool) -> Result<(), Status> {
+        if req_has_peer {
+            Err(Status::permission_denied(
+                "mesh certificate bootstrap stays on the local socket",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Joiner: persist the WireGuard key (minting it when absent) and a
+    /// TLS `node.key`, then return the CSR and the pubkey. Does not
+    /// create a CA and does not bring the tunnel up.
+    pub(crate) fn create_csr_work(&self) -> Result<MeshCreateCsrResponse, Status> {
+        let wg_pubkey = mesh::ensure_identity(&self.cfg.data_dir).map_err(int)?;
+        let csr_pem = crate::meshca::create_node_csr(&self.cfg.data_dir).map_err(int)?;
+        Ok(MeshCreateCsrResponse { csr_pem, wg_pubkey })
+    }
+
+    /// Root: stamp the joiner's WireGuard identity onto a fresh leaf and
+    /// return `node.crt` plus `ca.crt`. The CSR names are ignored.
+    /// Nothing is written over this host's own node certificate.
+    pub(crate) fn sign_csr_work(
+        &self,
+        wg_pubkey: &str,
+        csr_pem: &str,
+    ) -> Result<MeshSignCsrResponse, Status> {
+        if self.cfg.role == crate::ha::Role::Witness {
+            return Err(Status::failed_precondition(
+                "a witness votes and does not sign mesh certificates",
+            ));
+        }
+        if !self.cfg.data_dir.join("mesh-pki/ca.key").is_file() {
+            return Err(Status::failed_precondition(
+                "this host has no mesh CA key — only the root signs joiners",
+            ));
+        }
+        let wg_pubkey = wg_pubkey.trim();
+        let prefix = mesh::prefix_of(wg_pubkey).map_err(bad)?;
+        let host = mesh::host_addr(prefix);
+        let node_crt = crate::meshca::issue_from_csr(&self.cfg.data_dir, csr_pem, wg_pubkey, host)
+            .map_err(bad)?;
+        let ca_crt = std::fs::read(self.cfg.data_dir.join("mesh-pki/ca.crt"))
+            .map_err(|e| int(anyhow::anyhow!("mesh ca.crt: {e}")))?;
+        let ca_crt =
+            String::from_utf8(ca_crt).map_err(|e| int(anyhow::anyhow!("mesh ca.crt: {e}")))?;
+        Ok(MeshSignCsrResponse { node_crt, ca_crt })
+    }
+
     /// Give every running standalone pod its mesh /128 — used after
     /// `mesh init`/daemon restart when pods outlived the daemon (or
     /// were started before the mesh existed). Idempotent: both the
@@ -148,7 +207,7 @@ impl super::super::Svc {
             conf.listen_port = port;
         }
         state::save_mesh(&self.cfg.data_dir, &conf).map_err(int)?;
-        let m = mesh::Mesh::start(&self.cfg.data_dir, conf)
+        let m = mesh::Mesh::start_as(&self.cfg.data_dir, conf, self.cfg.role)
             .await
             .map_err(int)?;
         let status = m.status().await;
@@ -191,6 +250,7 @@ impl super::super::Svc {
         endpoint: &str,
         pubkey: &str,
         name: &str,
+        is_witness: bool,
     ) -> Result<MeshStatus, Status> {
         let Some(m) = self.mesh() else {
             return Err(Status::failed_precondition(
@@ -198,7 +258,9 @@ impl super::super::Svc {
             ));
         };
         let alias = (!name.is_empty()).then_some(name);
-        m.add_peer(endpoint, pubkey, alias).await.map_err(bad)?;
+        m.add_peer(endpoint, pubkey, alias, is_witness)
+            .await
+            .map_err(bad)?;
         self.sync_mesh_rpc_guard().await?;
         Ok(m.status().await)
     }
@@ -318,9 +380,12 @@ impl super::super::Svc {
             );
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let raft_svc = svc.clone();
-            let raft_stop = rx.clone();
-            tokio::spawn(async move {
-                super::raft::run(raft_svc, raft_stop).await;
+            let (raft_tx, raft_rx) = tokio::sync::watch::channel(false);
+            // Dropped with this task, including when the task is aborted,
+            // so the election loop cannot outlive the listener.
+            let stop_raft = StopOnDrop(raft_tx);
+            let raft = tokio::spawn(async move {
+                super::raft::run(raft_svc, raft_rx).await;
             });
             let mut rx = rx;
             let res = server
@@ -332,6 +397,8 @@ impl super::super::Svc {
             if let Err(e) = res {
                 tracing::error!("mesh-RPC server exited: {e:#}");
             }
+            drop(stop_raft);
+            let _ = tokio::time::timeout(Duration::from_secs(2), raft).await;
         });
         {
             let mut guard = match self.mesh_rpc_stop.lock() {
