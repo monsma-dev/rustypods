@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RustyPods — systemd-native pod runtime</title>
+<style>
+  body { font-family: "Segoe UI", Calibri, Arial, sans-serif; font-size: 11pt; line-height: 1.45; color: #1a1a1a; }
+  h1 { font-size: 22pt; color: #0b3d66; border-bottom: 3px solid #0b3d66; padding-bottom: 6px; }
+  h2 { font-size: 15pt; color: #0b3d66; margin-top: 26px; border-bottom: 1px solid #9db8cc; padding-bottom: 3px; }
+  h3 { font-size: 12.5pt; color: #1f5a8a; margin-top: 18px; }
+  code, pre { font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace; font-size: 9.5pt; }
+  pre { background: #f4f6f8; border: 1px solid #d5dde3; border-left: 4px solid #0b3d66; padding: 10px 12px; white-space: pre-wrap; }
+  code { background: #eef2f5; padding: 1px 4px; border-radius: 3px; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th { background: #0b3d66; color: #fff; text-align: left; padding: 6px 9px; font-size: 10pt; }
+  td { border: 1px solid #c9d4dc; padding: 5px 9px; vertical-align: top; font-size: 10pt; }
+  tr:nth-child(even) td { background: #f4f7fa; }
+  blockquote { border-left: 4px solid #c8a03c; background: #fdf6e3; margin: 12px 0; padding: 8px 14px; }
+  ul, ol { margin: 6px 0 12px 0; }
+  li { margin: 3px 0; }
+  .meta { color: #666; font-size: 10pt; }
+</style>
+</head>
+<body>
+
+<h1>RustyPods</h1>
+<p class="meta"><b>A systemd-native pod runtime for Linux</b> — nspawn pods on Btrfs, driven by one Rust daemon over a Unix socket and gRPC.<br>
+Technical overview · 27 September 2026 · Nick Monsma</p>
+
+<h2>1. In one paragraph</h2>
+<p>RustyPods is a pod orchestrator that uses <b>systemd-nspawn</b> as its isolation primitive instead of the classic container stack. There is <b>no containerd, no runc, no overlayfs, and no Docker daemon</b>. One Rust daemon (<code>rustypodsd</code>) talks directly to systemd, machined, Btrfs and nftables through <code>zbus</code>. On top of that local machine model it adds the pieces a second site actually needs: a private mesh CA, mutual TLS between nodes, a WireGuard fabric, an availability policy, and a Raft election whose vote is on disk before it is sent. Business data stays in the database that already owns it. Raft is reserved for membership and, later, the desired set of pods.</p>
+
+<h2>2. The problem it solves</h2>
+<p>The dominant container stack is layered and heavy: Docker, then containerd, then runc, then kernel namespaces, plus overlayfs for storage and a separate network layer. Kubernetes adds a scheduler, an API server, etcd and a control plane. That is proven at large scale, and it is the wrong price for one machine or two sites:</p>
+<ul>
+  <li>A single host, or a pair of hosts, pays an operational cost that belongs to a much larger cluster.</li>
+  <li>Every layer is its own failure domain, its own CVE surface and its own configuration language.</li>
+  <li>systemd-nspawn has done the core job for years — a bootable machine on the host kernel, registered with machined, limited by a cgroup scope — and it still has <b>no management layer</b>: no images, no snapshot workflow, no exec model, no port publishing, no second site.</li>
+</ul>
+<p>RustyPods is that missing layer, and it stays small on purpose. The daemon is one process. State is a directory. Firewall rules are one readable nftables table. A second site is a peer and, when two hosts are not enough to vote, a witness. It is not a new etcd.</p>
+
+<h2>3. Architecture</h2>
+<pre><code>rustypods (CLI) ──UDS+gRPC──&gt; rustypodsd (root, systemd unit)
+                                  │
+                                  ├─ btrfs subvolume snapshot   images → pods, instant CoW
+                                  ├─ btrfs qgroups              per-pod storage caps
+                                  ├─ systemd-nspawn --boot      payload on the host kernel
+                                  ├─ machined via zbus          machine-&lt;pod&gt;.scope
+                                  ├─ systemd1 via zbus          MemoryHigh/Max, CPUQuota
+                                  ├─ nftables                   ip rustypods / ip6 rustypods6
+                                  ├─ rustypods-agent            in-pod cgroup v2 + PSI
+                                  ├─ mesh pump                  userspace WireGuard → rp-mesh0
+                                  ├─ mesh CA                    per-node certs, distinct from ingress
+                                  └─ Raft election              term + vote, fsynced before send</code></pre>
+<table>
+<tr><th>Component</th><th>Role</th></tr>
+<tr><td><code>rustypodsd</code></td><td>The only privileged process. Listens on <code>/run/rustypods/daemon.sock</code>. An optional HTTP API stays on loopback. Data lives in <code>/var/lib/rustypods</code>.</td></tr>
+<tr><td><code>rustypods</code></td><td>CLI for images, pods, exec, volumes, stacks, mesh, ingress, metrics and doctor. Local calls use the Unix socket. <code>--remote user@host</code> bridges gRPC over SSH.</td></tr>
+<tr><td><code>rustypods-agent</code></td><td>A small binary inside each pod. It reads cgroup v2 and PSI and is dropped into the image at import.</td></tr>
+<tr><td><code>rustypods-ingress</code></td><td>A TLS-terminating reverse proxy in its own pod, with its own local PKI. The daemon pushes route snapshots. This CA is not the mesh CA.</td></tr>
+<tr><td><code>rustypods-proto</code></td><td>The gRPC contract shared by the CLI, the daemon, the agent and the ingress.</td></tr>
+</table>
+
+<h3>Dataplane without a proxy</h3>
+<p>Host-to-pod data uses real shared pages. <code>/dev/shm/rustypods/&lt;pod&gt;/</code> is bound to <code>/run/rustypods/shm/</code> inside the pod. An <code>mmap</code> there is kernel shared memory: no socket and no copy. The daemon also binds <code>/var/lib/rustypods/run/&lt;pod&gt;/agent.sock</code> into the pod as the control channel.</p>
+
+<h3>What crosses the NIC, and what does not</h3>
+<table>
+<tr><th>Path</th><th>Protection</th></tr>
+<tr><td>Local Unix socket</td><td><code>SO_PEERCRED</code>. Root and the configured administrator uid may mutate. Extra uids can be read-only. The socket is plaintext because it never leaves the host.</td></tr>
+<tr><td>HTTP <code>/v1</code></td><td>Loopback only, unless an explicit insecure flag is set. That flag is not a remote-access design.</td></tr>
+<tr><td>Mesh gRPC, TCP 5306</td><td>Mutual TLS. The client certificate is issued by the mesh CA. Its IP SAN must equal the TCP source address.</td></tr>
+<tr><td>Gossip, UDP 5305</td><td>HMAC-SHA256 with the cluster token. Pods cannot reach this socket.</td></tr>
+<tr><td>WireGuard, UDP 51820</td><td>Userspace BoringTun on <code>rp-mesh0</code>. No kernel module.</td></tr>
+<tr><td>SSH remote CLI</td><td>SSH authenticates the operator. gRPC then hits the remote Unix socket. No extra daemon port on the public Internet.</td></tr>
+</table>
+
+<h2>4. Feature overview</h2>
+<table>
+<tr><th>Feature</th><th>What it does</th></tr>
+<tr><td><b>Images</b></td><td><code>pull</code> fetches OCI images from registries such as docker.io and ghcr.io without podman or docker. <code>import --from-distrobox</code> turns an existing distrobox into an image. <code>export</code> and <code>load</code> stream a pod, including rootfs, config and volumes.</td></tr>
+<tr><td><b>Snapshots</b></td><td><code>create</code> is a Btrfs copy-on-write snapshot of an image. <code>commit</code> snapshots a running pod. <code>rollback</code> puts that rootfs back. <code>clone</code> is an instant copy with a new network identity. On XFS the same operations fall back to reflink copies.</td></tr>
+<tr><td><b>Exec and shell</b></td><td><code>exec</code> and <code>shell</code> use <code>nsenter</code> and a host pty. Pipes, ttys, exit codes, workdir, environment and timeouts are first-class. A timeout kills the process group.</td></tr>
+<tr><td><b>Live limits</b></td><td><code>config</code> changes MemoryHigh, MemoryMax, CPUQuota and the storage cap on the running scope through <code>SetUnitProperties</code>. No restart.</td></tr>
+<tr><td><b>Networking</b></td><td>A pod with ports or ingress gets a private netns: host <code>ve-&lt;pod&gt;</code> to pod <code>host0</code>, dual-stack. DNAT lives in RustyPods' own nftables table. A publish without a host IP binds to 127.0.0.1.</td></tr>
+<tr><td><b>Stacks</b></td><td><code>apply stack.toml</code> puts several pods in one netns. They reach each other on 127.0.0.1. <code>stack start</code>, <code>stop</code> and <code>destroy</code> cover the group.</td></tr>
+<tr><td><b>Mesh</b></td><td>Each pod on a private netns receives a stable ULA, <code>fd&lt;host&gt;:&lt;idx&gt;::2</code>, routed between peers without NAT. Pod names resolve across the mesh. Names expire by TTL.</td></tr>
+<tr><td><b>Mesh identity</b></td><td>A mesh CA, separate from the ingress CA, issues a short-lived node certificate bound to the WireGuard public key and to <code>fd&lt;host&gt;::1</code>. Joiners bootstrap from a CSR. They never receive <code>ca.key</code>.</td></tr>
+<tr><td><b>Ingress</b></td><td>A managed reverse-proxy pod with its own local PKI. It terminates TLS for ingress names and publishes them to pods.</td></tr>
+<tr><td><b>Volumes</b></td><td>Named Btrfs subvolumes that outlive a pod, mounted with <code>--volume name:/path</code>.</td></tr>
+<tr><td><b>Health and restart</b></td><td>Exec or TCP probes, restart policies <code>no</code>, <code>on-failure</code> and <code>always</code>, and autostart when the daemon starts. The unit uses <code>KillMode=process</code>, so pods survive a daemon restart.</td></tr>
+<tr><td><b>Metrics</b></td><td>Live telemetry from the in-pod agent: cgroup v2 CPU, memory, I/O and PSI.</td></tr>
+<tr><td><b>Access and audit</b></td><td>Administrators are uid 0 and the configured uid. Read-only uids may call read RPCs. Every rejected or accepted mutation is one JSON line in an append-only audit log, mode 0600.</td></tr>
+<tr><td><b>Doctor</b></td><td><code>rustypods doctor</code> checks systemd as PID 1, cgroup v2, user namespaces, nspawn and nsenter, machined, <code>/dev/shm</code>, sysctls, Btrfs and the SELinux context.</td></tr>
+</table>
+
+<h2>5. Why not Podman, Docker, or Kubernetes?</h2>
+<table>
+<tr><th></th><th>RustyPods</th><th>Podman or Docker</th><th>Kubernetes</th><th>plain nspawn</th></tr>
+<tr><td><b>Isolation</b></td><td>systemd-nspawn, a machine on the host kernel</td><td>runc namespaces, seccomp and capabilities</td><td>containerd or runc, plus kubelet</td><td>systemd-nspawn</td></tr>
+<tr><td><b>Runtime stack</b></td><td>one Rust daemon</td><td>containerd or runc, a shim, conmon</td><td>kubelet, CRI, etcd, and more</td><td>none</td></tr>
+<tr><td><b>Storage</b></td><td>Btrfs subvolume snapshots</td><td>overlayfs layers</td><td>overlayfs plus CSI</td><td>manual</td></tr>
+<tr><td><b>Exec</b></td><td>nsenter over gRPC, privilege checks in the daemon</td><td>conmon and OCI exec</td><td>kubectl exec, kubelet, CRI</td><td>machinectl shell</td></tr>
+<tr><td><b>Network</b></td><td>veth and a private nftables table</td><td>netavark or CNI</td><td>CNI plugins and kube-proxy</td><td>manual</td></tr>
+<tr><td><b>Second site</b></td><td>WireGuard mesh, mesh CA, Raft vote, witness</td><td>no current built-in fabric</td><td>a cluster and an overlay</td><td>none</td></tr>
+<tr><td><b>Minimum host</b></td><td>systemd, cgroup v2, nftables</td><td>the engine plus its kernel features</td><td>several control-plane nodes</td><td>systemd</td></tr>
+</table>
+<p>Podman is a good tool, and it brings the OCI runtime with it: runc, conmon, netavark, and on a rootless host often fuse-overlayfs. It models a container as a process. RustyPods models a pod as a <b>machine</b>. machined knows it. cgroup limits come from systemd. Stopping it is a signal to systemd-PID 1 inside the pod. There is no conmon per container and no overlayfs mount stack.</p>
+<p>Kubernetes schedules hundreds of nodes. RustyPods is aimed at the operator who currently runs a VM, Compose, and a handmade tunnel. The mesh gives pod addresses on a second site without bootstrapping a cluster first. Scheduling stays opt-in: a stack with no placement rule remains on the host where it was created.</p>
+
+<h2>6. Security model</h2>
+<p>The exec path is deliberately stricter than most tools in this class. The rule is that <b>no image binary ever runs at a higher privilege than the target identity</b>.</p>
+<ul>
+  <li>Identity changes happen in the daemon (<code>pre_exec_identity</code>, async-signal-safe calls) or inside nsenter. Image binaries such as <code>setpriv</code> or <code>su</code> are never used to raise privilege on the host.</li>
+  <li><code>PR_CAPBSET_DROP</code> removes every capability outside the nspawn bounding set. Pods without a user namespace also set <code>PR_SET_NO_NEW_PRIVS</code>.</li>
+  <li>Root exec in a pod without a user namespace is host root. It is refused unless the operator passes <code>--user root</code>. Those pods are trusted code only.</li>
+  <li>Exec'd processes enter the pod cgroup atomically through <code>nsenter --cgroup</code>. MemoryHigh and CPUQuota apply to exec work. A cgroup v2 kill covers the group when a timeout fires.</li>
+  <li>A publish without a host IP is loopback-only. Pod egress and published ports use RustyPods' own nftables table. Pods cannot reach each other's unpublished ports, and the host-loopback pattern behind CVE-2020-8558 is closed.</li>
+  <li>Writable binds of <code>/run</code>, <code>/etc</code>, <code>/usr</code>, <code>/boot</code>, <code>/proc</code>, <code>/sys</code>, <code>/dev</code> and <code>/var/lib/rustypods</code> are refused. A writable bind of <code>/run/user</code> once wiped a real login session; that class of mount does not come back.</li>
+  <li>Rootfs setup uses <code>openat2</code> with <code>RESOLVE_BENEATH</code> so a pod cannot escape its tree through a symlink.</li>
+  <li><code>rustypods-proto</code>, <code>rustypods-client</code>, <code>rustypods-agent</code> and <code>rustypods-ingress</code> forbid unsafe code. The daemon and the CLI use unsafe only for libc, ptys and ioctl.</li>
+</ul>
+
+<h3>Mesh certificates</h3>
+<p>Once a packet leaves the host, a shared cluster token is not the gRPC credential. The mesh CA is name-constrained to <code>node.mesh.rustypods</code> and to <code>fd00::/8</code>, with a path length of zero, so a node certificate cannot sign anything else. A node certificate lasts seven days, carries server and client EKUs, and names both a DNS SAN derived from the WireGuard public key and the host ULA. The listener inserts that identity only when the certificate's IPv6 SAN equals the TCP source. A peer cannot request a vote under another node's name.</p>
+<p><code>ca.key</code> is mode 0600 and never leaves the root. <code>node.key</code> is mode 0640 and is shared with the administrator group so <code>rustypods --host</code> can present it. Group-writable or world-readable keys are refused. A leaf directory (<code>ca.crt</code>, <code>node.crt</code>, <code>node.key</code>, and no <code>ca.key</code>) is accepted as-is and is not rotated in place. Anything between empty and a full root or leaf is corrupt, and the daemon will not mint a CA over it.</p>
+<p>Certificate bootstrap stays on the local socket. <code>mesh create-csr</code> prints the WireGuard public key and a CSR. <code>mesh sign-csr</code> discards every name in that CSR and stamps the WireGuard identity itself. The mesh listener refuses both calls. A witness with an empty <code>mesh-pki</code> cannot run <code>mesh init</code>: a witness does not mint a CA and must join through <code>create-csr</code>.</p>
+
+<h3>The four PKI files are one directory swap</h3>
+<p>Linux <code>rename</code> cannot replace a directory that already has entries. RustyPods therefore writes the complete set into <code>.mesh-pki.tmp</code>, parks the live <code>mesh-pki</code> as <code>.mesh-pki.bak</code>, and renames the staging directory into place. The backup is removed only after that rename succeeds. A crash in the middle leaves the original directory, or no directory plus the backup. The next start restores the backup and deletes an incomplete staging directory. A half-written CA is not a layout the daemon will trust.</p>
+
+<h2>7. Mesh without a cluster</h2>
+<p><code>rustypods mesh init</code> on a host creates a WireGuard identity. The private key stays in <code>conf/mesh.conf</code>, mode 0600. A stable ULA <code>/48</code> is derived from the public key, with the two required ULA bits forced. Peers are added on both sides with <code>mesh add-peer</code>. There is no <code>mesh join</code> over the network.</p>
+<ul>
+  <li>Each pod with a private netns receives <code>fd&lt;host&gt;:&lt;idx&gt;::2</code>. The host control address is <code>fd&lt;host&gt;::1</code>. Both are routed across peers, without NAT.</li>
+  <li>A DNS registry on the mesh resolves pod names. Records expire by TTL instead of living until a process remembers to delete them.</li>
+  <li>The pump is userspace WireGuard (BoringTun). Roaming updates a peer's endpoint, so a NATed host can keep the tunnel as long as it sends the first packet to a public <code>ip:51820</code>.</li>
+  <li>Gossip is HMAC-SHA256 and is chunked. The cluster token still exists for that path and for token rotation. It is not sent on mesh gRPC.</li>
+  <li>An nftables set accepts TCP 5306 only from peer host addresses. mTLS is the check behind that filter, not a replacement for it.</li>
+  <li>Handshake floods are bounded so a noisy UDP peer cannot pin the pump.</li>
+</ul>
+<p>Joining a node, including a witness, is an out-of-band exchange over the SSH session that already reaches the local socket:</p>
+<pre><code># on the joiner — writes node.key, does not create a CA
+rustypods mesh create-csr
+
+# on the root — local socket only; prints ca.crt, then node.crt
+rustypods mesh sign-csr &lt;wg-pubkey&gt; joiner.csr
+
+# operator places those two files beside node.key, never ca.key
+# then, on the root, the witness is a voter and not a placement target
+rustypods mesh add-peer &lt;public-ip&gt;:51820 &lt;pubkey&gt; --witness</code></pre>
+<p>In September 2026 a live mesh between an AlmaLinux 9.8 host and an AlmaLinux 10.2 host carried pod-to-pod traffic over the tunnel, with handshakes in both directions. That measurement is a tunnel. It is not yet a Raft quorum. A binary built on Debian 13 requires glibc 2.39 and does not run on AlmaLinux 9. The witness is intended to be a bare Debian 13 host with a public address, built on that host.</p>
+
+<h2>8. Availability</h2>
+<p>A Btrfs snapshot is a local copy. It dies with the disk it sits on. Four rules in <code>ha.rs</code> decide what a missing site means. A stack that asks for something the rules forbid is rejected at <code>apply</code>.</p>
+<ol>
+  <li><b>Traffic.</b> Members that share <code>serves = "orders"</code> are one DNS name. While quorum holds, the name points at the live primary, or at the live mesh replica when the primary's host is dead. A name with nobody left is withdrawn.</li>
+  <li><b>Workloads.</b> <code>ha = "movable"</code> may restart on the single surviving host. The default is <code>pinned</code>. A volume, a published port, an ingress name, or host access cannot be movable: there is nowhere for that byte or that socket to go.</li>
+  <li><b>Databases.</b> <code>replicates = "snapshot"</code> is the local time machine and is not a second copy. <code>replicates = "mesh"</code> means MySQL or Postgres is replicating itself across the mesh. RustyPods does not copy those rows and does not restart a database on the other host. It only retargets the name onto the replica that is already running there.</li>
+  <li><b>Quorum.</b> A plan is published only when a majority of voters is reachable. Two hosts need a witness. The witness votes and runs no pods. One live host out of three publishes nothing, so a partition cannot elect two leaders. Two hosts and no witness also publish nothing once one of them is gone.</li>
+</ol>
+<p><code>is_witness</code> is stored on the peer, in <code>mesh.conf</code> format 4. The planner places work only on a host. Two live witnesses can hold quorum and still receive no restart and no published address. A witness leader drops restart, DNS and stranded work locally. Single-node placement remains the default, so a shop does not have to become a cluster to keep running.</p>
+
+<h3>Raft, and only the vote</h3>
+<p>Raft here is the election for mesh membership. It is not a database. <code>current_term</code> and <code>voted_for</code> are the fields that must survive a crash, because a node grants at most one vote per term. They are written to <code>raft.state</code>, mode 0600, with an <code>fsync</code> before any <code>RequestVote</code> is sent.</p>
+<p>The write does not run on a Tokio worker while the election mutex is held. The term and the vote are copied out, the lock is dropped, and a blocking task fsyncs the file. <code>tokio::fs::write</code> is not used: it reports success when the bytes are in the page cache, and a power loss can then lose them. If the fsync fails, memory is put back to the previous term, provided nothing newer landed while the write was in flight, and the vote is not sent. That is the split-brain barrier. A node must not be able to vote twice in one term after a crash.</p>
+<p>A missed heartbeat starts an election. The timeout is 150–300 ms. A leader sends empty <code>AppendEntries</code> heartbeats. Quorum is a majority, counting this node. One acknowledgement is enough for three voters and not enough for five. A laptop with no peers has a majority of one and elects itself. A non-empty append is rejected. There is no stored log yet, and the daemon will not pretend an entry was committed. The availability plan is computed on a quorum and then discarded until that log carries workloads. The witness is already excluded from the decision, so the discarded plan cannot name it as a target.</p>
+<p>The election task is tied to the mesh listener. When the listener returns or is aborted, it signals the election loop and waits for it to stop. A dead listener does not leave a second voter running beside the next one.</p>
+
+<h2>9. Who it is for</h2>
+<ul>
+  <li><b>One host, or a few hosts.</b> Homelabs, edge, and small production: anyone who currently maintains a VM, Compose, and a tunnel by hand.</li>
+  <li><b>systemd shops.</b> Teams that already use machined or nspawn and want a real management layer.</li>
+  <li><b>A second site that must not run the shop.</b> A witness on a small VPS, voting and holding no pods, so two application hosts can lose one without both sides deciding.</li>
+  <li><b>Not this, on purpose.</b> A multi-tenant platform that schedules hundreds of nodes. That remains Kubernetes.</li>
+</ul>
+
+<h2>10. Status</h2>
+<table>
+<tr><th>Piece</th><th>Where it stands on 27 September 2026</th></tr>
+<tr><td>Local pods</td><td>In daily use. The development machine builds inside a RustyPods pod. Images, snapshots, exec, limits, stacks, ingress and the agent are in tree.</td></tr>
+<tr><td>Distros</td><td>Debian 13 is the development host. Fedora 44 has been live-tested with SELinux enforcing and Btrfs. AlmaLinux has run the daemon when the binary was built for that glibc. Release builds are native; there are no published static binaries.</td></tr>
+<tr><td>Mesh tunnel</td><td>Live between two sites in September 2026. Identity, mTLS, HMAC gossip, roaming and the nftables guard are in the daemon.</td></tr>
+<tr><td>Availability policy</td><td>The four rules are enforced at plan time and when a stack is applied. The planner's DNS is not published yet, because the Raft log does not carry workloads.</td></tr>
+<tr><td>Raft election</td><td>A single node elects itself, fsyncs <code>raft.state</code> once per start, and heartbeats nobody. A witness role exists. A third voter on a public Debian 13 host is the next operational step, and it is not deployed.</td></tr>
+<tr><td>Not in this tree</td><td>A replicated command log, automatic failover of real DNS, database row shipping, an OCI runtime, a scheduler, an autoscaler.</td></tr>
+</table>
+<p>The honest boundary: the vote cannot be granted twice after a crash, a witness cannot be given a pod, and a witness cannot mint a CA. The tunnel can already carry packets. The log that would move a stack, and the witness that would make two hosts a majority, are the next cuts. They are not implied by the election that exists today.</p>
+
+<h2>11. A short command tour</h2>
+<pre><code>rustypods pull docker.io/library/debian:trixie
+rustypods create app --image debian-trixie --port 8080:8080
+rustypods start app --memory-high 2G
+rustypods exec app -w /srv -- ./server
+rustypods commit app before-migrate
+
+rustypods mesh init
+rustypods mesh create-csr
+rustypods mesh sign-csr &lt;wg-pubkey&gt; joiner.csr
+rustypods mesh add-peer &lt;public-ip&gt;:51820 &lt;pubkey&gt; --witness
+rustypods --remote ops@other-host ps</code></pre>
+
+<blockquote>
+RustyPods is a different architecture, not another container CLI. A pod is a systemd machine on the host kernel, with the management layer nspawn never had: snapshots, an exec path with a real privilege model, a private nftables network, and a WireGuard mesh whose nodes authenticate with their own CA. Two sites can vote only when a witness is present. That witness counts, and it runs nothing. The bar is a Raspberry Pi at one end and a second datacenter at the other, without standing up a cluster to get there.
+</blockquote>
+
+<p class="meta">Nick Monsma — Apotheek Centraal / RustyPods. September 2026.</p>
+
+</body>
+</html>
