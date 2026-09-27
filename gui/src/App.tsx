@@ -7,6 +7,7 @@ import ApplyStackDialog from "./ApplyStackDialog";
 import PodsView from "./views/PodsView";
 import StacksView from "./views/StacksView";
 import ImagesView from "./views/ImagesView";
+import MeshView from "./views/MeshView";
 import SettingsView from "./views/SettingsView";
 import Tutorial, { tutorialSeen } from "./Tutorial";
 import { IconButton } from "./ui/Button";
@@ -16,6 +17,7 @@ import {
   ImagesIcon,
   MaximizeIcon,
   MinimizeIcon,
+  NetworkIcon,
   PodsIcon,
   SettingsIcon,
   StacksIcon,
@@ -23,12 +25,13 @@ import {
 } from "./ui/icons";
 import type { PodAct } from "./lib";
 
-type View = "pods" | "stacks" | "images" | "settings";
+type View = "pods" | "stacks" | "images" | "mesh" | "settings";
 
 const NAV: { id: View; label: string; Icon: (p: IconProps) => JSX.Element }[] = [
   { id: "pods", label: "Pods", Icon: PodsIcon },
   { id: "stacks", label: "Stacks", Icon: StacksIcon },
   { id: "images", label: "Images", Icon: ImagesIcon },
+  { id: "mesh", label: "Mesh", Icon: NetworkIcon },
   { id: "settings", label: "Settings", Icon: SettingsIcon },
 ];
 
@@ -91,7 +94,7 @@ function HeaderBar({ title, onHelp }: { title: string; onHelp: () => void }) {
 export default function App() {
   const [view, setView] = useState<View>(() => {
     const v = new URLSearchParams(location.search).get("view");
-    return v === "stacks" || v === "images" || v === "settings" ? v : "pods";
+    return v === "stacks" || v === "images" || v === "mesh" || v === "settings" ? v : "pods";
   });
   const [pods, setPods] = useState<Pod[]>([]);
   const [images, setImages] = useState<Image[]>([]);
@@ -177,6 +180,7 @@ export default function App() {
     pods: "Pods",
     stacks: "Stacks",
     images: "Images",
+    mesh: "Mesh",
     settings: "Settings",
   };
 
@@ -245,6 +249,7 @@ export default function App() {
               />
             )}
             {view === "images" && <ImagesView images={images} />}
+            {view === "mesh" && <MeshView />}
             {view === "settings" && (
               <SettingsView
                 info={info}
