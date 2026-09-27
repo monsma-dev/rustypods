@@ -10,8 +10,12 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-const RPC_BOUND: Duration = Duration::from_millis(200);
+const RPC_BOUND: Duration = Duration::from_millis(2000);
 const TICK: Duration = Duration::from_millis(50);
+/// WAN meshes run at tens of ms RTT; a fresh mTLS channel per call
+/// makes each append ~3 RTTs. Pace heartbeats well under the election
+/// floor so followers stay silent without drowning the link.
+const HEARTBEAT_EVERY: Duration = Duration::from_millis(500);
 
 fn attested(req: &Request<impl Sized>) -> Result<Ipv6Addr, Status> {
     req.extensions()
@@ -143,6 +147,9 @@ pub(crate) async fn append_entries(
 /// records quorum. A witness keeps that bit and publishes nothing.
 pub(crate) async fn run(svc: Svc, mut stop: watch::Receiver<bool>) {
     let mut timeout = crate::raft::election_timeout(crate::raft::jitter());
+    let mut last_beat = std::time::Instant::now()
+        .checked_sub(HEARTBEAT_EVERY)
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         tokio::select! {
             _ = stop.changed() => return,
@@ -156,8 +163,11 @@ pub(crate) async fn run(svc: Svc, mut stop: watch::Receiver<bool>) {
             (node.is_leader(), node.leader_silent(timeout))
         };
         if leader {
-            if let Err(e) = heartbeat(&svc).await {
-                tracing::debug!("raft heartbeat: {e}");
+            if last_beat.elapsed() >= HEARTBEAT_EVERY {
+                last_beat = std::time::Instant::now();
+                if let Err(e) = heartbeat(&svc).await {
+                    tracing::debug!("raft heartbeat: {e}");
+                }
             }
             continue;
         }

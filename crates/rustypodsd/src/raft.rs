@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const ELECTION_MIN: Duration = Duration::from_millis(150);
-pub const ELECTION_MAX: Duration = Duration::from_millis(300);
+/// Election timeouts must span several WAN RTTs: peers tens of ms apart
+/// otherwise campaign faster than votes can return and never converge.
+pub const ELECTION_MIN: Duration = Duration::from_millis(1500);
+pub const ELECTION_MAX: Duration = Duration::from_millis(3000);
 const STATE_NAME: &str = "raft.state";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,8 +266,14 @@ mod tests {
     #[test]
     fn election_timeout_stays_inside_the_window() {
         assert_eq!(election_timeout(0), ELECTION_MIN);
-        assert_eq!(election_timeout(150), ELECTION_MAX);
-        assert_eq!(election_timeout(151), ELECTION_MIN);
+        assert_eq!(
+            election_timeout(ELECTION_MAX.as_millis() as u64 - ELECTION_MIN.as_millis() as u64),
+            ELECTION_MAX
+        );
+        assert_eq!(
+            election_timeout(ELECTION_MAX.as_millis() as u64 - ELECTION_MIN.as_millis() as u64 + 1),
+            ELECTION_MIN
+        );
     }
 
     #[test]
