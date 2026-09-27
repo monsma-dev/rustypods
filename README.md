@@ -1,7 +1,77 @@
 # RustyPods
 
-nspawn pods on Btrfs, driven by a Rust daemon over UDS+gRPC.
-Podman/distrobox-light without overlayfs, without containerd, without proxy overhead.
+nspawn pods on Btrfs, driven by one Rust daemon over a Unix socket and gRPC.
+No containerd, no overlayfs, no Docker daemon. A second site is a WireGuard
+peer with its own certificate, not a Kubernetes cluster.
+
+A pod is a systemd machine. The daemon is one process. Two hosts can form a
+quorum only when a witness is present, and that witness runs no pods.
+
+Licensed under the MIT License. Copyright Nick Monsma, 2026.
+
+## Install from a terminal
+
+You need Linux with systemd as PID 1, a unified cgroup v2 hierarchy, and
+machined. Build on the machine that will run the daemon. A binary built on
+Debian 13 needs glibc 2.39 and does not run on AlmaLinux 9.
+
+Install a Rust toolchain and the `mold` linker. On Debian or Ubuntu:
+
+```bash
+sudo apt install build-essential mold pkg-config curl ca-certificates
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+On Fedora:
+
+```bash
+sudo dnf install gcc mold pkgconf curl ca-certificates
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+On Arch Linux, install `base-devel`, `mold` and `rustup`, then `rustup default stable`.
+
+Clone, build, and install:
+
+```bash
+git clone https://github.com/monsma-dev/rustypods.git
+cd rustypods
+bash scripts/build.sh
+sudo bash scripts/install-daemon.sh --user "$USER"
+rustypods doctor
+```
+
+`scripts/build.sh` compiles the release binaries and runs the tests. It links
+with `mold`. The installer then adds the distro packages the daemon needs
+(`systemd-container` or the equivalent, nftables, iproute, util-linux,
+btrfs-progs, socat), copies `rustypodsd` and `rustypods` to `/usr/local/bin`,
+and starts the systemd unit. Data lives in `/var/lib/rustypods`. The user you
+pass to `--user` is the administrator on the local socket.
+
+See the plan without changing the machine, and without root:
+
+```bash
+bash scripts/install-daemon.sh --dry-run --user "$USER"
+```
+
+First pod:
+
+```bash
+rustypods pull docker.io/library/debian:trixie
+rustypods create app --image debian-trixie --port 8080:8080
+rustypods start app --memory-high 2G
+rustypods exec app -- cat /etc/os-release
+rustypods ps
+```
+
+`sudo bash scripts/uninstall-daemon.sh` removes the unit and the binaries. It
+keeps `/var/lib/rustypods` unless you pass `--purge-data`.
+
+Design notes are in `docs/architecture.md`. The longer overview, including
+the mesh CA and the Raft vote, is `docs/RustyPods-overzicht.html` (the same
+text is also `.docx` and `.odt`).
 
 ## Architecture
 
@@ -57,7 +127,7 @@ Supported distro families — the installer maps each to its package set
 | --- | --- | --- |
 | Debian/Ubuntu | Debian, Ubuntu, Mint, Pop!_OS, Neon, Raspbian, Kali | runtime + deployment live-tested on Debian 13 |
 | Fedora | Fedora 44 | full runtime + deployment live-tested under KVM with SELinux Enforcing, Btrfs, cgroup v2 |
-| RHEL family | RHEL, CentOS, Alma, Rocky, Oracle | required packages mapped; `btrfs-progs` is optional (not in RHEL 8/9 repos — reflink fallback). Runtime/SELinux still unverified |
+| RHEL family | RHEL, CentOS, Alma, Rocky, Oracle | packages mapped; `btrfs-progs` is optional on 8/9 (reflink fallback). Build on that host. A Debian 13 binary does not run on AlmaLinux 9 |
 | Arch | Arch, Manjaro, EndeavourOS, CachyOS | distro detection + installer dry-run validated; runtime unverified |
 
 Release artifacts are currently built from source and should be compiled
@@ -140,29 +210,54 @@ Handy flags: `start --ephemeral` (throwaway run, `-x`) and
 
 ### Mesh
 
-`rustypods mesh init` creates `conf/mesh.conf` (mode 0600, holds the
-WireGuard private key + a generated cluster token) and a stable ULA /48.
-Peers are added with `mesh add-peer <ip:port> <pubkey> [--name s2]`.
-Joining hosts adopt the shared token via `mesh init --token <tok>`
-(`mesh status` on the first host prints it).
+`rustypods mesh init` on the first host creates `conf/mesh.conf` (mode 0600:
+the WireGuard private key and a cluster token) and a stable ULA `/48` derived
+from the public key. It also creates the mesh CA in `mesh-pki/`. `ca.key`
+stays on that host, mode 0600, and is never copied to a peer.
 
-With the mesh up, every daemon also serves its PodControl API to peers
-on `[fd<host>::1]:5306` (token-gated, nft source-guarded) — so the CLI
-can drive a peer directly:
+The cluster token authenticates gossip only (HMAC-SHA256 on UDP 5305). Mesh
+gRPC on `[fd<host>::1]:5306` is mutual TLS. The certificate's IP address must
+equal the TCP source, and nftables accepts that port only from peer host
+addresses. There is no shared token on the gRPC path.
+
+A second host must not mint its own CA. `mesh init` on an empty `mesh-pki`
+would do that, and the two CAs would refuse each other's certificates. A
+witness (`RUSTYPODS_ROLE=witness` in the daemon environment) is refused
+outright. Every joiner bootstraps from a CSR, over the local sockets, and
+the operator copies the PEM across the SSH session that already exists:
 
 ```bash
-rustypods --host s2 ps        # list pods on peer s2 — no ssh needed
-rustypods --host s2 shell db  # exec into a pod on the peer
+# on the joiner — writes node.key, prints the WireGuard pubkey and a CSR
+rustypods mesh create-csr
+
+# on the first host — local socket only; prints ca.crt, then node.crt
+rustypods mesh sign-csr <wg-pubkey> joiner.csr
 ```
-rustypods volume send dbdata --to s2   # push a named volume daemon→daemon
-                                       # (btrfs send when both ends are
-                                       # btrfs, tar otherwise — rename
-                                       # and --force supported)
-``` There is no in-band key rotation: `mesh deinit` (or
-remove a corrupt `conf/mesh.conf` by hand) on every host, then `mesh
-init` and re-add peers with the new pubkeys. `mesh init` will not
-replace a file it cannot parse — that would mint a new /48 and break
-every peer. `mesh status` shows that parse error when the mesh is down.
+
+Place `ca.crt` and `node.crt` next to the joiner's `node.key`. Do not copy
+`ca.key`. Then add the peer on both sides. `--witness` marks a voter that
+must not receive a workload:
+
+```bash
+rustypods mesh add-peer <public-ip>:51820 <pubkey> --name s2 --witness
+rustypods --host s2 ps          # pods on that peer, no SSH
+rustypods --host s2 shell db
+rustypods volume send dbdata --to s2
+```
+
+`volume send` uses Btrfs send when both ends are Btrfs, and tar otherwise.
+
+Gossip still needs the same cluster token. `mesh init --token <tok>` adopts
+the introducer's token. Run that only after the joiner already has `ca.crt`
+and `node.crt`; on an empty directory it would mint a second CA. `mesh init`
+will not replace a `mesh.conf` it cannot parse — that would mint a new `/48`
+and break every peer. `mesh status` shows that parse error when the mesh is
+down.
+
+Node certificates last seven days. The host that holds `ca.key` rotates its
+own leaf and keeps the previous certificate acceptable for a grace window.
+A joiner has no CA key, so it waits for a new `sign-csr`. Build the joiner's
+daemon on that machine's own OS.
 
 ## Bind mounts & sandboxing
 

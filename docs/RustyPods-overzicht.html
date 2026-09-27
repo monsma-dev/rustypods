@@ -188,7 +188,26 @@ rustypods mesh add-peer &lt;public-ip&gt;:51820 &lt;pubkey&gt; --witness</code><
 </table>
 <p>The honest boundary: the vote cannot be granted twice after a crash, a witness cannot be given a pod, and a witness cannot mint a CA. The tunnel can already carry packets. The log that would move a stack, and the witness that would make two hosts a majority, are the next cuts. They are not implied by the election that exists today.</p>
 
-<h2>11. A short command tour</h2>
+<h2>11. Install from a terminal</h2>
+<p>Build on the machine that will run the daemon. A binary from Debian 13 needs glibc 2.39 and does not run on AlmaLinux 9. The host must boot systemd as PID 1, on cgroup v2, with machined.</p>
+<p>On Debian or Ubuntu, install a compiler, <code>mold</code>, and Rust:</p>
+<pre><code>sudo apt install build-essential mold pkg-config curl ca-certificates
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"</code></pre>
+<p>On Fedora, the package line is <code>sudo dnf install gcc mold pkgconf curl ca-certificates</code>. On Arch Linux, install <code>base-devel</code>, <code>mold</code> and <code>rustup</code>.</p>
+<pre><code>git clone https://github.com/monsma-dev/rustypods.git
+cd rustypods
+bash scripts/build.sh
+sudo bash scripts/install-daemon.sh --user "$USER"
+rustypods doctor
+
+rustypods pull docker.io/library/debian:trixie
+rustypods create app --image debian-trixie --port 8080:8080
+rustypods start app --memory-high 2G
+rustypods ps</code></pre>
+<p><code>scripts/build.sh</code> compiles the release binaries and runs the tests. The installer adds nftables, iproute, util-linux, btrfs-progs, socat and the nspawn package for that distro, then starts <code>rustypodsd</code>. Your user is the administrator of the local socket. <code>bash scripts/install-daemon.sh --dry-run --user "$USER"</code> prints the plan and changes nothing. <code>sudo bash scripts/uninstall-daemon.sh</code> removes the unit and keeps <code>/var/lib/rustypods</code> unless you pass <code>--purge-data</code>.</p>
+
+<h2>12. A short command tour</h2>
 <pre><code>rustypods pull docker.io/library/debian:trixie
 rustypods create app --image debian-trixie --port 8080:8080
 rustypods start app --memory-high 2G
