@@ -1202,8 +1202,15 @@ impl PodControl for Svc {
     }
 
     async fn get_mesh_status(&self, _req: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
+        // Raft opens its on-disk state independently of the mesh tunnel,
+        // so this is filled on both branches below.
+        let raft = Some(svc::raft::status(self).await);
         match self.mesh() {
-            Some(m) => Ok(Response::new(m.status().await)),
+            Some(m) => {
+                let mut status = m.status().await;
+                status.raft = raft;
+                Ok(Response::new(status))
+            }
             None => {
                 let conf_error = match state::load_mesh(&self.cfg.data_dir) {
                     Err(e) => e.to_string(),
@@ -1212,6 +1219,7 @@ impl PodControl for Svc {
                 Ok(Response::new(MeshStatus {
                     enabled: false,
                     conf_error,
+                    raft,
                     ..Default::default()
                 }))
             }

@@ -461,6 +461,31 @@ message MeshStatus {
   // This host's own mesh gRPC addr ("fd<host>::1") — dial
   // http://[addr]:5306 from any mesh peer.
   string grpc_addr = 13;
+  // Absent only when the daemon could not open raft.state at all — in
+  // practice always present once the mesh has ever been initialized.
+  RaftState raft = 14;
+}
+
+// Which side of the availability policy this voter is on. A witness
+// votes and runs no pods (see ha.rs); it must never be a restart target.
+enum RaftRole {
+  RAFT_ROLE_HOST = 0;
+  RAFT_ROLE_WITNESS = 1;
+}
+
+// Election state for mesh membership — not a data log. `current_term`
+// and `voted_for` are read from the same on-disk raft.state a crash
+// must not roll back (see raft.rs). `quorum_size` counts configured
+// voters (self + mesh peers), not live acks; pair it with `has_quorum`
+// for "is a majority actually reachable right now".
+message RaftState {
+  uint64 current_term = 1;
+  bool is_leader = 2;
+  // "" if this node has not cast a vote in the current term.
+  string voted_for = 3;
+  uint32 quorum_size = 4;
+  bool has_quorum = 5;
+  RaftRole role = 6;
 }
 
 message ListPodsRequest {}

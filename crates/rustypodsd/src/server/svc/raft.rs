@@ -20,6 +20,45 @@ fn attested(req: &Request<impl Sized>) -> Result<Ipv6Addr, Status> {
         .ok_or_else(|| Status::unauthenticated("raft requires a mesh peer certificate"))
 }
 
+/// Election snapshot for `GetMeshStatus`. Independent of the
+/// heartbeat/campaign path: it takes its own short lock rather than
+/// threading a result out of `run`, so a GUI poll never waits on an
+/// in-flight election.
+pub(crate) async fn status(svc: &Svc) -> RaftState {
+    let (current_term, voted_for, is_leader, has_quorum) = {
+        let node = svc.raft.lock().await;
+        (
+            node.persistent.current_term,
+            node.persistent.voted_for.clone().unwrap_or_default(),
+            node.is_leader(),
+            node.has_quorum(),
+        )
+    };
+    // Configured voters (self + peers), not live acks — `has_quorum` is
+    // the "is a majority reachable right now" signal. Falls back to a
+    // plain conf read when the mesh isn't up, so the count is still
+    // meaningful right after `mesh init` and before the tunnel starts.
+    let peer_count = match svc.mesh() {
+        Some(m) => m.peer_host_addrs().await.len(),
+        None => crate::state::load_mesh(&svc.cfg.data_dir)
+            .ok()
+            .flatten()
+            .map(|c| c.peers.len())
+            .unwrap_or(0),
+    };
+    RaftState {
+        current_term,
+        is_leader,
+        voted_for,
+        quorum_size: (peer_count + 1) as u32,
+        has_quorum,
+        role: match svc.cfg.role {
+            crate::ha::Role::Host => RaftRole::Host as i32,
+            crate::ha::Role::Witness => RaftRole::Witness as i32,
+        },
+    }
+}
+
 pub(crate) async fn request_vote(
     svc: &Svc,
     req: Request<RequestVoteRequest>,

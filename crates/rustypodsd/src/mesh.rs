@@ -1005,6 +1005,9 @@ impl Mesh {
             conf_error: String::new(),
             cluster_token: conf.cluster_token,
             grpc_addr: self.host_addr.to_string(),
+            // The caller (GetMeshStatus) fills this from the raft lock —
+            // Mesh has no reference to the Raft node.
+            raft: None,
         }
     }
 

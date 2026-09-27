@@ -1238,6 +1238,26 @@ pub(crate) fn print_mesh_status(st: &MeshStatus) {
         "pump:    ticks={} udp={} tun={} tun_drops={}",
         st.pump_ticks, st.udp_pkts, st.tun_pkts, st.tun_drops
     );
+    if let Some(r) = &st.raft {
+        let role = match rustypods_proto::rpc::RaftRole::try_from(r.role)
+            .unwrap_or(rustypods_proto::rpc::RaftRole::Host)
+        {
+            rustypods_proto::rpc::RaftRole::Host => "host",
+            rustypods_proto::rpc::RaftRole::Witness => "witness",
+        };
+        println!(
+            "raft:    term={} {} quorum={}/{} voted_for={} role={role}",
+            r.current_term,
+            if r.is_leader { "leader" } else { "follower" },
+            if r.has_quorum { "yes" } else { "no" },
+            r.quorum_size,
+            if r.voted_for.is_empty() {
+                "-"
+            } else {
+                &r.voted_for
+            },
+        );
+    }
     if !st.conf_error.is_empty() {
         println!("error:   {}", st.conf_error);
     }
