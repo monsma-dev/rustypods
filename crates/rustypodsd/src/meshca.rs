@@ -120,7 +120,6 @@ fn pem_der(pem: &str) -> Result<Vec<u8>> {
 }
 
 fn check_required(paths: &MeshCa) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     for path in paths.required() {
         let md =
             std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -131,14 +130,23 @@ fn check_required(paths: &MeshCa) -> Result<()> {
             bail!("{} is empty", path.display());
         }
     }
-    for path in [&paths.ca_key, &paths.node_key] {
-        let md = std::fs::symlink_metadata(path)?;
-        if md.permissions().mode() & 0o077 != 0 {
-            bail!(
-                "{} is group/other-readable — fix permissions or delete and re-init",
-                path.display()
-            );
-        }
+    // ca.key never leaves the daemon. node.key may be 0640 so the
+    // operator uid can present it on `rustypods --host`; share_node_key
+    // sets that mode after the listener is up, and the next boot must
+    // still accept it. Group write and any other-access stay refused.
+    key_not_open(&paths.ca_key, 0o077, "group/other-readable")?;
+    key_not_open(&paths.node_key, 0o037, "group-writable or other-accessible")?;
+    Ok(())
+}
+
+fn key_not_open(path: &Path, forbidden: u32, why: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = std::fs::symlink_metadata(path)?;
+    if md.permissions().mode() & forbidden != 0 {
+        bail!(
+            "{} is {why} — fix permissions or delete and re-init",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -528,6 +536,30 @@ mod tests {
         assert_eq!(id.dns, node_dns("pubkey"));
         assert_eq!(id.addr, host);
         assert!(identity_from_der(b"not-a-cert").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_node_key_restarts_and_loose_modes_do_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        let host = Ipv6Addr::new(0xfd12, 0x3456, 0x789a, 0, 0, 0, 0, 1);
+        let paths = ensure(&dir, "pubkey-a", host).unwrap();
+        std::fs::set_permissions(&paths.node_key, std::fs::Permissions::from_mode(0o640)).unwrap();
+        ensure(&dir, "pubkey-a", host).unwrap();
+        std::fs::set_permissions(&paths.node_key, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let err = ensure(&dir, "pubkey-a", host).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("node.key"),
+            "group-writable node key must be refused, got {err:#}"
+        );
+        std::fs::set_permissions(&paths.node_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&paths.ca_key, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = ensure(&dir, "pubkey-a", host).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ca.key"),
+            "group-readable CA key must be refused, got {err:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
