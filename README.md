@@ -1,13 +1,36 @@
 # RustyPods
 
-nspawn pods on Btrfs, driven by one Rust daemon over a Unix socket and gRPC.
-No containerd, no overlayfs, no Docker daemon. A second site is a WireGuard
-peer with its own certificate, not a Kubernetes cluster.
+RustyPods is a single-binary pod orchestrator for Linux: nspawn machines on
+Btrfs, driven by one Rust daemon over a Unix socket and gRPC. No containerd,
+no overlayfs, no Docker daemon, no Kubernetes control plane to stand up
+before your first pod boots. A second site is a WireGuard peer with its own
+certificate and a vote — not a cluster you have to operate.
+
+- **Single-binary orchestrator.** One daemon (`rustypodsd`) talks directly to
+  systemd, machined, Btrfs and nftables. No sidecar runtimes, no etcd, no
+  API server to keep patched — the k8s control-plane tax without the k8s
+  control plane.
+- **Zero-trust WireGuard mesh.** Every node gets its own certificate from an
+  internal mesh CA; mutual TLS gates the cluster gRPC plane, not a shared
+  token. Gossip is HMAC-signed. A pod can't reach the mesh control socket at
+  all.
+- **Built-in Raft consensus.** Membership and quorum are decided by a Raft
+  vote whose term and ballot are fsynced to disk before the message leaves
+  the host — a crash can't grant the same term twice. Split-brain is a
+  protocol violation here, not a runbook step.
+- **Btrfs-backed atomic failover.** Pod state is a CoW snapshot; certificate
+  bootstrap installs as one atomic directory swap. A crash mid-write leaves
+  the previous, known-good state intact — never a half-written one.
 
 A pod is a systemd machine. The daemon is one process. Two hosts can form a
 quorum only when a witness is present, and that witness runs no pods.
 
 Licensed under the MIT License. Copyright Nick Monsma, 2026.
+
+| | | |
+|---|---|---|
+| ![Pods](docs/screenshots/pods.png) | ![Mesh quorum](docs/screenshots/mesh.png) | ![Welcome tour](docs/screenshots/tutorial.png) |
+| Pods — GNOME-style dense list | Mesh — live Raft term, quorum, witness role | Built-in welcome tour |
 
 ## Install from a terminal
 
@@ -710,9 +733,13 @@ npm run build         # frontend only → gui/dist
 ```
 
 Commands: `get_pods`, `start_pod`, `stop_pod`, `update_pod_config`,
-`get_images`, `get_daemon_info`, `watch_logs`. Views: Pods (dense table,
+`get_images`, `get_daemon_info`, `get_mesh_status`, `mesh_create_csr`,
+`mesh_sign_csr`, `mesh_add_peer`, `watch_logs`. Views: Pods (dense table,
 click a row for the detail panel), Stacks (grouped by shared netns),
-Images, Settings (daemon info, refresh interval, reduce-motion).
+Images, Mesh (live Raft term/leader/quorum, peer list, Add Peer dialog),
+Settings (daemon info, refresh interval, reduce-motion, replay the
+welcome tour). A first-launch welcome tour covers pods, stacks and the
+terminal; replay it any time from Settings or the header's `?` button.
 The detail panel has a segmented tab strip: Settings | Logs | Terminal —
 Logs renders `StreamLogs` in a read-only xterm, Terminal is a live exec
 shell. Snapshot retention (keep-last / max-age) is editable under
@@ -724,8 +751,8 @@ live, no restart. While a pod runs, `watch_metrics` streams the in-pod
 agent's samples to the frontend as `pod-metrics` Tauri events: the
 panel renders 60-sample SVG sparklines for memory (with high/max limit
 lines), CPU vs quota, and PSI stall (mem/io/cpu). Reduce-motion or a
-≥5 s refresh interval falls back to text stats. Screenshots in
-`docs/screenshots/`.
+≥5 s refresh interval falls back to text stats. Screenshots at the top of
+this README; more in `docs/screenshots/`.
 
 End-to-end IPC test against a live daemon (uses `tauri::test`
 MockRuntime — no webview needed):
