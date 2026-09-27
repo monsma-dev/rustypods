@@ -37,6 +37,9 @@ pub struct DaemonEnv {
     pub http_token_rotate: bool,
     /// `RUSTYPODS_READ_ONLY_UIDS`, comma-separated. Missing means nobody.
     pub read_only_uids: Vec<u32>,
+    /// `RUSTYPODS_ROLE`. Missing means `host`. `witness` votes and does
+    /// not schedule or publish DNS.
+    pub role: crate::ha::Role,
 }
 
 static LOADED: OnceLock<DaemonEnv> = OnceLock::new();
@@ -54,6 +57,7 @@ impl DaemonEnv {
             http_insecure: std::env::var_os("RUSTYPODS_HTTP_INSECURE").is_some(),
             http_token_rotate: std::env::var_os("RUSTYPODS_HTTP_TOKEN_ROTATE").is_some(),
             read_only_uids: var_uids("RUSTYPODS_READ_ONLY_UIDS")?,
+            role: var_role("RUSTYPODS_ROLE")?,
         })
     }
 }
@@ -110,6 +114,15 @@ fn var_uids(name: &str) -> Result<Vec<u32>> {
         out.push(uid);
     }
     Ok(out)
+}
+
+fn var_role(name: &str) -> Result<crate::ha::Role> {
+    match var_present(name)? {
+        None => Ok(crate::ha::Role::Host),
+        Some(s) if s == "host" => Ok(crate::ha::Role::Host),
+        Some(s) if s == "witness" => Ok(crate::ha::Role::Witness),
+        Some(s) => bail!("{name} must be host or witness, got {s}"),
+    }
 }
 
 fn var_string(name: &str, default: &str) -> Result<String> {
@@ -193,12 +206,14 @@ mod tests {
         let _c = Restore::clear("RUSTYPODS_DEFAULT_MEMORY_MAX");
         let _d = Restore::clear("RUSTYPODS_DEFAULT_CPU");
         let _e = Restore::clear("RUSTYPODS_READ_ONLY_UIDS");
+        let _f = Restore::clear("RUSTYPODS_ROLE");
         let env = DaemonEnv::from_env().unwrap();
         assert_eq!(env.import_max_bytes, DEFAULT_IMPORT_MAX_BYTES);
         assert_eq!(env.log_max_bytes, DEFAULT_LOG_MAX_BYTES);
         assert_eq!(env.default_memory_max, None);
         assert_eq!(env.default_cpu_percent, None);
         assert!(env.read_only_uids.is_empty());
+        assert_eq!(env.role, crate::ha::Role::Host);
     }
 
     #[test]

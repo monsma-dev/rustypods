@@ -36,10 +36,22 @@ pub enum Replication {
 }
 
 /// A voter. A witness counts toward quorum and runs no pods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Role {
+    #[default]
     Host,
     Witness,
+}
+
+/// A witness may vote. It does not restart a pod and it does not
+/// publish a DNS generation.
+pub fn local_effect(mut decision: Decision, role: Role) -> Decision {
+    if role == Role::Witness {
+        decision.restart.clear();
+        decision.dns = None;
+        decision.stranded.clear();
+    }
+    decision
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

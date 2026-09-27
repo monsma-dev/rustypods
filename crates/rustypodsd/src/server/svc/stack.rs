@@ -6,6 +6,11 @@ impl super::super::Svc {
         &self,
         req: Request<ApplyStackRequest>,
     ) -> Result<Response<ApplyStackResponse>, Status> {
+        if self.cfg.role == crate::ha::Role::Witness {
+            return Err(Status::failed_precondition(
+                "a witness votes and does not apply stacks",
+            ));
+        }
         let toml_text = String::from_utf8(req.into_inner().toml)
             .map_err(|e| bad(anyhow::anyhow!("stack file is not UTF-8: {e}")))?;
         let def = {

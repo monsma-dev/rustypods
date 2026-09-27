@@ -93,6 +93,11 @@ service PodControl {
   // Replace an old CA. Trust stores that imported the previous CA must
   // re-import; this does not edit the host trust store itself.
   rpc RotateIngressCa(Empty) returns (IngressCaResult);
+  // Raft election. The mesh interceptor has already checked the peer
+  // certificate's IP SAN against the TCP source.
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  // Raft heartbeat and log append. An empty entries list is a heartbeat.
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
 }
 
 // In-pod agent → daemon, on the per-pod socket /run/rustypods/run/agent.sock.
@@ -721,6 +726,33 @@ message IngressCaResult {
 }
 
 message IngressGatewayStatusRequest {}
+
+message RequestVoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+message RaftLogEntry {
+  uint64 term = 1;
+  bytes command = 2;
+}
+message AppendEntriesRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated RaftLogEntry entries = 5;
+  uint64 leader_commit = 6;
+}
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+}
 
 message IngressGatewayStatusResponse {
   // The managed gateway pod exists in state.

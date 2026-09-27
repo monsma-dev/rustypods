@@ -99,6 +99,8 @@ pub struct Svc {
     /// Serializes mesh_up vs mesh_down — a racing pair could otherwise
     /// delete a fresh conf or have the old teardown kill the new TUN.
     mesh_lifecycle: Arc<Mutex<()>>,
+    /// Raft term, vote, and whether the last heartbeat round held a majority.
+    raft: Arc<Mutex<crate::raft::Node>>,
     /// In-memory mirror of `PodMeta.stopped_by_user`, set before the conf
     /// write so a racing supervisor tick cannot restart a pod mid-stop.
     /// The conf is the source of truth across daemon restarts.
@@ -1124,6 +1126,20 @@ impl Svc {
 
 #[tonic::async_trait]
 impl PodControl for Svc {
+    async fn request_vote(
+        &self,
+        req: Request<RequestVoteRequest>,
+    ) -> Result<Response<RequestVoteResponse>, Status> {
+        svc::raft::request_vote(self, req).await
+    }
+
+    async fn append_entries(
+        &self,
+        req: Request<AppendEntriesRequest>,
+    ) -> Result<Response<AppendEntriesResponse>, Status> {
+        svc::raft::append_entries(self, req).await
+    }
+
     async fn ping(&self, _req: Request<PingRequest>) -> Result<Response<DaemonInfo>, Status> {
         Ok(Response::new(DaemonInfo {
             version: env!("CARGO_PKG_VERSION").into(),
@@ -2933,10 +2949,11 @@ impl Svc {
         }
         Svc {
             cfg: Config {
-                data_dir,
+                data_dir: data_dir.clone(),
                 socket: std::path::PathBuf::from("/tmp/rustypods-test.sock"),
                 allowed_uid: 1000,
                 read_only_uids: Vec::new(),
+                role: crate::ha::Role::Host,
                 import_user: "test".into(),
                 http_addr: String::new(),
                 gc_interval_secs: 300,
@@ -2958,6 +2975,9 @@ impl Svc {
             mesh_rpc_stop: Arc::new(std::sync::Mutex::new(None)),
             mesh_lifecycle: Default::default(),
             inflight: Inflight::new(),
+            raft: Arc::new(Mutex::new(
+                crate::raft::Node::open(&data_dir).expect("raft state"),
+            )),
         }
     }
 }
@@ -3085,6 +3105,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
         mesh: Default::default(),
         mesh_rpc_stop: Arc::new(std::sync::Mutex::new(None)),
         mesh_lifecycle: Default::default(),
+        raft: Arc::new(Mutex::new(
+            crate::raft::Node::open(&cfg.data_dir).context("raft state")?,
+        )),
     };
 
     // Restore unless-stopped intent from conf so the in-memory set matches

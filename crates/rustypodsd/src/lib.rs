@@ -11,6 +11,7 @@ pub mod net;
 pub mod notify;
 pub mod oci;
 pub mod pki;
+pub mod raft;
 pub mod rootfs;
 pub mod runtime;
 pub mod server;
@@ -32,6 +33,8 @@ pub struct Config {
     /// Uids that may connect and call read RPCs. Mutating calls are
     /// rejected. Empty unless `RUSTYPODS_READ_ONLY_UIDS` is set.
     pub read_only_uids: Vec<u32>,
+    /// `host` schedules and publishes DNS. `witness` votes and does neither.
+    pub role: crate::ha::Role,
     /// Host user that owns the rootless podman store (for distrobox import).
     pub import_user: String,
     /// REST/JSON API bind address; "" disables the HTTP listener.

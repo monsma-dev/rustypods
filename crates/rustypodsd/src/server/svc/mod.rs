@@ -3,6 +3,7 @@ mod exec;
 mod ingress;
 mod lifecycle;
 mod mesh;
+pub(super) mod raft;
 mod stack;
 mod supervisor;
 pub(super) mod transfer;

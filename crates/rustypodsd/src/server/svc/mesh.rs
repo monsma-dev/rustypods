@@ -317,6 +317,11 @@ impl super::super::Svc {
                 Self::MESH_RPC_PORT
             );
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let raft_svc = svc.clone();
+            let raft_stop = rx.clone();
+            tokio::spawn(async move {
+                super::raft::run(raft_svc, raft_stop).await;
+            });
             let mut rx = rx;
             let res = server
                 .add_service(PodControlServer::with_interceptor(svc, require_mesh_peer))
@@ -374,6 +379,10 @@ impl super::super::Svc {
     /// set_local_names keeps the announce quiet when nothing changed.
     pub(crate) async fn sync_mesh_names(&self) {
         let Some(m) = self.mesh() else { return };
+        if self.cfg.role == crate::ha::Role::Witness {
+            m.set_local_names(std::collections::BTreeMap::new()).await;
+            return;
+        }
         let pods: Vec<PodMeta> = {
             let st = self.st.lock().await;
             st.pods

@@ -154,6 +154,9 @@ async fn run(notify: rustypodsd::notify::Notifier) -> Result<()> {
             .context("daemon environment")?
             .read_only_uids
             .clone(),
+        role: rustypodsd::envcfg::load()
+            .context("daemon environment")?
+            .role,
         import_user,
         http_addr: args.http_addr,
         gc_interval_secs: args.gc_interval_secs,

@@ -25,7 +25,11 @@ type ClusterClient = PodControlClient<tonic::transport::Channel>;
 impl super::super::Svc {
     /// Open an mTLS PodControl channel to a peer daemon. The server name
     /// is that peer's WireGuard DNS SAN, not the zone apex.
-    async fn cluster_client(&self, peer_addr: Ipv6Addr) -> Result<ClusterClient, Status> {
+    pub(super) async fn mesh_channel(
+        &self,
+        peer_addr: Ipv6Addr,
+        connect_timeout: Duration,
+    ) -> Result<tonic::transport::Channel, Status> {
         let Some(m) = self.mesh() else {
             return Err(Status::failed_precondition(
                 "mesh is not up — `rustypods mesh init` first",
@@ -47,16 +51,20 @@ impl super::super::Svc {
         let ep =
             tonic::transport::Endpoint::try_from(format!("https://[{peer_addr}]:{MESH_RPC_PORT}"))
                 .map_err(int)?
-                .connect_timeout(CLUSTER_DIAL_TIMEOUT)
+                .connect_timeout(connect_timeout)
                 .tls_config(tls)
                 .map_err(|e| Status::internal(format!("mesh TLS config: {e}")))?;
-        // No .timeout(): a volume stream is one long call and a per-call
-        // bound would sever a big transfer mid-flight.
-        let ch = ep.connect().await.map_err(|e| {
+        ep.connect().await.map_err(|e| {
             Status::unavailable(format!(
                 "dialing peer [{peer_addr}]:{MESH_RPC_PORT} over the mesh: {e}"
             ))
-        })?;
+        })
+    }
+
+    async fn cluster_client(&self, peer_addr: Ipv6Addr) -> Result<ClusterClient, Status> {
+        // No .timeout() on the channel: a volume stream is one long call
+        // and a per-call bound would sever a big transfer mid-flight.
+        let ch = self.mesh_channel(peer_addr, CLUSTER_DIAL_TIMEOUT).await?;
         Ok(PodControlClient::new(ch))
     }
 

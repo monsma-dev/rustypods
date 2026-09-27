@@ -668,7 +668,12 @@ just re-run.
   replication over the mesh; a snapshot is not that. `ha::plan` publishes
   DNS and restarts only when a majority of voters (the two hosts plus a
   witness) is alive. One side of a partition gets `dns: None` and must
-  keep the previous generation.
+  keep the previous generation. `RequestVote` and `AppendEntries` ride
+  the mesh mTLS listener. `current_term` and `voted_for` live in
+  `<data>/raft.state` (0600); a term grants one candidate. The election
+  timeout is 150–300ms. `RUSTYPODS_ROLE=witness` is a full voter that
+  refuses create/start/apply and publishes no mesh DNS. A leader sets
+  quorum only after a majority, counting itself, accepts the heartbeat.
 
 ## Mesh-DNS (Wave K)
 

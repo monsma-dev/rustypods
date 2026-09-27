@@ -388,6 +388,11 @@ impl super::super::Svc {
         &self,
         req: Request<StartPodRequest>,
     ) -> Result<Response<Pod>, Status> {
+        if self.cfg.role == crate::ha::Role::Witness {
+            return Err(Status::failed_precondition(
+                "a witness votes and does not start pods",
+            ));
+        }
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
         {
@@ -775,6 +780,11 @@ impl super::super::Svc {
         &self,
         req: Request<CreatePodRequest>,
     ) -> Result<Response<Pod>, Status> {
+        if self.cfg.role == crate::ha::Role::Witness {
+            return Err(Status::failed_precondition(
+                "a witness votes and does not create pods",
+            ));
+        }
         let req = req.into_inner();
         let name = proto::validate_name(&req.name).map_err(bad)?.to_string();
         if name == proto::INGRESS_POD {
