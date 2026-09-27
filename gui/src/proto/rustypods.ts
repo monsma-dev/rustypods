@@ -60,6 +60,43 @@ export function podStateToJSON(object: PodState): string {
   }
 }
 
+/**
+ * Which side of the availability policy this voter is on. A witness
+ * votes and runs no pods (see ha.rs); it must never be a restart target.
+ */
+export enum RaftRole {
+  RAFT_ROLE_HOST = 0,
+  RAFT_ROLE_WITNESS = 1,
+  UNRECOGNIZED = -1,
+}
+
+export function raftRoleFromJSON(object: any): RaftRole {
+  switch (object) {
+    case 0:
+    case "RAFT_ROLE_HOST":
+      return RaftRole.RAFT_ROLE_HOST;
+    case 1:
+    case "RAFT_ROLE_WITNESS":
+      return RaftRole.RAFT_ROLE_WITNESS;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return RaftRole.UNRECOGNIZED;
+  }
+}
+
+export function raftRoleToJSON(object: RaftRole): string {
+  switch (object) {
+    case RaftRole.RAFT_ROLE_HOST:
+      return "RAFT_ROLE_HOST";
+    case RaftRole.RAFT_ROLE_WITNESS:
+      return "RAFT_ROLE_WITNESS";
+    case RaftRole.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 export interface AgentInfo {
   version: string;
 }
@@ -405,6 +442,29 @@ export interface MeshInitRequest {
 }
 
 /**
+ * Joiner output. wg_pubkey is the WireGuard identity the leader must
+ * stamp; the CSR names are discarded at sign time.
+ */
+export interface MeshCreateCsrResponse {
+  csrPem: string;
+  wgPubkey: string;
+}
+
+export interface MeshSignCsrRequest {
+  wgPubkey: string;
+  csrPem: string;
+}
+
+/**
+ * Leaf material. The joiner stores these next to its own node.key.
+ * ca.key is not returned.
+ */
+export interface MeshSignCsrResponse {
+  nodeCrt: string;
+  caCrt: string;
+}
+
+/**
  * Peer identity: a reachable UDP endpoint + its WG pubkey. The peer's
  * ULA /48 is derived from the pubkey — never configured separately.
  */
@@ -415,6 +475,8 @@ export interface MeshPeer {
   pubkey: string;
   /** optional alias used by --host (e.g. "s2") */
   name: string;
+  /** Counts toward quorum and never receives a workload. */
+  isWitness: boolean;
 }
 
 export interface MeshPeerInfo {
@@ -433,6 +495,7 @@ export interface MeshPeerInfo {
    * http://[addr]:5306 for remote pod ops.
    */
   grpcAddr: string;
+  isWitness: boolean;
 }
 
 export interface MeshStatus {
@@ -471,11 +534,33 @@ export interface MeshStatus {
    * http://[addr]:5306 from any mesh peer.
    */
   grpcAddr: string;
+  /**
+   * Absent only when the daemon could not open raft.state at all — in
+   * practice always present once the mesh has ever been initialized.
+   */
+  raft?: RaftState | undefined;
 }
 
 export interface MeshStatus_NamesEntry {
   key: string;
   value: string;
+}
+
+/**
+ * Election state for mesh membership — not a data log. `current_term`
+ * and `voted_for` are read from the same on-disk raft.state a crash
+ * must not roll back (see raft.rs). `quorum_size` counts configured
+ * voters (self + mesh peers), not live acks; pair it with `has_quorum`
+ * for "is a majority actually reachable right now".
+ */
+export interface RaftState {
+  currentTerm: number;
+  isLeader: boolean;
+  /** "" if this node has not cast a vote in the current term. */
+  votedFor: string;
+  quorumSize: number;
+  hasQuorum: boolean;
+  role: RaftRole;
 }
 
 export interface ListPodsRequest {
@@ -832,6 +917,37 @@ export interface IngressCaResult {
 }
 
 export interface IngressGatewayStatusRequest {
+}
+
+export interface RequestVoteRequest {
+  term: number;
+  candidateId: string;
+  lastLogIndex: number;
+  lastLogTerm: number;
+}
+
+export interface RequestVoteResponse {
+  term: number;
+  voteGranted: boolean;
+}
+
+export interface RaftLogEntry {
+  term: number;
+  command: Uint8Array;
+}
+
+export interface AppendEntriesRequest {
+  term: number;
+  leaderId: string;
+  prevLogIndex: number;
+  prevLogTerm: number;
+  entries: RaftLogEntry[];
+  leaderCommit: number;
+}
+
+export interface AppendEntriesResponse {
+  term: number;
+  success: boolean;
 }
 
 export interface IngressGatewayStatusResponse {
@@ -4321,8 +4437,287 @@ export const MeshInitRequest: MessageFns<MeshInitRequest> = {
   },
 };
 
+function createBaseMeshCreateCsrResponse(): MeshCreateCsrResponse {
+  return { csrPem: "", wgPubkey: "" };
+}
+
+export const MeshCreateCsrResponse: MessageFns<MeshCreateCsrResponse> = {
+  encode(message: MeshCreateCsrResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.csrPem !== "") {
+      writer.uint32(10).string(message.csrPem);
+    }
+    if (message.wgPubkey !== "") {
+      writer.uint32(18).string(message.wgPubkey);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshCreateCsrResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshCreateCsrResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.csrPem = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.wgPubkey = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshCreateCsrResponse {
+    return {
+      csrPem: isSet(object.csrPem)
+        ? globalThis.String(object.csrPem)
+        : isSet(object.csr_pem)
+        ? globalThis.String(object.csr_pem)
+        : "",
+      wgPubkey: isSet(object.wgPubkey)
+        ? globalThis.String(object.wgPubkey)
+        : isSet(object.wg_pubkey)
+        ? globalThis.String(object.wg_pubkey)
+        : "",
+    };
+  },
+
+  toJSON(message: MeshCreateCsrResponse): unknown {
+    const obj: any = {};
+    if (message.csrPem !== "") {
+      obj.csrPem = message.csrPem;
+    }
+    if (message.wgPubkey !== "") {
+      obj.wgPubkey = message.wgPubkey;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshCreateCsrResponse>, I>>(base?: I): MeshCreateCsrResponse {
+    return MeshCreateCsrResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshCreateCsrResponse>, I>>(object: I): MeshCreateCsrResponse {
+    const message = createBaseMeshCreateCsrResponse();
+    message.csrPem = object.csrPem ?? "";
+    message.wgPubkey = object.wgPubkey ?? "";
+    return message;
+  },
+};
+
+function createBaseMeshSignCsrRequest(): MeshSignCsrRequest {
+  return { wgPubkey: "", csrPem: "" };
+}
+
+export const MeshSignCsrRequest: MessageFns<MeshSignCsrRequest> = {
+  encode(message: MeshSignCsrRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.wgPubkey !== "") {
+      writer.uint32(10).string(message.wgPubkey);
+    }
+    if (message.csrPem !== "") {
+      writer.uint32(18).string(message.csrPem);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshSignCsrRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshSignCsrRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.wgPubkey = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.csrPem = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshSignCsrRequest {
+    return {
+      wgPubkey: isSet(object.wgPubkey)
+        ? globalThis.String(object.wgPubkey)
+        : isSet(object.wg_pubkey)
+        ? globalThis.String(object.wg_pubkey)
+        : "",
+      csrPem: isSet(object.csrPem)
+        ? globalThis.String(object.csrPem)
+        : isSet(object.csr_pem)
+        ? globalThis.String(object.csr_pem)
+        : "",
+    };
+  },
+
+  toJSON(message: MeshSignCsrRequest): unknown {
+    const obj: any = {};
+    if (message.wgPubkey !== "") {
+      obj.wgPubkey = message.wgPubkey;
+    }
+    if (message.csrPem !== "") {
+      obj.csrPem = message.csrPem;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshSignCsrRequest>, I>>(base?: I): MeshSignCsrRequest {
+    return MeshSignCsrRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshSignCsrRequest>, I>>(object: I): MeshSignCsrRequest {
+    const message = createBaseMeshSignCsrRequest();
+    message.wgPubkey = object.wgPubkey ?? "";
+    message.csrPem = object.csrPem ?? "";
+    return message;
+  },
+};
+
+function createBaseMeshSignCsrResponse(): MeshSignCsrResponse {
+  return { nodeCrt: "", caCrt: "" };
+}
+
+export const MeshSignCsrResponse: MessageFns<MeshSignCsrResponse> = {
+  encode(message: MeshSignCsrResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.nodeCrt !== "") {
+      writer.uint32(10).string(message.nodeCrt);
+    }
+    if (message.caCrt !== "") {
+      writer.uint32(18).string(message.caCrt);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MeshSignCsrResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMeshSignCsrResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.nodeCrt = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.caCrt = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): MeshSignCsrResponse {
+    return {
+      nodeCrt: isSet(object.nodeCrt)
+        ? globalThis.String(object.nodeCrt)
+        : isSet(object.node_crt)
+        ? globalThis.String(object.node_crt)
+        : "",
+      caCrt: isSet(object.caCrt)
+        ? globalThis.String(object.caCrt)
+        : isSet(object.ca_crt)
+        ? globalThis.String(object.ca_crt)
+        : "",
+    };
+  },
+
+  toJSON(message: MeshSignCsrResponse): unknown {
+    const obj: any = {};
+    if (message.nodeCrt !== "") {
+      obj.nodeCrt = message.nodeCrt;
+    }
+    if (message.caCrt !== "") {
+      obj.caCrt = message.caCrt;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<MeshSignCsrResponse>, I>>(base?: I): MeshSignCsrResponse {
+    return MeshSignCsrResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<MeshSignCsrResponse>, I>>(object: I): MeshSignCsrResponse {
+    const message = createBaseMeshSignCsrResponse();
+    message.nodeCrt = object.nodeCrt ?? "";
+    message.caCrt = object.caCrt ?? "";
+    return message;
+  },
+};
+
 function createBaseMeshPeer(): MeshPeer {
-  return { endpoint: "", pubkey: "", name: "" };
+  return { endpoint: "", pubkey: "", name: "", isWitness: false };
 }
 
 export const MeshPeer: MessageFns<MeshPeer> = {
@@ -4335,6 +4730,9 @@ export const MeshPeer: MessageFns<MeshPeer> = {
     }
     if (message.name !== "") {
       writer.uint32(26).string(message.name);
+    }
+    if (message.isWitness !== false) {
+      writer.uint32(32).bool(message.isWitness);
     }
     return writer;
   },
@@ -4376,6 +4774,14 @@ export const MeshPeer: MessageFns<MeshPeer> = {
             message.name = reader.string();
             continue;
           }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.isWitness = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -4393,6 +4799,11 @@ export const MeshPeer: MessageFns<MeshPeer> = {
       endpoint: isSet(object.endpoint) ? globalThis.String(object.endpoint) : "",
       pubkey: isSet(object.pubkey) ? globalThis.String(object.pubkey) : "",
       name: isSet(object.name) ? globalThis.String(object.name) : "",
+      isWitness: isSet(object.isWitness)
+        ? globalThis.Boolean(object.isWitness)
+        : isSet(object.is_witness)
+        ? globalThis.Boolean(object.is_witness)
+        : false,
     };
   },
 
@@ -4407,6 +4818,9 @@ export const MeshPeer: MessageFns<MeshPeer> = {
     if (message.name !== "") {
       obj.name = message.name;
     }
+    if (message.isWitness !== false) {
+      obj.isWitness = message.isWitness;
+    }
     return obj;
   },
 
@@ -4418,12 +4832,23 @@ export const MeshPeer: MessageFns<MeshPeer> = {
     message.endpoint = object.endpoint ?? "";
     message.pubkey = object.pubkey ?? "";
     message.name = object.name ?? "";
+    message.isWitness = object.isWitness ?? false;
     return message;
   },
 };
 
 function createBaseMeshPeerInfo(): MeshPeerInfo {
-  return { endpoint: "", pubkey: "", prefix: "", handshakeSecsAgo: 0, txBytes: 0, rxBytes: 0, name: "", grpcAddr: "" };
+  return {
+    endpoint: "",
+    pubkey: "",
+    prefix: "",
+    handshakeSecsAgo: 0,
+    txBytes: 0,
+    rxBytes: 0,
+    name: "",
+    grpcAddr: "",
+    isWitness: false,
+  };
 }
 
 export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
@@ -4451,6 +4876,9 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
     }
     if (message.grpcAddr !== "") {
       writer.uint32(66).string(message.grpcAddr);
+    }
+    if (message.isWitness !== false) {
+      writer.uint32(72).bool(message.isWitness);
     }
     return writer;
   },
@@ -4532,6 +4960,14 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
             message.grpcAddr = reader.string();
             continue;
           }
+          case 9: {
+            if (tag !== 72) {
+              break;
+            }
+
+            message.isWitness = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -4570,6 +5006,11 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
         : isSet(object.grpc_addr)
         ? globalThis.String(object.grpc_addr)
         : "",
+      isWitness: isSet(object.isWitness)
+        ? globalThis.Boolean(object.isWitness)
+        : isSet(object.is_witness)
+        ? globalThis.Boolean(object.is_witness)
+        : false,
     };
   },
 
@@ -4599,6 +5040,9 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
     if (message.grpcAddr !== "") {
       obj.grpcAddr = message.grpcAddr;
     }
+    if (message.isWitness !== false) {
+      obj.isWitness = message.isWitness;
+    }
     return obj;
   },
 
@@ -4615,6 +5059,7 @@ export const MeshPeerInfo: MessageFns<MeshPeerInfo> = {
     message.rxBytes = object.rxBytes ?? 0;
     message.name = object.name ?? "";
     message.grpcAddr = object.grpcAddr ?? "";
+    message.isWitness = object.isWitness ?? false;
     return message;
   },
 };
@@ -4634,6 +5079,7 @@ function createBaseMeshStatus(): MeshStatus {
     confError: "",
     clusterToken: "",
     grpcAddr: "",
+    raft: undefined,
   };
 }
 
@@ -4677,6 +5123,9 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     }
     if (message.grpcAddr !== "") {
       writer.uint32(106).string(message.grpcAddr);
+    }
+    if (message.raft !== undefined) {
+      RaftState.encode(message.raft, writer.uint32(114).fork()).join();
     }
     return writer;
   },
@@ -4801,6 +5250,14 @@ export const MeshStatus: MessageFns<MeshStatus> = {
             message.grpcAddr = reader.string();
             continue;
           }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.raft = RaftState.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -4869,6 +5326,7 @@ export const MeshStatus: MessageFns<MeshStatus> = {
         : isSet(object.grpc_addr)
         ? globalThis.String(object.grpc_addr)
         : "",
+      raft: isSet(object.raft) ? RaftState.fromJSON(object.raft) : undefined,
     };
   },
 
@@ -4919,6 +5377,9 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     if (message.grpcAddr !== "") {
       obj.grpcAddr = message.grpcAddr;
     }
+    if (message.raft !== undefined) {
+      obj.raft = RaftState.toJSON(message.raft);
+    }
     return obj;
   },
 
@@ -4948,6 +5409,7 @@ export const MeshStatus: MessageFns<MeshStatus> = {
     message.confError = object.confError ?? "";
     message.clusterToken = object.clusterToken ?? "";
     message.grpcAddr = object.grpcAddr ?? "";
+    message.raft = (object.raft !== undefined && object.raft !== null) ? RaftState.fromPartial(object.raft) : undefined;
     return message;
   },
 };
@@ -5033,6 +5495,175 @@ export const MeshStatus_NamesEntry: MessageFns<MeshStatus_NamesEntry> = {
     const message = createBaseMeshStatus_NamesEntry();
     message.key = object.key ?? "";
     message.value = object.value ?? "";
+    return message;
+  },
+};
+
+function createBaseRaftState(): RaftState {
+  return { currentTerm: 0, isLeader: false, votedFor: "", quorumSize: 0, hasQuorum: false, role: 0 };
+}
+
+export const RaftState: MessageFns<RaftState> = {
+  encode(message: RaftState, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.currentTerm !== 0) {
+      writer.uint32(8).uint64(message.currentTerm);
+    }
+    if (message.isLeader !== false) {
+      writer.uint32(16).bool(message.isLeader);
+    }
+    if (message.votedFor !== "") {
+      writer.uint32(26).string(message.votedFor);
+    }
+    if (message.quorumSize !== 0) {
+      writer.uint32(32).uint32(message.quorumSize);
+    }
+    if (message.hasQuorum !== false) {
+      writer.uint32(40).bool(message.hasQuorum);
+    }
+    if (message.role !== 0) {
+      writer.uint32(48).int32(message.role);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RaftState {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRaftState();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.currentTerm = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.isLeader = reader.bool();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.votedFor = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.quorumSize = reader.uint32();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.hasQuorum = reader.bool();
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.role = reader.int32() as any;
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RaftState {
+    return {
+      currentTerm: isSet(object.currentTerm)
+        ? globalThis.Number(object.currentTerm)
+        : isSet(object.current_term)
+        ? globalThis.Number(object.current_term)
+        : 0,
+      isLeader: isSet(object.isLeader)
+        ? globalThis.Boolean(object.isLeader)
+        : isSet(object.is_leader)
+        ? globalThis.Boolean(object.is_leader)
+        : false,
+      votedFor: isSet(object.votedFor)
+        ? globalThis.String(object.votedFor)
+        : isSet(object.voted_for)
+        ? globalThis.String(object.voted_for)
+        : "",
+      quorumSize: isSet(object.quorumSize)
+        ? globalThis.Number(object.quorumSize)
+        : isSet(object.quorum_size)
+        ? globalThis.Number(object.quorum_size)
+        : 0,
+      hasQuorum: isSet(object.hasQuorum)
+        ? globalThis.Boolean(object.hasQuorum)
+        : isSet(object.has_quorum)
+        ? globalThis.Boolean(object.has_quorum)
+        : false,
+      role: isSet(object.role) ? raftRoleFromJSON(object.role) : 0,
+    };
+  },
+
+  toJSON(message: RaftState): unknown {
+    const obj: any = {};
+    if (message.currentTerm !== 0) {
+      obj.currentTerm = Math.round(message.currentTerm);
+    }
+    if (message.isLeader !== false) {
+      obj.isLeader = message.isLeader;
+    }
+    if (message.votedFor !== "") {
+      obj.votedFor = message.votedFor;
+    }
+    if (message.quorumSize !== 0) {
+      obj.quorumSize = Math.round(message.quorumSize);
+    }
+    if (message.hasQuorum !== false) {
+      obj.hasQuorum = message.hasQuorum;
+    }
+    if (message.role !== 0) {
+      obj.role = raftRoleToJSON(message.role);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RaftState>, I>>(base?: I): RaftState {
+    return RaftState.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RaftState>, I>>(object: I): RaftState {
+    const message = createBaseRaftState();
+    message.currentTerm = object.currentTerm ?? 0;
+    message.isLeader = object.isLeader ?? false;
+    message.votedFor = object.votedFor ?? "";
+    message.quorumSize = object.quorumSize ?? 0;
+    message.hasQuorum = object.hasQuorum ?? false;
+    message.role = object.role ?? 0;
     return message;
   },
 };
@@ -8787,6 +9418,561 @@ export const IngressGatewayStatusRequest: MessageFns<IngressGatewayStatusRequest
   },
 };
 
+function createBaseRequestVoteRequest(): RequestVoteRequest {
+  return { term: 0, candidateId: "", lastLogIndex: 0, lastLogTerm: 0 };
+}
+
+export const RequestVoteRequest: MessageFns<RequestVoteRequest> = {
+  encode(message: RequestVoteRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.term !== 0) {
+      writer.uint32(8).uint64(message.term);
+    }
+    if (message.candidateId !== "") {
+      writer.uint32(18).string(message.candidateId);
+    }
+    if (message.lastLogIndex !== 0) {
+      writer.uint32(24).uint64(message.lastLogIndex);
+    }
+    if (message.lastLogTerm !== 0) {
+      writer.uint32(32).uint64(message.lastLogTerm);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RequestVoteRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRequestVoteRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.term = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.candidateId = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.lastLogIndex = longToNumber(reader.uint64());
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.lastLogTerm = longToNumber(reader.uint64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RequestVoteRequest {
+    return {
+      term: isSet(object.term) ? globalThis.Number(object.term) : 0,
+      candidateId: isSet(object.candidateId)
+        ? globalThis.String(object.candidateId)
+        : isSet(object.candidate_id)
+        ? globalThis.String(object.candidate_id)
+        : "",
+      lastLogIndex: isSet(object.lastLogIndex)
+        ? globalThis.Number(object.lastLogIndex)
+        : isSet(object.last_log_index)
+        ? globalThis.Number(object.last_log_index)
+        : 0,
+      lastLogTerm: isSet(object.lastLogTerm)
+        ? globalThis.Number(object.lastLogTerm)
+        : isSet(object.last_log_term)
+        ? globalThis.Number(object.last_log_term)
+        : 0,
+    };
+  },
+
+  toJSON(message: RequestVoteRequest): unknown {
+    const obj: any = {};
+    if (message.term !== 0) {
+      obj.term = Math.round(message.term);
+    }
+    if (message.candidateId !== "") {
+      obj.candidateId = message.candidateId;
+    }
+    if (message.lastLogIndex !== 0) {
+      obj.lastLogIndex = Math.round(message.lastLogIndex);
+    }
+    if (message.lastLogTerm !== 0) {
+      obj.lastLogTerm = Math.round(message.lastLogTerm);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RequestVoteRequest>, I>>(base?: I): RequestVoteRequest {
+    return RequestVoteRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RequestVoteRequest>, I>>(object: I): RequestVoteRequest {
+    const message = createBaseRequestVoteRequest();
+    message.term = object.term ?? 0;
+    message.candidateId = object.candidateId ?? "";
+    message.lastLogIndex = object.lastLogIndex ?? 0;
+    message.lastLogTerm = object.lastLogTerm ?? 0;
+    return message;
+  },
+};
+
+function createBaseRequestVoteResponse(): RequestVoteResponse {
+  return { term: 0, voteGranted: false };
+}
+
+export const RequestVoteResponse: MessageFns<RequestVoteResponse> = {
+  encode(message: RequestVoteResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.term !== 0) {
+      writer.uint32(8).uint64(message.term);
+    }
+    if (message.voteGranted !== false) {
+      writer.uint32(16).bool(message.voteGranted);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RequestVoteResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRequestVoteResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.term = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.voteGranted = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RequestVoteResponse {
+    return {
+      term: isSet(object.term) ? globalThis.Number(object.term) : 0,
+      voteGranted: isSet(object.voteGranted)
+        ? globalThis.Boolean(object.voteGranted)
+        : isSet(object.vote_granted)
+        ? globalThis.Boolean(object.vote_granted)
+        : false,
+    };
+  },
+
+  toJSON(message: RequestVoteResponse): unknown {
+    const obj: any = {};
+    if (message.term !== 0) {
+      obj.term = Math.round(message.term);
+    }
+    if (message.voteGranted !== false) {
+      obj.voteGranted = message.voteGranted;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RequestVoteResponse>, I>>(base?: I): RequestVoteResponse {
+    return RequestVoteResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RequestVoteResponse>, I>>(object: I): RequestVoteResponse {
+    const message = createBaseRequestVoteResponse();
+    message.term = object.term ?? 0;
+    message.voteGranted = object.voteGranted ?? false;
+    return message;
+  },
+};
+
+function createBaseRaftLogEntry(): RaftLogEntry {
+  return { term: 0, command: new Uint8Array(0) };
+}
+
+export const RaftLogEntry: MessageFns<RaftLogEntry> = {
+  encode(message: RaftLogEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.term !== 0) {
+      writer.uint32(8).uint64(message.term);
+    }
+    if (message.command.length !== 0) {
+      writer.uint32(18).bytes(message.command);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RaftLogEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRaftLogEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.term = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.command = reader.bytes();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RaftLogEntry {
+    return {
+      term: isSet(object.term) ? globalThis.Number(object.term) : 0,
+      command: isSet(object.command) ? bytesFromBase64(object.command) : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: RaftLogEntry): unknown {
+    const obj: any = {};
+    if (message.term !== 0) {
+      obj.term = Math.round(message.term);
+    }
+    if (message.command.length !== 0) {
+      obj.command = base64FromBytes(message.command);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RaftLogEntry>, I>>(base?: I): RaftLogEntry {
+    return RaftLogEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RaftLogEntry>, I>>(object: I): RaftLogEntry {
+    const message = createBaseRaftLogEntry();
+    message.term = object.term ?? 0;
+    message.command = object.command ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseAppendEntriesRequest(): AppendEntriesRequest {
+  return { term: 0, leaderId: "", prevLogIndex: 0, prevLogTerm: 0, entries: [], leaderCommit: 0 };
+}
+
+export const AppendEntriesRequest: MessageFns<AppendEntriesRequest> = {
+  encode(message: AppendEntriesRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.term !== 0) {
+      writer.uint32(8).uint64(message.term);
+    }
+    if (message.leaderId !== "") {
+      writer.uint32(18).string(message.leaderId);
+    }
+    if (message.prevLogIndex !== 0) {
+      writer.uint32(24).uint64(message.prevLogIndex);
+    }
+    if (message.prevLogTerm !== 0) {
+      writer.uint32(32).uint64(message.prevLogTerm);
+    }
+    for (const v of message.entries) {
+      RaftLogEntry.encode(v!, writer.uint32(42).fork()).join();
+    }
+    if (message.leaderCommit !== 0) {
+      writer.uint32(48).uint64(message.leaderCommit);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AppendEntriesRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseAppendEntriesRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.term = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.leaderId = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.prevLogIndex = longToNumber(reader.uint64());
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.prevLogTerm = longToNumber(reader.uint64());
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.entries.push(RaftLogEntry.decode(reader, reader.uint32()));
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.leaderCommit = longToNumber(reader.uint64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): AppendEntriesRequest {
+    return {
+      term: isSet(object.term) ? globalThis.Number(object.term) : 0,
+      leaderId: isSet(object.leaderId)
+        ? globalThis.String(object.leaderId)
+        : isSet(object.leader_id)
+        ? globalThis.String(object.leader_id)
+        : "",
+      prevLogIndex: isSet(object.prevLogIndex)
+        ? globalThis.Number(object.prevLogIndex)
+        : isSet(object.prev_log_index)
+        ? globalThis.Number(object.prev_log_index)
+        : 0,
+      prevLogTerm: isSet(object.prevLogTerm)
+        ? globalThis.Number(object.prevLogTerm)
+        : isSet(object.prev_log_term)
+        ? globalThis.Number(object.prev_log_term)
+        : 0,
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => RaftLogEntry.fromJSON(e))
+        : [],
+      leaderCommit: isSet(object.leaderCommit)
+        ? globalThis.Number(object.leaderCommit)
+        : isSet(object.leader_commit)
+        ? globalThis.Number(object.leader_commit)
+        : 0,
+    };
+  },
+
+  toJSON(message: AppendEntriesRequest): unknown {
+    const obj: any = {};
+    if (message.term !== 0) {
+      obj.term = Math.round(message.term);
+    }
+    if (message.leaderId !== "") {
+      obj.leaderId = message.leaderId;
+    }
+    if (message.prevLogIndex !== 0) {
+      obj.prevLogIndex = Math.round(message.prevLogIndex);
+    }
+    if (message.prevLogTerm !== 0) {
+      obj.prevLogTerm = Math.round(message.prevLogTerm);
+    }
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => RaftLogEntry.toJSON(e));
+    }
+    if (message.leaderCommit !== 0) {
+      obj.leaderCommit = Math.round(message.leaderCommit);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<AppendEntriesRequest>, I>>(base?: I): AppendEntriesRequest {
+    return AppendEntriesRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<AppendEntriesRequest>, I>>(object: I): AppendEntriesRequest {
+    const message = createBaseAppendEntriesRequest();
+    message.term = object.term ?? 0;
+    message.leaderId = object.leaderId ?? "";
+    message.prevLogIndex = object.prevLogIndex ?? 0;
+    message.prevLogTerm = object.prevLogTerm ?? 0;
+    message.entries = object.entries?.map((e) => RaftLogEntry.fromPartial(e)) || [];
+    message.leaderCommit = object.leaderCommit ?? 0;
+    return message;
+  },
+};
+
+function createBaseAppendEntriesResponse(): AppendEntriesResponse {
+  return { term: 0, success: false };
+}
+
+export const AppendEntriesResponse: MessageFns<AppendEntriesResponse> = {
+  encode(message: AppendEntriesResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.term !== 0) {
+      writer.uint32(8).uint64(message.term);
+    }
+    if (message.success !== false) {
+      writer.uint32(16).bool(message.success);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AppendEntriesResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseAppendEntriesResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.term = longToNumber(reader.uint64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.success = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): AppendEntriesResponse {
+    return {
+      term: isSet(object.term) ? globalThis.Number(object.term) : 0,
+      success: isSet(object.success) ? globalThis.Boolean(object.success) : false,
+    };
+  },
+
+  toJSON(message: AppendEntriesResponse): unknown {
+    const obj: any = {};
+    if (message.term !== 0) {
+      obj.term = Math.round(message.term);
+    }
+    if (message.success !== false) {
+      obj.success = message.success;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<AppendEntriesResponse>, I>>(base?: I): AppendEntriesResponse {
+    return AppendEntriesResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<AppendEntriesResponse>, I>>(object: I): AppendEntriesResponse {
+    const message = createBaseAppendEntriesResponse();
+    message.term = object.term ?? 0;
+    message.success = object.success ?? false;
+    return message;
+  },
+};
+
 function createBaseIngressGatewayStatusResponse(): IngressGatewayStatusResponse {
   return { configured: false, running: false, controlReady: false, generation: 0, routeCount: 0, caCertPath: "" };
 }
@@ -9303,6 +10489,27 @@ export const PodControlDefinition = {
       options: {},
     },
     /**
+     * Out-of-band join. The daemon refuses these on the mesh listener:
+     * the CSR and the CA key never cross the NIC. The operator copies
+     * the PEM over the SSH session that already reaches the local socket.
+     */
+    meshCreateCsr: {
+      name: "MeshCreateCsr",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: MeshCreateCsrResponse as typeof MeshCreateCsrResponse,
+      responseStream: false,
+      options: {},
+    },
+    meshSignCsr: {
+      name: "MeshSignCsr",
+      requestType: MeshSignCsrRequest as typeof MeshSignCsrRequest,
+      requestStream: false,
+      responseType: MeshSignCsrResponse as typeof MeshSignCsrResponse,
+      responseStream: false,
+      options: {},
+    },
+    /**
      * Provision/start the managed ingress gateway pod (local PKI + the
      * rustypods-ingress proxy), and report its health/route table.
      */
@@ -9340,6 +10547,27 @@ export const PodControlDefinition = {
       requestType: Empty as typeof Empty,
       requestStream: false,
       responseType: IngressCaResult as typeof IngressCaResult,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Raft election. The mesh interceptor has already checked the peer
+     * certificate's IP SAN against the TCP source.
+     */
+    requestVote: {
+      name: "RequestVote",
+      requestType: RequestVoteRequest as typeof RequestVoteRequest,
+      requestStream: false,
+      responseType: RequestVoteResponse as typeof RequestVoteResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Raft heartbeat and log append. An empty entries list is a heartbeat. */
+    appendEntries: {
+      name: "AppendEntries",
+      requestType: AppendEntriesRequest as typeof AppendEntriesRequest,
+      requestStream: false,
+      responseType: AppendEntriesResponse as typeof AppendEntriesResponse,
       responseStream: false,
       options: {},
     },

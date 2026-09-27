@@ -5,16 +5,35 @@ import {
   DaemonInfo,
   Image,
   Limits,
+  MeshCreateCsrResponse,
+  MeshPeerInfo,
+  MeshSignCsrResponse,
+  MeshStatus,
   Metric,
   Pod,
   PodState,
+  RaftRole,
+  RaftState,
 } from "./proto/rustypods";
 
 // The wire contract is crates/rustypods-proto/proto/rustypods.proto — Tauri
 // commands return proto messages as camelCase JSON, decoded here via the
-// generated fromJSON. No hand-maintained mirrors.
-export type { ApplyStackResponse, DaemonInfo, Image, Limits, Metric, Pod };
-export { PodState };
+// generated fromJSON. No hand-maintained mirrors — a MeshView built
+// against these types can't drift from what the daemon actually sends.
+export type {
+  ApplyStackResponse,
+  DaemonInfo,
+  Image,
+  Limits,
+  MeshCreateCsrResponse,
+  MeshPeerInfo,
+  MeshSignCsrResponse,
+  MeshStatus,
+  Metric,
+  Pod,
+  RaftState,
+};
+export { PodState, RaftRole };
 
 // Outside the Tauri webview (plain `npm run dev` in a browser) there is no IPC
 // bridge — serve mock data so the UI stays demoable/testable.
@@ -87,6 +106,46 @@ const MOCK_INFO: DaemonInfo = DaemonInfo.fromPartial({
   runtimeEngine: "systemd-nspawn",
 });
 
+// Two-voter mesh: self (leader, term 3) plus one witness peer that has
+// acked the current heartbeat — enough shape for a MeshView to render
+// every state (leader/follower badge, quorum yes/no, witness peer) in
+// the browser dev server, no daemon attached.
+const MOCK_MESH_STATUS: MeshStatus = MeshStatus.fromPartial({
+  enabled: true,
+  pubkey: "ccj3lueeVyPYRT/gC4XHhS0yd3tLA23GL1tKAcserFE=",
+  listen: "[::]:51820",
+  prefix: "fd7e:f0a:d1ae::/48",
+  grpcAddr: "fd7e:f0a:d1ae::1",
+  pumpTicks: 128_400,
+  udpPkts: 9_812,
+  tunPkts: 6_640,
+  tunDrops: 0,
+  clusterToken: "",
+  confError: "",
+  names: {},
+  peers: [
+    MeshPeerInfo.fromPartial({
+      endpoint: "203.0.113.9:51820",
+      pubkey: "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM=",
+      prefix: "fd9a:1c2e:88f0::/48",
+      handshakeSecsAgo: 14,
+      txBytes: 48_200,
+      rxBytes: 51_900,
+      name: "witness",
+      grpcAddr: "fd9a:1c2e:88f0::1",
+      isWitness: true,
+    }),
+  ],
+  raft: RaftState.fromPartial({
+    currentTerm: 3,
+    isLeader: true,
+    votedFor: "fd7e:f0a:d1ae::1",
+    quorumSize: 2,
+    hasQuorum: true,
+    role: RaftRole.RAFT_ROLE_HOST,
+  }),
+});
+
 const delay = (ms = 80) => new Promise((r) => setTimeout(r, ms));
 
 export const getPods = async (): Promise<Pod[]> =>
@@ -103,6 +162,70 @@ export const getDaemonInfo = async (): Promise<DaemonInfo> =>
   inTauri
     ? invoke<unknown>("get_daemon_info").then(DaemonInfo.fromJSON)
     : (await delay(), MOCK_INFO);
+
+// ---- mesh + raft ----
+
+/** Same payload the CLI's `mesh status` prints, `raft` included — poll
+ *  this for the Mesh view the way PodsView polls getPods. */
+export const getMeshStatus = async (): Promise<MeshStatus> =>
+  inTauri
+    ? invoke<unknown>("get_mesh_status").then(MeshStatus.fromJSON)
+    : (await delay(), MOCK_MESH_STATUS);
+
+/** Joiner half of the out-of-band PKI bootstrap: mints (or reuses)
+ *  node.key locally and returns a CSR + this host's WireGuard pubkey.
+ *  Never touches the mesh listener. */
+export const meshCreateCsr = async (): Promise<MeshCreateCsrResponse> =>
+  inTauri
+    ? invoke<unknown>("mesh_create_csr").then(MeshCreateCsrResponse.fromJSON)
+    : (await delay(),
+      MeshCreateCsrResponse.fromPartial({
+        wgPubkey: MOCK_MESH_STATUS.pubkey,
+        csrPem: "-----BEGIN CERTIFICATE REQUEST-----\n(mock — no daemon attached)\n-----END CERTIFICATE REQUEST-----",
+      }));
+
+/** Root half: sign a joiner's CSR. Returns ca.crt then node.crt — never
+ *  ca.key. `wgPubkey` is the joiner's `meshCreateCsr()` output; names
+ *  inside the CSR itself are discarded by the daemon. */
+export const meshSignCsr = async (
+  wgPubkey: string,
+  csrPem: string
+): Promise<MeshSignCsrResponse> => {
+  if (inTauri)
+    return invoke<unknown>("mesh_sign_csr", { wgPubkey, csrPem }).then(
+      MeshSignCsrResponse.fromJSON
+    );
+  await delay();
+  return MeshSignCsrResponse.fromPartial({
+    caCrt: "-----BEGIN CERTIFICATE-----\n(mock ca.crt — no daemon attached)\n-----END CERTIFICATE-----",
+    nodeCrt: "-----BEGIN CERTIFICATE-----\n(mock node.crt — no daemon attached)\n-----END CERTIFICATE-----",
+  });
+};
+
+/** Register a peer host. `witness: true` marks a voter that counts
+ *  toward quorum and must never receive a workload (see ha.rs). */
+export const meshAddPeer = async (
+  endpoint: string,
+  pubkey: string,
+  name: string | undefined,
+  witness: boolean
+): Promise<MeshStatus> => {
+  if (inTauri)
+    return invoke<unknown>("mesh_add_peer", { endpoint, pubkey, name, witness }).then(
+      MeshStatus.fromJSON
+    );
+  await delay();
+  MOCK_MESH_STATUS.peers.push(
+    MeshPeerInfo.fromPartial({
+      endpoint,
+      pubkey,
+      name: name ?? "",
+      isWitness: witness,
+      handshakeSecsAgo: -1,
+    })
+  );
+  return MOCK_MESH_STATUS;
+};
 
 export interface CreatePodSpec {
   name: string;

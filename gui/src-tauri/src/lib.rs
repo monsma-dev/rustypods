@@ -528,6 +528,75 @@ async fn get_daemon_info(rt: State<'_, Rt>) -> Result<DaemonInfo, String> {
     .await
 }
 
+/// Mesh + Raft snapshot for the (forthcoming) Mesh view — same
+/// `MeshStatus` the CLI's `mesh status` prints, `raft` included.
+#[tauri::command]
+async fn get_mesh_status(rt: State<'_, Rt>) -> Result<MeshStatus, String> {
+    call(&rt.0, |mut c| async move {
+        c.get_mesh_status(Empty {})
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| e.message().to_string())
+    })
+    .await
+}
+
+/// Joiner half of the out-of-band PKI bootstrap: mints (or reuses)
+/// `node.key` and returns a CSR to hand to a host that already holds
+/// `ca.key`. Never touches the mesh listener — local socket only, same
+/// as `rustypods mesh create-csr`.
+#[tauri::command]
+async fn mesh_create_csr(rt: State<'_, Rt>) -> Result<MeshCreateCsrResponse, String> {
+    call(&rt.0, |mut c| async move {
+        c.mesh_create_csr(Empty {})
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| e.message().to_string())
+    })
+    .await
+}
+
+/// Root half: sign a joiner's CSR. Returns `ca.crt` then `node.crt` — no
+/// `ca.key`, ever.
+#[tauri::command]
+async fn mesh_sign_csr(
+    rt: State<'_, Rt>,
+    wg_pubkey: String,
+    csr_pem: String,
+) -> Result<MeshSignCsrResponse, String> {
+    call(&rt.0, move |mut c| async move {
+        c.mesh_sign_csr(MeshSignCsrRequest { wg_pubkey, csr_pem })
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| e.message().to_string())
+    })
+    .await
+}
+
+/// Register a peer host — `witness: true` marks a voter that must never
+/// receive a workload (see ha.rs). Mirrors `rustypods mesh add-peer`.
+#[tauri::command]
+async fn mesh_add_peer(
+    rt: State<'_, Rt>,
+    endpoint: String,
+    pubkey: String,
+    name: Option<String>,
+    witness: bool,
+) -> Result<MeshStatus, String> {
+    call(&rt.0, move |mut c| async move {
+        c.mesh_add_peer(MeshPeer {
+            endpoint,
+            pubkey,
+            name: name.unwrap_or_default(),
+            is_witness: witness,
+        })
+        .await
+        .map(|r| r.into_inner())
+        .map_err(|e| e.message().to_string())
+    })
+    .await
+}
+
 /// Shared builder wiring — used by the desktop entry point and the IPC tests.
 pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -555,6 +624,10 @@ pub fn app_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Buil
             close_pty,
             get_images,
             get_daemon_info,
+            get_mesh_status,
+            mesh_create_csr,
+            mesh_sign_csr,
+            mesh_add_peer,
         ])
 }
 
