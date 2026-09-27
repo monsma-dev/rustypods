@@ -79,6 +79,25 @@ pub struct StackPod {
     /// key. Daemons reject a toml that still carries it.
     #[serde(default)]
     pub placement: Option<String>,
+    /// `pinned` (default) stays on the host that created it. `movable`
+    /// may be restarted on the surviving host after a quorum failure
+    /// of its own host. A volume, published port, ingress name, or
+    /// host socket cannot be movable.
+    #[serde(default)]
+    pub ha: crate::ha::HaMode,
+    /// `snapshot` is a local Btrfs copy and does not survive a lost
+    /// datacenter. `mesh` means this member replicates its own bytes
+    /// over the mesh (MySQL, Postgres). RustyPods does not copy them.
+    #[serde(default)]
+    pub replicates: crate::ha::Replication,
+    /// DNS name shared by a primary and its mesh replica. Traffic
+    /// follows whichever of them is on a live host.
+    #[serde(default)]
+    pub serves: Option<String>,
+    /// When several members `serve` one name and more than one host
+    /// is alive, this one wins.
+    #[serde(default)]
+    pub primary: bool,
 }
 
 /// Full pod name of a stack member: <stack>-<member>.
@@ -140,6 +159,29 @@ pub fn parse(toml_text: &str, image_exists: impl Fn(&str) -> bool) -> Result<Sta
             rustypods_proto::parse_volume_spec(spec)
                 .with_context(|| format!("pods.{member}: invalid volume"))?;
         }
+        crate::ha::admit(&crate::ha::MemberShape {
+            ha: p.ha,
+            replicates: p.replicates,
+            serves: p.serves.as_deref(),
+            primary: p.primary,
+            has_volume: !p.volumes.is_empty(),
+            has_publish: !p.ports.is_empty() || !p.ingress.is_empty(),
+            host_access: p.host_access,
+        })
+        .with_context(|| format!("pods.{member}"))?;
+    }
+    let mut primaries: BTreeMap<&str, u32> = BTreeMap::new();
+    for (member, p) in &def.pods {
+        let Some(name) = p.serves.as_deref() else {
+            continue;
+        };
+        let n = primaries.entry(name).or_insert(0);
+        if p.primary {
+            *n += 1;
+        }
+        if *n > 1 {
+            bail!("pods.{member}: service '{name}' already has a primary");
+        }
     }
     Ok(def)
 }
@@ -194,6 +236,17 @@ cpu_quota_percent = 50
         assert_eq!(d.pods["db"].snap_max_age_secs, 7 * 86400);
         assert_eq!(d.pods["db"].snap_keep_last, 3);
         assert_eq!(member_name("shop", "web"), "shop-web");
+    }
+
+    #[test]
+    fn a_volume_cannot_be_movable_and_a_mesh_replica_can_be_pinned() {
+        let movable = "name = \"s\"\n[pods.db]\nimage = \"i\"\nha = \"movable\"\nvolumes = [\"data:/var/lib/mysql\"]\n";
+        let err = parse(movable, img).unwrap_err();
+        assert!(format!("{err:#}").contains("volume"), "{err:#}");
+        let replica = "name = \"s\"\n[pods.db]\nimage = \"i\"\nreplicates = \"mesh\"\nserves = \"orders\"\nprimary = true\n";
+        let d = parse(replica, img).unwrap();
+        assert_eq!(d.pods["db"].replicates, crate::ha::Replication::Mesh);
+        assert!(d.pods["db"].primary);
     }
 
     #[test]

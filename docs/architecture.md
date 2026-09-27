@@ -113,6 +113,33 @@ back over a per-pod Unix socket at `/run/rustypods/run/agent.sock`.
   real job control; exec'd processes are moved into the pod's scope so the
   limits keep applying. Exit codes and SIGWINCH propagate over the stream.
 
+## Availability across sites
+
+A Btrfs snapshot is a local copy-on-write. It dies with the disk it sits
+on. Four rules decide what happens when a site is gone. They live in
+`ha.rs` and a stack is rejected at `apply` when it asks for something
+the rules forbid.
+
+1. **Traffic.** Members that share `serves = "orders"` are one DNS name.
+   While quorum holds, the name points at the live primary, or at the
+   live mesh replica when the primary's host is dead. A name with nobody
+   left is withdrawn.
+2. **Workloads.** `ha = "movable"` may restart on the single surviving
+   host. The default is `pinned`. A volume, a published port, an ingress
+   name, or host access cannot be movable: there is nowhere for that
+   byte or that socket to go.
+3. **Databases.** `replicates = "snapshot"` (the default) is the local
+   time machine and is not a second copy. `replicates = "mesh"` means
+   MySQL or Postgres is replicating itself across the mesh. RustyPods
+   does not ship those rows, and it does not restart a database on the
+   other host. It only retargets the name onto the replica that is
+   already running there.
+4. **Quorum.** A plan is published only when a majority of voters is
+   reachable. Two hosts need a witness, which votes and runs no pods.
+   One live host out of three publishes nothing, so a partition cannot
+   elect two leaders. Two hosts and no witness also publish nothing
+   once one of them is gone.
+
 ## Repository layout
 
 ```

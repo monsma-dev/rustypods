@@ -662,6 +662,13 @@ as before; different host → own netns + gossip name
 member's host. `--host` + placement is refused (target is implied).
 Partial fan-out failure is per-host reported; `apply` is idempotent —
 just re-run.
+- `ha = "pinned"` (default) never restarts on another host. `movable`
+  is refused when the member has a volume, a published port, an ingress
+  name, or host access. `replicates = "mesh"` is the database's own
+  replication over the mesh; a snapshot is not that. `ha::plan` publishes
+  DNS and restarts only when a majority of voters (the two hosts plus a
+  witness) is alive. One side of a partition gets `dns: None` and must
+  keep the previous generation.
 
 ## Mesh-DNS (Wave K)
 
