@@ -22,14 +22,6 @@
   --color-warn: #f6d32d;
   --color-err: #e01b24;
 
-  /* libadwaita's spacing grid (6px steps) — every new component in
-   * gui/src/ui/ pulls from this instead of ad hoc px-3/py-1.5 mixes. */
-  --spacing-xs: 0.375rem; /* 6px  */
-  --spacing-sm: 0.75rem; /* 12px */
-  --spacing-md: 1.125rem; /* 18px */
-  --spacing-lg: 1.5rem; /* 24px */
-  --spacing-xl: 2rem; /* 32px */
-
   /* rounded-control = inputs/buttons, rounded-card = boxed-list groups
    * and dialogs — two radii, used consistently everywhere. */
   --radius-control: 0.5rem; /* 8px  */
