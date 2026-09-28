@@ -137,7 +137,10 @@ impl Node {
     pub fn heard_leader(&mut self) {
         self.last_from_leader = Instant::now();
         self.leader = false;
-        self.quorum = false;
+        // A live AppendEntries means a leader holds this term. Followers
+        // used to clear this bit, so `mesh status` lied `quorum=no`
+        // on every non-leader even while the cluster was healthy.
+        self.quorum = true;
     }
 
     /// Wait a full election timeout before trying again.
@@ -274,6 +277,19 @@ mod tests {
             election_timeout(ELECTION_MAX.as_millis() as u64 - ELECTION_MIN.as_millis() as u64 + 1),
             ELECTION_MIN
         );
+    }
+
+    #[test]
+    fn hearing_the_leader_means_the_follower_sees_quorum() {
+        let dir = std::env::temp_dir().join(format!("rp-raft-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut node = Node::open(&dir).unwrap();
+        assert!(!node.has_quorum());
+        node.heard_leader();
+        assert!(node.has_quorum());
+        assert!(!node.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

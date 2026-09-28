@@ -1003,7 +1003,9 @@ impl Mesh {
             tun_drops: self.tun_drops.load(std::sync::atomic::Ordering::Relaxed),
             names: self.names().await.into_iter().collect(),
             conf_error: String::new(),
-            cluster_token: conf.cluster_token,
+            // Never put the join token on the status wire. `mesh status`,
+            // the GUI and /metrics all share this message.
+            cluster_token: String::new(),
             grpc_addr: self.host_addr.to_string(),
             // The caller (GetMeshStatus) fills this from the raft lock —
             // Mesh has no reference to the Raft node.

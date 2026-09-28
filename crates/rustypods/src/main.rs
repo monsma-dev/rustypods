@@ -1229,10 +1229,7 @@ pub(crate) fn print_mesh_status(st: &MeshStatus) {
         );
     }
     if !st.cluster_token.is_empty() {
-        println!(
-            "token:   {}  (share with peer hosts' `mesh init --token`)",
-            st.cluster_token
-        );
+        println!("token:   present (redacted — rotate via POST /v1/mesh/rotate-token)");
     }
     println!(
         "pump:    ticks={} udp={} tun={} tun_drops={}",
