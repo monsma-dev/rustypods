@@ -443,8 +443,67 @@ fn stack_peer(stack: &str) -> String {
 /// ve-<stack> in the root ns gets .1/30, vp-<stack> inside the netns gets
 /// .2/30 + a default route. Pods then join via --network-namespace-path and
 /// share lo — every member sees the same 127.0.0.1.
+fn netns_exec_ok(ns: &str) -> bool {
+    run("ip", &["netns", "exec", ns, "true"]).is_ok()
+}
+
+/// After `KillMode=process` daemon restarts the named netns file can
+/// stay behind as a stale bind-mount ("Peer netns reference is invalid")
+/// while pods keep the live namespace via their nspawn fds. Rebind that
+/// file to a still-running stack member so `start` can reuse the uplink.
+fn recover_stack_netns(stack: &str) -> bool {
+    let ns = netns_name(stack);
+    if netns_exec_ok(&ns) {
+        return true;
+    }
+    let Ok(list) = run_out("machinectl", &["list", "--no-legend"]) else {
+        return false;
+    };
+    let prefix = format!("{stack}-");
+    for line in list.lines() {
+        let name = match line.split_whitespace().next() {
+            Some(n) => n,
+            None => continue,
+        };
+        if name != stack && !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(pid) = run_out("machinectl", &["show", "-p", "Leader", "--value", name]) else {
+            continue;
+        };
+        let pid = pid.trim();
+        if pid.is_empty() || !Path::new(&format!("/proc/{pid}/ns/net")).exists() {
+            continue;
+        }
+        let path = netns_path(stack);
+        let _ = run("umount", &[path.to_str().unwrap_or("")]);
+        let _ = std::fs::create_dir_all("/var/run/netns");
+        if !path.exists() {
+            let _ = std::fs::File::create(&path);
+        }
+        if run(
+            "mount",
+            &[
+                "--bind",
+                &format!("/proc/{pid}/ns/net"),
+                path.to_str().unwrap_or(""),
+            ],
+        )
+        .is_ok()
+            && netns_exec_ok(&ns)
+        {
+            tracing::warn!("rebound stale netns {ns} from machine {name} (pid {pid})");
+            return true;
+        }
+    }
+    false
+}
+
 pub fn ensure_stack_net(stack: &str, idx: u32) -> Result<()> {
     let ns = netns_name(stack);
+    if !netns_exec_ok(&ns) {
+        let _ = recover_stack_netns(stack);
+    }
     if !netns_path(stack).exists() {
         run("ip", &["netns", "add", &ns])?;
     }

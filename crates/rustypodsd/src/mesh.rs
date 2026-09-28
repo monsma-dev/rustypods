@@ -139,6 +139,38 @@ fn parse_pubkey(b64: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("pubkey must decode to 32 bytes"))
 }
 
+/// Impreza-class DPI fingerprints WireGuard's first 4 bytes (type 1..=4)
+/// and kills the flow. XOR with a key derived from the cluster token
+/// makes the UDP look like noise. Empty token = identity so unit tests
+/// and a node that has not joined yet still speak raw WG.
+fn cloak_key(token: &str) -> Option<[u8; 32]> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut h = Sha256::new();
+    h.update(b"wg-obfs-v1|");
+    h.update(token.as_bytes());
+    Some(h.finalize().into())
+}
+
+fn xor_keystream(buf: &mut [u8], key: &[u8; 32]) {
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b ^= key[i & 31];
+    }
+}
+
+fn cloak(dgram: &[u8], token: &str) -> Vec<u8> {
+    let mut out = dgram.to_vec();
+    if let Some(key) = cloak_key(token) {
+        xor_keystream(&mut out, &key);
+    }
+    out
+}
+
+fn uncloak(dgram: &[u8], token: &str) -> Vec<u8> {
+    cloak(dgram, token)
+}
+
 /// Normalize an endpoint to a canonical v6 form: v4 addresses become
 /// v4-mapped-v6. The mesh UDP socket binds [::] (dual-stack); on Linux
 /// sendto() to a bare AF_INET sockaddr on an AF_INET6 socket fails
@@ -687,6 +719,15 @@ impl Mesh {
             .clone()
     }
 
+    fn wg_token(&self) -> String {
+        self.cluster_tokens().0
+    }
+
+    async fn udp_send(&self, dgram: &[u8], endpoint: SocketAddr) -> std::io::Result<usize> {
+        let wire = cloak(dgram, &self.wg_token());
+        self.udp.send_to(&wire, endpoint).await
+    }
+
     fn store_tokens(&self, conf: &MeshConf) {
         let mut guard = self
             .cluster_tokens
@@ -941,8 +982,8 @@ impl Mesh {
                 _ => None,
             }
         };
-        if let Some((dgram, endpoint)) = pending {
-            let _ = self.udp.send_to(&dgram, endpoint).await;
+            if let Some((dgram, endpoint)) = pending {
+            let _ = self.udp_send(&dgram, endpoint).await;
         }
     }
 
@@ -1086,7 +1127,8 @@ impl Mesh {
                     if let Ok((n, src)) = r {
                         self.udp_pkts.fetch_add(1, Relaxed);
                         self.pump_where.store(4, Relaxed);
-                        self.handle_udp(&udp_buf[..n], src, &mut out).await;
+                        let plain = uncloak(&udp_buf[..n], &self.wg_token());
+                        self.handle_udp(&plain, src, &mut out).await;
                     }
                 }
             }
@@ -1135,7 +1177,7 @@ impl Mesh {
             }
         };
         if let Some((dgram, endpoint)) = pending {
-            if let Err(e) = self.udp.send_to(&dgram, endpoint).await {
+            if let Err(e) = self.udp_send(&dgram, endpoint).await {
                 tracing::debug!("mesh udp send {endpoint}: {e}");
             }
         }
@@ -1280,7 +1322,7 @@ impl Mesh {
         for item in items {
             match item {
                 Outbound::Udp(dgram, dst) => {
-                    let _ = self.udp.send_to(dgram, *dst).await;
+                    let _ = self.udp_send(dgram, *dst).await;
                 }
                 Outbound::Tun(pkt) => self.tun_write(pkt).await,
             }
@@ -1301,7 +1343,7 @@ impl Mesh {
             batch
         };
         for (dgram, endpoint) in pending {
-            let _ = self.udp.send_to(&dgram, endpoint).await;
+            let _ = self.udp_send(&dgram, endpoint).await;
         }
     }
 
@@ -1986,6 +2028,16 @@ fn build_peer(secret: &StaticSecret, pc: &MeshPeerConf, index: u32) -> Result<(P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloak_hides_the_wg_type_byte_and_round_trips() {
+        let wg = [1u8, 0, 0, 0, 0x11, 0x22, 0x33];
+        let token = "cluster-secret";
+        let wire = cloak(&wg, token);
+        assert_ne!(wire[0], 1, "DPI fingerprints WireGuard type=1");
+        assert_eq!(uncloak(&wire, token), wg);
+        assert_eq!(cloak(&wg, ""), wg);
+    }
 
     #[test]
     fn prefix_is_stable_and_ula() {
